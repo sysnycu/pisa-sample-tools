@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -206,3 +207,25 @@ def test_missing_required_scenario_file_errors(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="spec.yaml"):
         export_samples(runner_spec_path=runner_spec, output_dir=tmp_path / "out", shard_size=1)
+
+
+def test_zip_output_excludes_manifest(tmp_path: Path) -> None:
+    runner_spec = _make_runner_fixture(tmp_path, sample_count=2)
+    output_dir = tmp_path / "out"
+
+    result = export_samples(
+        runner_spec_path=runner_spec,
+        output_dir=output_dir,
+        shard_size=1,
+        create_zip=True,
+    )
+
+    assert result.zip_path == tmp_path / "out.zip"
+    assert result.zip_path.exists()
+    with zipfile.ZipFile(result.zip_path) as archive:
+        names = archive.namelist()
+
+    assert "manifest.yaml" not in names
+    assert all(not name.endswith("/manifest.yaml") for name in names)
+    assert "demo_scenario-grid1/explicit.yaml" in names
+    assert "demo_scenario-grid2/demo_scenario.xosc" in names

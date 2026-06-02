@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -28,6 +29,7 @@ class ExportResult:
     manifest_path: Path
     total_samples: int
     shard_count: int
+    zip_path: Path | None = None
 
 
 def export_samples(
@@ -39,6 +41,8 @@ def export_samples(
     shard_size: int | None = None,
     num_shards: int | None = None,
     source_path_mode: SourcePathMode = SourcePathMode.ABSOLUTE,
+    create_zip: bool = False,
+    zip_path: Path | None = None,
     overwrite: bool = False,
 ) -> ExportResult:
     _validate_split_args(shard_size=shard_size, num_shards=num_shards)
@@ -82,7 +86,12 @@ def export_samples(
         sampler_name=str(sampler_runtime_spec.get("name")),
         total_samples=len(samples),
     )
+    if create_zip and zip_path is None:
+        zip_path = _default_zip_path(output_dir)
     _prepare_output_dir(output_dir, overwrite=overwrite)
+    if create_zip:
+        assert zip_path is not None
+        _prepare_zip_path(zip_path, overwrite=overwrite)
 
     shard_entries: list[dict[str, Any]] = []
     for index, shard_samples in enumerate(shards):
@@ -134,16 +143,21 @@ def export_samples(
         "shard_count": len(shards),
         "shard_size": shard_size,
         "num_shards": num_shards,
+        "zip_path": str(zip_path) if create_zip and zip_path is not None else None,
         "shards": shard_entries,
     }
     manifest_path = output_dir / "manifest.yaml"
     _write_yaml(manifest_path, manifest)
+    if create_zip:
+        assert zip_path is not None
+        _zip_output_dir(output_dir, zip_path=zip_path)
 
     return ExportResult(
         output_dir=output_dir,
         manifest_path=manifest_path,
         total_samples=len(samples),
         shard_count=len(shards),
+        zip_path=zip_path if create_zip else None,
     )
 
 
@@ -170,6 +184,10 @@ def _default_output_dir(*, scenario_name: str, sampler_name: str, total_samples:
     return Path("output") / f"{scenario_name}-{sampler_name}-{total_samples}"
 
 
+def _default_zip_path(output_dir: Path) -> Path:
+    return output_dir.with_suffix(".zip")
+
+
 def _validate_split_args(*, shard_size: int | None, num_shards: int | None) -> None:
     if shard_size is not None and num_shards is not None:
         raise ExportError("shard-size and num-shards are mutually exclusive")
@@ -193,6 +211,16 @@ def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
             )
     else:
         output_dir.mkdir(parents=True)
+
+
+def _prepare_zip_path(zip_path: Path, *, overwrite: bool) -> None:
+    if zip_path.exists():
+        if not overwrite:
+            raise ExportError(f"zip path already exists: {zip_path}")
+        if zip_path.is_dir():
+            raise ExportError(f"zip path exists and is a directory: {zip_path}")
+        zip_path.unlink()
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _load_mapping_file(path: Path, *, label: str) -> dict[str, Any]:
@@ -396,3 +424,11 @@ def _write_yaml(path: Path, data: dict[str, Any]) -> None:
         yaml.safe_dump(data, sort_keys=False, allow_unicode=False),
         encoding="utf-8",
     )
+
+
+def _zip_output_dir(output_dir: Path, *, zip_path: Path) -> None:
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(output_dir.rglob("*")):
+            if not path.is_file() or path.name == "manifest.yaml":
+                continue
+            archive.write(path, arcname=path.relative_to(output_dir))

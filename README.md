@@ -47,6 +47,17 @@ You can override that with `--output-dir /path/to/generated_samples`.
 
 `--shard-size` and `--num-shards` are mutually exclusive. Existing output directories are rejected by default. `--overwrite` only allows an existing empty directory.
 
+Add `--zip` to create an archive next to the output directory:
+
+```bash
+uv run pisa-sample-export \
+  --runner-spec /path/to/runner_spec.json \
+  --shard-size 50 \
+  --zip
+```
+
+The default archive path is `{output_dir}.zip`. Use `--zip-path /path/to/archive.zip` to choose a specific path.
+
 You can also use a sampler runtime spec directly when you provide a scenario path:
 
 ```bash
@@ -137,6 +148,8 @@ shards:
     first_sample_id: '1'
     last_sample_id: '50'
 ```
+
+When `--zip` is used, the archive contains the generated bundle folders and excludes `manifest.yaml`.
 
 ## Runner Use
 

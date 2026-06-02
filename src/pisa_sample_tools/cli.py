@@ -42,6 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow writing to an existing empty output directory.",
     )
+    parser.add_argument(
+        "--zip",
+        dest="create_zip",
+        action="store_true",
+        help="Create a zip archive for the generated bundles, excluding manifest.yaml.",
+    )
+    parser.add_argument(
+        "--zip-path",
+        type=Path,
+        help="Optional archive path. Implies --zip when provided.",
+    )
     return parser
 
 
@@ -58,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
             shard_size=args.shard_size,
             num_shards=args.num_shards,
             source_path_mode=SourcePathMode(args.source_path_mode),
+            create_zip=args.create_zip or args.zip_path is not None,
+            zip_path=args.zip_path,
             overwrite=args.overwrite,
         )
     except ExportError as exc:
