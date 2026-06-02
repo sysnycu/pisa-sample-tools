@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import zipfile
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -30,6 +31,8 @@ class ExportResult:
     total_samples: int
     shard_count: int
     zip_path: Path | None = None
+    dry_run: bool = False
+    summary: dict[str, Any] | None = None
 
 
 def export_samples(
@@ -43,6 +46,7 @@ def export_samples(
     source_path_mode: SourcePathMode = SourcePathMode.ABSOLUTE,
     create_zip: bool = False,
     zip_path: Path | None = None,
+    dry_run: bool = False,
     overwrite: bool = False,
 ) -> ExportResult:
     _validate_split_args(shard_size=shard_size, num_shards=num_shards)
@@ -88,28 +92,16 @@ def export_samples(
     )
     if create_zip and zip_path is None:
         zip_path = _default_zip_path(output_dir)
-    _prepare_output_dir(output_dir, overwrite=overwrite)
-    if create_zip:
-        assert zip_path is not None
-        _prepare_zip_path(zip_path, overwrite=overwrite)
 
     shard_entries: list[dict[str, Any]] = []
     for index, shard_samples in enumerate(shards):
         bundle_id = index + 1
         bundle_dir = output_dir / f"{scenario_assets.name}-{sampler_runtime_spec.get('name')}{bundle_id}"
-        bundle_dir.mkdir()
         xosc_path = bundle_dir / f"{scenario_assets.name}.xosc"
         explicit_path = bundle_dir / "explicit.yaml"
         spec_path = bundle_dir / "spec.yaml"
         stop_conditions_path = bundle_dir / "stop_conditions.yaml"
 
-        shutil.copy2(scenario_assets.xosc_path, xosc_path)
-        shutil.copy2(scenario_assets.spec_path, spec_path)
-        shutil.copy2(scenario_assets.stop_conditions_path, stop_conditions_path)
-        _write_yaml(
-            explicit_path,
-            {"samples": [_sample_to_dict(sample) for sample in shard_samples]},
-        )
         shard_entries.append(
             {
                 "index": index,
@@ -124,6 +116,25 @@ def export_samples(
                 "last_sample_id": shard_samples[-1].id if shard_samples else None,
             }
         )
+
+    if not dry_run:
+        _prepare_output_dir(output_dir, overwrite=overwrite)
+        if create_zip:
+            assert zip_path is not None
+            _prepare_zip_path(zip_path, overwrite=overwrite)
+        for shard_entry, shard_samples in zip(shard_entries, shards, strict=True):
+            bundle_dir = Path(shard_entry["bundle_path"])
+            bundle_dir.mkdir()
+            shutil.copy2(scenario_assets.xosc_path, shard_entry["scenario_file_path"])
+            shutil.copy2(scenario_assets.spec_path, shard_entry["spec_file_path"])
+            shutil.copy2(
+                scenario_assets.stop_conditions_path,
+                shard_entry["stop_conditions_file_path"],
+            )
+            _write_yaml(
+                Path(shard_entry["sample_file_path"]),
+                {"samples": [_sample_to_dict(sample) for sample in shard_samples]},
+            )
 
     manifest = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -147,8 +158,16 @@ def export_samples(
         "shards": shard_entries,
     }
     manifest_path = output_dir / "manifest.yaml"
-    _write_yaml(manifest_path, manifest)
-    if create_zip:
+    summary = _build_summary(
+        manifest,
+        output_dir=output_dir,
+        manifest_path=manifest_path,
+        zip_path=zip_path if create_zip else None,
+        dry_run=dry_run,
+    )
+    if not dry_run:
+        _write_yaml(manifest_path, manifest)
+    if create_zip and not dry_run:
         assert zip_path is not None
         _zip_output_dir(output_dir, zip_path=zip_path)
 
@@ -158,6 +177,8 @@ def export_samples(
         total_samples=len(samples),
         shard_count=len(shards),
         zip_path=zip_path if create_zip else None,
+        dry_run=dry_run,
+        summary=summary,
     )
 
 
@@ -205,12 +226,66 @@ def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
             raise ExportError(f"output-dir exists and is not a directory: {output_dir}")
         if not overwrite:
             raise ExportError(f"output-dir already exists: {output_dir}")
-        if any(output_dir.iterdir()):
-            raise ExportError(
-                "output-dir already exists and is not empty; choose an empty directory or a new path"
-            )
+        if not any(output_dir.iterdir()):
+            return
+        _clear_previous_output(output_dir)
     else:
         output_dir.mkdir(parents=True)
+
+
+def _clear_previous_output(output_dir: Path) -> None:
+    manifest_path = output_dir / "manifest.yaml"
+    if not manifest_path.exists():
+        raise ExportError(
+            "output-dir already exists and is not empty, but no manifest.yaml was found; "
+            "refusing to overwrite a directory not created by this tool"
+        )
+
+    manifest = _load_mapping_file(manifest_path, label="existing output manifest")
+    for shard in manifest.get("shards", []):
+        if not isinstance(shard, dict):
+            continue
+        bundle_path = shard.get("bundle_path")
+        if bundle_path is not None:
+            _remove_path_if_under_output(Path(bundle_path), output_dir)
+        for key in (
+            "sample_file_path",
+            "sampler_config_path",
+            "scenario_file_path",
+            "spec_file_path",
+            "stop_conditions_file_path",
+        ):
+            raw_path = shard.get(key)
+            if raw_path is not None:
+                _remove_path_if_under_output(Path(raw_path), output_dir)
+    manifest_path.unlink()
+    _remove_empty_dirs(output_dir)
+    if any(output_dir.iterdir()):
+        raise ExportError(
+            "output-dir still contains files after clearing manifest-listed outputs; "
+            "refusing to overwrite unrelated files"
+        )
+
+
+def _remove_path_if_under_output(path: Path, output_dir: Path) -> None:
+    output_root = output_dir.resolve()
+    target = path.resolve()
+    try:
+        target.relative_to(output_root)
+    except ValueError:
+        return
+    if not target.exists():
+        return
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+
+def _remove_empty_dirs(output_dir: Path) -> None:
+    for path in sorted((path for path in output_dir.rglob("*") if path.is_dir()), reverse=True):
+        with suppress(OSError):
+            path.rmdir()
 
 
 def _prepare_zip_path(zip_path: Path, *, overwrite: bool) -> None:
@@ -424,6 +499,43 @@ def _write_yaml(path: Path, data: dict[str, Any]) -> None:
         yaml.safe_dump(data, sort_keys=False, allow_unicode=False),
         encoding="utf-8",
     )
+
+
+def _build_summary(
+    manifest: dict[str, Any],
+    *,
+    output_dir: Path,
+    manifest_path: Path,
+    zip_path: Path | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    return {
+        "dry_run": dry_run,
+        "scenario_name": manifest["scenario_name"],
+        "sampler_name": manifest["sampler_name"],
+        "source_path": manifest["source_path"],
+        "source_type": manifest["source_type"],
+        "total_samples": manifest["total_samples"],
+        "shard_count": manifest["shard_count"],
+        "shard_size": manifest["shard_size"],
+        "num_shards": manifest["num_shards"],
+        "output_dir": str(output_dir),
+        "manifest_path": str(manifest_path),
+        "zip_path": str(zip_path) if zip_path is not None else None,
+        "scenario_xosc_path": manifest["scenario_xosc_path"],
+        "scenario_spec_path": manifest["scenario_spec_path"],
+        "stop_conditions_path": manifest["stop_conditions_path"],
+        "shards": [
+            {
+                "bundle_id": shard["bundle_id"],
+                "sample_count": shard["sample_count"],
+                "bundle_path": shard["bundle_path"],
+                "first_sample_id": shard["first_sample_id"],
+                "last_sample_id": shard["last_sample_id"],
+            }
+            for shard in manifest["shards"]
+        ],
+    }
 
 
 def _zip_output_dir(output_dir: Path, *, zip_path: Path) -> None:

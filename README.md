@@ -45,7 +45,35 @@ output/{scenario_name}-{sampler_name}-{total_samples}/
 
 You can override that with `--output-dir /path/to/generated_samples`.
 
-`--shard-size` and `--num-shards` are mutually exclusive. Existing output directories are rejected by default. `--overwrite` only allows an existing empty directory.
+`--shard-size` and `--num-shards` are mutually exclusive. Existing output directories are rejected by default. `--overwrite` only replaces an existing directory when it contains this tool's `manifest.yaml`; directories without a manifest are treated as user-owned and are refused.
+
+Use `--dry-run` to resolve inputs, generate the sample plan, and print a summary without writing files:
+
+```bash
+uv run pisa-sample-export \
+  --runner-spec /path/to/runner_spec.json \
+  --shard-size 50 \
+  --dry-run
+```
+
+Use `--summary` to print a summary after a real export:
+
+```bash
+uv run pisa-sample-export \
+  --runner-spec /path/to/runner_spec.json \
+  --shard-size 50 \
+  --summary
+```
+
+For scripts, use JSON:
+
+```bash
+uv run pisa-sample-export \
+  --runner-spec /path/to/runner_spec.json \
+  --shard-size 50 \
+  --dry-run \
+  --summary json
+```
 
 Add `--zip` to create an archive next to the output directory:
 

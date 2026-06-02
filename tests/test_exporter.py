@@ -17,6 +17,7 @@ def _write_yaml(path: Path, data: dict[str, Any]) -> None:
 
 
 def _make_runner_fixture(tmp_path: Path, *, sample_count: int = 5) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     scenario_dir = tmp_path / "scenario"
     config_dir = tmp_path / "configs"
     scenario_dir.mkdir()
@@ -229,3 +230,90 @@ def test_zip_output_excludes_manifest(tmp_path: Path) -> None:
     assert all(not name.endswith("/manifest.yaml") for name in names)
     assert "demo_scenario-grid1/explicit.yaml" in names
     assert "demo_scenario-grid2/demo_scenario.xosc" in names
+
+
+def test_dry_run_computes_summary_without_writing(tmp_path: Path) -> None:
+    runner_spec = _make_runner_fixture(tmp_path, sample_count=3)
+    output_dir = tmp_path / "out"
+
+    result = export_samples(
+        runner_spec_path=runner_spec,
+        output_dir=output_dir,
+        shard_size=2,
+        create_zip=True,
+        dry_run=True,
+    )
+
+    assert result.dry_run is True
+    assert result.total_samples == 3
+    assert result.shard_count == 2
+    assert result.summary is not None
+    assert result.summary["output_dir"] == str(output_dir)
+    assert result.summary["zip_path"] == str(tmp_path / "out.zip")
+    assert not output_dir.exists()
+    assert not (tmp_path / "out.zip").exists()
+
+
+def test_overwrite_replaces_previous_tool_output(tmp_path: Path) -> None:
+    first_runner_spec = _make_runner_fixture(tmp_path / "first", sample_count=4)
+    second_runner_spec = _make_runner_fixture(tmp_path / "second", sample_count=2)
+    output_dir = tmp_path / "out"
+
+    export_samples(runner_spec_path=first_runner_spec, output_dir=output_dir, shard_size=1)
+    assert (output_dir / "demo_scenario-grid4").exists()
+
+    export_samples(
+        runner_spec_path=second_runner_spec,
+        output_dir=output_dir,
+        shard_size=1,
+        overwrite=True,
+    )
+
+    assert (output_dir / "demo_scenario-grid1").exists()
+    assert (output_dir / "demo_scenario-grid2").exists()
+    assert not (output_dir / "demo_scenario-grid3").exists()
+    assert not (output_dir / "demo_scenario-grid4").exists()
+
+
+def test_overwrite_rejects_non_tool_output_dir(tmp_path: Path) -> None:
+    runner_spec = _make_runner_fixture(tmp_path, sample_count=1)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "unrelated.txt").write_text("keep me\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no manifest.yaml"):
+        export_samples(
+            runner_spec_path=runner_spec,
+            output_dir=output_dir,
+            shard_size=1,
+            overwrite=True,
+        )
+
+
+def test_cli_dry_run_summary_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    runner_spec = _make_runner_fixture(tmp_path, sample_count=2)
+    output_dir = tmp_path / "out"
+
+    assert (
+        main(
+            [
+                "--runner-spec",
+                str(runner_spec),
+                "--output-dir",
+                str(output_dir),
+                "--shard-size",
+                "1",
+                "--dry-run",
+                "--summary",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out)
+    assert summary["dry_run"] is True
+    assert summary["total_samples"] == 2
+    assert summary["shard_count"] == 2
+    assert not output_dir.exists()
