@@ -1,0 +1,6 @@
+scenario:
+  scenario_path: /path/to/scenario_folder
+  stop_condition_config_path: /path/to/scenario_folder/stop_conditions.yaml
+sampler:
+  name: lhs
+  config_path: /path/to/lhs_sampler.yaml
