@@ -21,6 +21,51 @@ If the runner repo moves, update that path and run `uv sync` again. The runner r
 
 ## CLI
 
+This repo provides three commands:
+
+- `pisa-sample-test`: preview raw sampler output from one sampler source file.
+- `pisa-sample-export`: materialize samples and split them into runner-ready bundle folders.
+- `pisa-sample-analyze`: inspect planned samples, generated explicit samples, or completed runner results.
+
+## Sampler Preview
+
+`pisa-sample-test` is the quick sampler smoke-test tool. It reads one sampler source file, builds a `simcore.sampler`, and prints the generated params without creating bundle output.
+
+Preview a param range file with the default grid sampler:
+
+```bash
+uv run pisa-sample-test /path/to/params.yaml --max-samples 10
+```
+
+Preview an LHS sampler with inline sampler options:
+
+```bash
+uv run pisa-sample-test /path/to/params.yaml \
+  --method lhs \
+  --n-samples 100 \
+  --seed 7 \
+  --max-samples 10
+```
+
+Use a sampler config file and machine-readable output:
+
+```bash
+uv run pisa-sample-test /path/to/params.yaml \
+  --method lhs \
+  --config-path /path/to/lhs_sampler.yaml \
+  --format yaml
+```
+
+Supported output formats are `table`, `yaml`, and `json`. If `--method` is omitted, the tool uses `native` for OpenSCENARIO sources, `explicit` for explicit sample sources, and `grid` for parameter range sources.
+
+The root `sampler_tester.py` file is kept as a compatibility wrapper around this command:
+
+```bash
+uv run python sampler_tester.py /path/to/params.yaml --max-samples 10
+```
+
+## Sample Export
+
 Generate bundles by shard size:
 
 ```bash
@@ -193,6 +238,93 @@ max_samples: null
 ```
 
 Then use sampler name `explicit` in the runner spec.
+
+## Sample Analysis
+
+`pisa-sample-analyze` creates an offline analysis folder for planned samples, exported samples, or completed runner results.
+
+Supported inputs:
+
+- `--runner-spec`: materializes samples from a runner JSON/YAML spec using `simcore.sampler`.
+- `--samples`: reads an `explicit.yaml`, a generated bundle output directory, a single bundle directory, or a CSV sample table.
+- `--results`: reads a runner output directory containing `iteration_*/monitor/result.csv`.
+
+Analyze planned sampler output:
+
+```bash
+uv run pisa-sample-analyze \
+  --runner-spec /path/to/runner_spec.json \
+  --params Agent_S,Ego_Speed,Agent_Cutin_Distance \
+  --output analysis/sakura-planned
+```
+
+Analyze generated bundles:
+
+```bash
+uv run pisa-sample-analyze \
+  --samples output/sakura_cutin_1-lhs-1000 \
+  --params Agent_S,Ego_Speed \
+  --output analysis/sakura-bundles
+```
+
+Analyze completed runner results and color points by outcome:
+
+```bash
+uv run pisa-sample-analyze \
+  --results /home/hcis-s05/ysws/PISA/runner/outputs/carla-esmini-lhs1000 \
+  --params Agent_S,Ego_Speed,Agent_Cutin_Distance \
+  --color-by outcome \
+  --output analysis/sakura-results
+```
+
+`--params` accepts at most 3 parameters. If omitted, the tool auto-selects up to 3 numeric parameters.
+
+Coloring supports:
+
+- `--color-by none`
+- `--color-by outcome`
+- `--color-by status`
+- `--color-by stop_condition`
+- `--color-by param:<name>`
+- `--color-by metric:<name>`
+
+CSV sample input can use either explicit prefixes or plain parameter columns:
+
+```csv
+sample_id,param.Agent_S,Ego_Speed,outcome,metric.min_ttc
+case_1,2970.0,12.5,success,3.1
+case_2,2955.0,25.0,fail,0.4
+```
+
+Analysis output:
+
+```text
+analysis/sakura-results/
+  summary.yaml
+  samples.csv
+  report.html
+  figures/
+    class_counts.svg
+    hist_Agent_S.svg
+    hist_Ego_Speed.svg
+    scatter_2d.svg
+    coverage_heatmap.svg
+    pair_matrix.svg
+    scatter_3d.html
+```
+
+`summary.yaml` contains counts, selected params, per-parameter stats, metric stats, outcomes, statuses, stop conditions, and missing result counts. `samples.csv` is the flattened table with `param.*` and `metric.*` columns. `report.html` is a self-contained static report that links to SVG figures and an interactive vanilla-JS 3D scatter view.
+
+`report.html` also includes a dynamic explorer. It embeds the loaded sample records, so it works offline without a server. In the browser you can:
+
+- choose X, Y, and optional Z parameters from dropdowns
+- switch between auto, 1D, 2D, and 3D views
+- recolor by outcome, status, stop condition, parameter value, or metric value
+- filter visible samples by outcome and status
+- click a point to inspect the full sample row
+- download the currently filtered rows as CSV
+
+For runner results, the analyzer reads each `iteration_<id>/monitor/result.csv`, parses `run.params` as sample parameters, uses `run.status`, `run.test_outcome`, `run.stop_condition`, and `run.stop_reason` for classification, and treats non-`run.*` columns as summary metrics.
 
 ## Why Separate
 

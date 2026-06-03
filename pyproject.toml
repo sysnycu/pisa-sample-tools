@@ -11,6 +11,8 @@ dependencies = [
 
 [project.scripts]
 pisa-sample-export = "pisa_sample_tools.cli:main"
+pisa-sample-analyze = "pisa_sample_tools.analyze_cli:main"
+pisa-sample-test = "pisa_sample_tools.sampler_test_cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]
