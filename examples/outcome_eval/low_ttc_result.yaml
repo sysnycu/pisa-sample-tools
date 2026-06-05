@@ -1,0 +1,7 @@
+condition:
+  type: result_metric_threshold
+  name: low_summary_ttc
+  outcome: Fail
+  metric: ego_to_agent_1.min_ttc_s
+  rule: lt
+  value: 1.0

@@ -1,0 +1,6 @@
+- type: frame_metric_threshold
+  name: low_frame_ttc
+  outcome: Fail
+  metric: ego_to_agent_1.ttc_s
+  rule: lt
+  value: 1.0

@@ -1,0 +1,9 @@
+condition:
+  type: agent_pair_expression
+  name: agent_0_too_far_from_agent_1
+  outcome: Fail
+  source_agent_id: 0
+  target_agent_id: 1
+  expression: abs(source_x - target_x)
+  rule: gt
+  value: 80.0

@@ -7,7 +7,7 @@ import math
 import shutil
 import statistics
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,10 +17,12 @@ from simcore.sampler import create_sampler, load_parameter_space
 from simcore.sampler.loader import load_sampler_spec, resolve_sampler_source
 
 from pisa_sample_tools.exporter import (
+    EXPLICIT_SAMPLE_FILE_NAME,
     _load_mapping_file,
     _runner_scenario_path,
     scenario_base_from_path,
 )
+from pisa_sample_tools.outcome_eval import OutcomeEvalError, OutcomeEvalMode, evaluate_outcomes
 
 
 class AnalyzeError(ValueError):
@@ -58,6 +60,7 @@ class SampleRecord:
     stop_reason: str | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     result_path: Path | None = None
+    post_outcome: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,17 @@ class AnalysisResult:
     selected_params: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ColorSpec:
+    color_by: str
+    mode: str
+    values: list[str]
+    palette: dict[str, str]
+    numeric_values: list[float | None]
+    numeric_min: float | None = None
+    numeric_max: float | None = None
+
+
 def analyze_samples(
     *,
     output_dir: Path,
@@ -79,11 +93,16 @@ def analyze_samples(
     results_path: Path | None = None,
     params: list[str] | None = None,
     color_by: str = "outcome",
+    bins: int = 28,
+    post_outcome_config_path: Path | None = None,
+    post_outcome_mode: str | OutcomeEvalMode = OutcomeEvalMode.OVERLAY,
     overwrite: bool = False,
 ) -> AnalysisResult:
     source_count = sum(path is not None for path in (runner_spec_path, samples_path, results_path))
     if source_count != 1:
         raise AnalyzeError("exactly one of runner_spec_path, samples_path, or results_path is required")
+    if bins <= 0:
+        raise AnalyzeError("bins must be greater than 0")
 
     if runner_spec_path is not None:
         records = load_records_from_runner_spec(runner_spec_path)
@@ -105,6 +124,18 @@ def analyze_samples(
     selected_params = _select_params(records, params)
     _prepare_analysis_dir(output_dir, overwrite=overwrite)
 
+    post_outcome_summary: dict[str, Any] | None = None
+    if post_outcome_config_path is not None:
+        if results_path is None:
+            raise AnalyzeError("--post-outcome-config is only supported with --results")
+        records, post_outcome_summary = _apply_post_outcome_eval(
+            records,
+            results_path=results_path,
+            config_path=post_outcome_config_path,
+            mode=OutcomeEvalMode(post_outcome_mode),
+            output_dir=output_dir / "post_outcome_eval",
+        )
+
     rows, columns = _records_to_rows(records)
     csv_path = output_dir / "samples.csv"
     _write_csv(csv_path, rows, columns)
@@ -115,6 +146,8 @@ def analyze_samples(
         source_label=source_label,
         selected_params=selected_params,
         color_by=color_by,
+        bins=bins,
+        post_outcome=post_outcome_summary,
     )
     summary_path = output_dir / "summary.yaml"
     _write_yaml(summary_path, summary)
@@ -125,6 +158,7 @@ def analyze_samples(
         records,
         selected_params=selected_params,
         color_by=color_by,
+        bins=bins,
         figures_dir=figures_dir,
     )
     report_path = output_dir / "report.html"
@@ -188,7 +222,7 @@ def load_records_from_samples(samples_path: Path) -> list[SampleRecord]:
     if not samples_path.is_dir():
         raise AnalyzeError(f"samples path does not exist: {samples_path}")
 
-    explicit_file = samples_path / "explicit.yaml"
+    explicit_file = _find_explicit_sample_file(samples_path)
     if explicit_file.exists():
         return _load_records_from_explicit_file(explicit_file)
 
@@ -198,14 +232,25 @@ def load_records_from_samples(samples_path: Path) -> list[SampleRecord]:
         if records:
             return records
 
-    explicit_files = sorted(samples_path.glob("*/explicit.yaml"))
+    explicit_files = sorted(samples_path.glob(f"*/{EXPLICIT_SAMPLE_FILE_NAME}"))
+    if not explicit_files:
+        explicit_files = sorted(samples_path.glob("*/explicit.yaml"))
     if explicit_files:
         records: list[SampleRecord] = []
         for path in explicit_files:
             records.extend(_load_records_from_explicit_file(path, result_path=path.parent))
         return records
 
-    raise AnalyzeError(f"could not find explicit.yaml or manifest.yaml in samples path: {samples_path}")
+    raise AnalyzeError(
+        f"could not find {EXPLICIT_SAMPLE_FILE_NAME}, explicit.yaml, or manifest.yaml in samples path: {samples_path}"
+    )
+
+
+def _find_explicit_sample_file(samples_path: Path) -> Path:
+    explicit_file = samples_path / EXPLICIT_SAMPLE_FILE_NAME
+    if explicit_file.exists():
+        return explicit_file
+    return samples_path / "explicit.yaml"
 
 
 def load_records_from_results(results_path: Path) -> list[SampleRecord]:
@@ -343,11 +388,10 @@ def _load_records_from_explicit_file(
 
 def _select_params(records: list[SampleRecord], params: list[str] | None) -> tuple[str, ...]:
     if params:
-        selected = tuple(param.strip() for param in params if param.strip())
-        if len(selected) > 3:
-            raise AnalyzeError("at most 3 params can be selected")
+        requested = tuple(param.strip() for param in params if param.strip())
+        selected = requested[:3]
         known_params = {name for record in records for name in record.params}
-        missing = [name for name in selected if name not in known_params]
+        missing = [name for name in requested if name not in known_params]
         if missing:
             raise AnalyzeError(f"selected param(s) not found: {', '.join(missing)}")
         return selected
@@ -392,6 +436,8 @@ def _build_analysis_summary(
     source_label: str,
     selected_params: tuple[str, ...],
     color_by: str,
+    bins: int,
+    post_outcome: dict[str, Any] | None,
 ) -> dict[str, Any]:
     outcomes = Counter(record.outcome or "unknown" for record in records)
     statuses = Counter(record.status or "unknown" for record in records)
@@ -406,6 +452,7 @@ def _build_analysis_summary(
         "record_count": len(records),
         "selected_params": list(selected_params),
         "color_by": color_by,
+        "bins": bins,
         "param_count": len(param_names),
         "metric_count": len(metric_names),
         "params": _parameter_summary(records, param_names),
@@ -414,6 +461,68 @@ def _build_analysis_summary(
         "statuses": dict(statuses),
         "stop_conditions": dict(stop_conditions),
         "missing_result_count": sum(record.status is None and record.outcome is None for record in records),
+        "post_outcome": post_outcome,
+    }
+
+
+def _apply_post_outcome_eval(
+    records: list[SampleRecord],
+    *,
+    results_path: Path,
+    config_path: Path,
+    mode: OutcomeEvalMode,
+    output_dir: Path,
+) -> tuple[list[SampleRecord], dict[str, Any]]:
+    try:
+        result = evaluate_outcomes(
+            input_path=results_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            mode=mode,
+            overwrite=True,
+        )
+    except OutcomeEvalError as exc:
+        raise AnalyzeError(f"post outcome eval failed: {exc}") from exc
+
+    outcomes_by_path = {outcome.scenario_path.resolve(): outcome for outcome in result.outcomes}
+    updated_records: list[SampleRecord] = []
+    matched = 0
+    for record in records:
+        outcome = outcomes_by_path.get(record.result_path.resolve()) if record.result_path else None
+        if outcome is None:
+            updated_records.append(record)
+            continue
+        matched += 1
+        updated_records.append(
+            replace(
+                record,
+                post_outcome={
+                    "test_outcome": outcome.test_outcome,
+                    "stop_condition": outcome.stop_condition,
+                    "stop_reason": outcome.stop_reason,
+                    "condition_code": outcome.code.name.lower(),
+                    "condition_name": outcome.condition_name,
+                    "triggered": outcome.triggered,
+                    "detail": outcome.detail,
+                },
+            )
+        )
+
+    counts = Counter(
+        record.post_outcome.get("test_outcome", "unknown")
+        for record in updated_records
+        if record.post_outcome is not None
+    )
+    return updated_records, {
+        "config_path": str(config_path),
+        "mode": mode.value,
+        "output_dir": str(result.output_dir),
+        "summary_csv_path": str(result.summary_csv_path),
+        "manifest_path": str(result.manifest_path),
+        "matched_records": matched,
+        "evaluated_scenarios": len(result.outcomes),
+        "triggered_count": sum(outcome.triggered for outcome in result.outcomes),
+        "outcomes": dict(counts),
     }
 
 
@@ -458,6 +567,10 @@ def _records_to_rows(records: list[SampleRecord]) -> tuple[list[dict[str, Any]],
         "outcome",
         "stop_condition",
         "stop_reason",
+        "post_outcome",
+        "post_stop_condition",
+        "post_condition_code",
+        "post_triggered",
         "result_path",
         *[f"param.{name}" for name in param_names],
         *[f"metric.{name}" for name in metric_names],
@@ -470,6 +583,10 @@ def _records_to_rows(records: list[SampleRecord]) -> tuple[list[dict[str, Any]],
             "outcome": record.outcome or "",
             "stop_condition": record.stop_condition or "",
             "stop_reason": record.stop_reason or "",
+            "post_outcome": (record.post_outcome or {}).get("test_outcome", ""),
+            "post_stop_condition": (record.post_outcome or {}).get("stop_condition", ""),
+            "post_condition_code": (record.post_outcome or {}).get("condition_code", ""),
+            "post_triggered": (record.post_outcome or {}).get("triggered", ""),
             "result_path": str(record.result_path) if record.result_path is not None else "",
         }
         row.update({f"param.{name}": record.params.get(name, "") for name in param_names})
@@ -494,27 +611,27 @@ def _write_figures(
     *,
     selected_params: tuple[str, ...],
     color_by: str,
+    bins: int,
     figures_dir: Path,
 ) -> list[Path]:
     figure_paths: list[Path] = []
-    color_values = [_color_value(record, color_by) for record in records]
-    palette = _build_palette(color_values)
+    color_spec = _build_color_spec(records, color_by)
 
     overview = figures_dir / "class_counts.svg"
-    overview.write_text(_class_counts_svg(color_values, palette), encoding="utf-8")
+    overview.write_text(_color_overview_svg(color_spec), encoding="utf-8")
     figure_paths.append(overview)
 
     for param in selected_params:
         values = [record.params.get(param) for record in records]
         path = figures_dir / f"hist_{_slug(param)}.svg"
-        path.write_text(_histogram_svg(param, values, color_values, palette), encoding="utf-8")
+        path.write_text(_histogram_svg(param, values, color_spec, bins=bins), encoding="utf-8")
         figure_paths.append(path)
 
     numeric_params = [param for param in selected_params if _param_is_numeric(records, param)]
     if len(numeric_params) >= 2:
         scatter = figures_dir / "scatter_2d.svg"
         scatter.write_text(
-            _scatter_2d_svg(records, numeric_params[0], numeric_params[1], color_values, palette),
+            _scatter_2d_svg(records, numeric_params[0], numeric_params[1], color_spec),
             encoding="utf-8",
         )
         figure_paths.append(scatter)
@@ -529,14 +646,14 @@ def _write_figures(
     if len(numeric_params) >= 3:
         scatter3d = figures_dir / "scatter_3d.html"
         scatter3d.write_text(
-            _scatter_3d_html(records, numeric_params[:3], color_values, palette),
+            _scatter_3d_html(records, numeric_params[:3], color_spec),
             encoding="utf-8",
         )
         figure_paths.append(scatter3d)
 
     if len(numeric_params) >= 2:
         matrix = figures_dir / "pair_matrix.svg"
-        matrix.write_text(_pair_matrix_svg(records, numeric_params, color_values, palette), encoding="utf-8")
+        matrix.write_text(_pair_matrix_svg(records, numeric_params, color_spec), encoding="utf-8")
         figure_paths.append(matrix)
 
     return figure_paths
@@ -593,12 +710,14 @@ def _write_report(
     th, td {{ border-bottom: 1px solid #e6ecf2; text-align: left; padding: 8px 10px; }}
     code {{ background: #eef3f7; padding: 2px 5px; border-radius: 4px; }}
     label {{ display: grid; gap: 4px; font-size: 13px; font-weight: 600; color: #314155; }}
-    select, button {{ min-height: 34px; border: 1px solid #b8c4d0; border-radius: 6px; background: white; padding: 6px 8px; }}
+    select, input[type="number"], button {{ min-height: 34px; border: 1px solid #b8c4d0; border-radius: 6px; background: white; padding: 6px 8px; }}
     button {{ cursor: pointer; background: #102033; color: white; border-color: #102033; }}
     .controls {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; align-items: end; margin-bottom: 14px; }}
     .filter-box {{ display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 12px 0; }}
     .filter-box label {{ display: inline-flex; grid-template-columns: none; align-items: center; gap: 6px; font-weight: 500; }}
     .detail {{ white-space: pre-wrap; overflow: auto; max-height: 260px; background: #f7fafc; border: 1px solid #d9e1ea; border-radius: 6px; padding: 12px; }}
+    .subtle-panel {{ background: #f8fafc; border: 1px solid #d9e1ea; border-radius: 8px; padding: 14px; margin: 12px 0; }}
+    .inline-controls {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }}
   </style>
 </head>
 <body>
@@ -645,6 +764,7 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
                 "stop_reason": record.stop_reason,
                 "metrics": record.metrics,
                 "result_path": str(record.result_path) if record.result_path is not None else "",
+                "post_outcome": record.post_outcome,
             }
             for record in records
         ],
@@ -652,18 +772,37 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
         "metricNames": list(summary["metrics"]),
         "selectedParams": list(summary["selected_params"]),
         "defaultColorBy": summary["color_by"],
+        "defaultBins": summary["bins"],
+        "postOutcomeSummary": summary.get("post_outcome"),
     }
     payload_json = json.dumps(payload, ensure_ascii=True).replace("</", "<\\/")
     return f"""
     <section id="dynamic-explorer">
       <h2>Dynamic Explorer</h2>
+      <p class="muted">All discovered parameters and metrics are available in the selectors below. CLI --params only chooses the initial axes.</p>
       <div class="controls">
         <label>X parameter<select id="dyn-x"></select></label>
         <label>Y parameter<select id="dyn-y"></select></label>
         <label>Z parameter<select id="dyn-z"></select></label>
         <label>Color by<select id="dyn-color"></select></label>
+        <label>Outcome source<select id="dyn-outcome-source"><option value="original">Original</option><option value="post">Post Eval</option><option value="lab">Lab Draft</option></select></label>
         <label>View<select id="dyn-view"><option value="auto">auto</option><option value="1d">1D</option><option value="2d">2D</option><option value="3d">3D</option></select></label>
+        <label>1D bins<input id="dyn-bins" type="number" min="1" max="500" step="1"></label>
         <button id="dyn-download" type="button">Download Filtered CSV</button>
+      </div>
+      <div id="post-summary" class="subtle-panel"></div>
+      <div class="subtle-panel">
+        <h3>Post Outcome Lab</h3>
+        <div class="inline-controls">
+          <label>Value source<select id="lab-source"><option value="metric">Metric</option><option value="param">Param</option></select></label>
+          <label>Field<select id="lab-field"></select></label>
+          <label>Operator<select id="lab-op"><option value="lt">&lt;</option><option value="le">&lt;=</option><option value="gt">&gt;</option><option value="ge">&gt;=</option><option value="eq">==</option><option value="between">between</option><option value="outside">outside</option></select></label>
+          <label>Value<input id="lab-value" type="text" placeholder="1.0 or min,max"></label>
+          <label>Outcome<select id="lab-outcome"><option value="fail">fail</option><option value="invalid">invalid</option><option value="success">success</option></select></label>
+          <label>Name<input id="lab-name" type="text" value="draft_condition"></label>
+          <button id="lab-apply" type="button">Apply Draft</button>
+        </div>
+        <pre id="lab-summary" class="detail">No lab rule applied.</pre>
       </div>
       <div><strong>Outcome filters</strong><div id="dyn-outcomes" class="filter-box"></div></div>
       <div><strong>Status filters</strong><div id="dyn-statuses" class="filter-box"></div></div>
@@ -671,7 +810,9 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
       <div class="stats">
         <div class="stat">Visible<b id="dyn-visible">0</b></div>
         <div class="stat">Mode<b id="dyn-mode">2D</b></div>
-        <div class="stat">Color Classes<b id="dyn-classes">0</b></div>
+        <div class="stat">Color<b id="dyn-classes">0</b></div>
+        <div class="stat">Params<b>{len(summary["params"])}</b></div>
+        <div class="stat">Metrics<b>{len(summary["metrics"])}</b></div>
       </div>
       <h3>Selected Sample</h3>
       <pre id="dyn-detail" class="detail">Click a point to inspect a sample.</pre>
@@ -690,7 +831,9 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
     y: document.getElementById('dyn-y'),
     z: document.getElementById('dyn-z'),
     color: document.getElementById('dyn-color'),
+    outcomeSource: document.getElementById('dyn-outcome-source'),
     view: document.getElementById('dyn-view'),
+    bins: document.getElementById('dyn-bins'),
     outcomes: document.getElementById('dyn-outcomes'),
     statuses: document.getElementById('dyn-statuses'),
     canvas: document.getElementById('dyn-canvas'),
@@ -698,10 +841,20 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
     mode: document.getElementById('dyn-mode'),
     classes: document.getElementById('dyn-classes'),
     detail: document.getElementById('dyn-detail'),
-    download: document.getElementById('dyn-download')
+    download: document.getElementById('dyn-download'),
+    postSummary: document.getElementById('post-summary'),
+    labSource: document.getElementById('lab-source'),
+    labField: document.getElementById('lab-field'),
+    labOp: document.getElementById('lab-op'),
+    labValue: document.getElementById('lab-value'),
+    labOutcome: document.getElementById('lab-outcome'),
+    labName: document.getElementById('lab-name'),
+    labApply: document.getElementById('lab-apply'),
+    labSummary: document.getElementById('lab-summary')
   }};
   const ctx = els.canvas.getContext('2d');
   let projected = [];
+  let updatingFilters = false;
   let yaw = -0.65, pitch = 0.55, zoom = 1.0, dragging = false, lastX = 0, lastY = 0;
 
   function addOptions(select, values, includeNone=false) {{
@@ -742,14 +895,43 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
   }}
+  function activeOutcomeRecord(record) {{
+    const source = els.outcomeSource.value;
+    if (source === 'post' && record.post_outcome) return record.post_outcome;
+    if (source === 'lab' && record.lab_outcome) return record.lab_outcome;
+    return null;
+  }}
+  function effectiveOutcome(record) {{
+    const active = activeOutcomeRecord(record);
+    return active ? (active.test_outcome || 'unknown') : (record.outcome || 'unknown');
+  }}
+  function effectiveStopCondition(record) {{
+    const active = activeOutcomeRecord(record);
+    return active ? (active.stop_condition || '') : (record.stop_condition || '');
+  }}
   function colorValue(record, colorBy) {{
     if (!colorBy || colorBy === 'none') return 'sample';
-    if (colorBy === 'outcome') return record.outcome || 'unknown';
+    if (colorBy === 'outcome') return effectiveOutcome(record);
     if (colorBy === 'status') return record.status || 'unknown';
-    if (colorBy === 'stop_condition') return record.stop_condition || 'unknown';
+    if (colorBy === 'stop_condition') return effectiveStopCondition(record) || 'unknown';
     if (colorBy.startsWith('param:')) return String(record.params[colorBy.slice(6)] ?? 'missing');
     if (colorBy.startsWith('metric:')) return String(record.metrics[colorBy.slice(7)] ?? 'missing');
     return 'sample';
+  }}
+  function numericColorValue(record, colorBy) {{
+    let value = null;
+    if (colorBy.startsWith('param:')) value = record.params[colorBy.slice(6)];
+    else if (colorBy.startsWith('metric:')) value = record.metrics[colorBy.slice(7)];
+    else return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }}
+  function continuousBlue(value, min, max) {{
+    const t = max <= min ? 0.5 : Math.max(0, Math.min(1, (value - min) / (max - min)));
+    const r = Math.round(239 - t * 198);
+    const g = Math.round(246 - t * 111);
+    const b = Math.round(255 - t * 35);
+    return `rgb(${{r}},${{g}},${{b}})`;
   }}
   function colorOptions() {{
     return ['none','outcome','status','stop_condition', ...paramNames.map(p => 'param:' + p), ...metricNames.map(m => 'metric:' + m)];
@@ -757,7 +939,19 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
   function filteredRecords() {{
     const outcomes = checked(els.outcomes);
     const statuses = checked(els.statuses);
-    return records.filter(record => outcomes.has(record.outcome || 'unknown') && statuses.has(record.status || 'unknown'));
+    return records.filter(record => outcomes.has(effectiveOutcome(record)) && statuses.has(record.status || 'unknown'));
+  }}
+  function rebuildOutcomeFilters() {{
+    updatingFilters = true;
+    checkboxGroup(els.outcomes, records.map(record => effectiveOutcome(record)));
+    updatingFilters = false;
+  }}
+  function renderPostSummary() {{
+    const post = payload.postOutcomeSummary;
+    const original = countValues(records.map(r => r.outcome || 'unknown')).map(([k,v]) => `${{k}}: ${{v}}`).join(', ');
+    const postCounts = post && post.outcomes ? Object.entries(post.outcomes).map(([k,v]) => `${{k}}: ${{v}}`).join(', ') : 'no post eval config loaded';
+    const changed = records.filter(r => r.post_outcome && (r.post_outcome.test_outcome || 'unknown') !== (r.outcome || 'unknown')).length;
+    els.postSummary.textContent = `Original outcomes: ${{original || 'none'}}\\nPost outcomes: ${{postCounts}}\\nChanged by post eval: ${{changed}}\\nPost mode: ${{post ? post.mode : 'none'}}\\nPost config: ${{post ? post.config_path : 'none'}}`;
   }}
   function resize() {{
     const rect = els.canvas.getBoundingClientRect();
@@ -782,6 +976,24 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
     }});
     return map;
   }}
+  function colorState(records, colorBy) {{
+    const values = records.map(record => colorValue(record, colorBy));
+    const numeric = records.map(record => numericColorValue(record, colorBy));
+    const present = numeric.filter(value => value !== null);
+    if ((colorBy.startsWith('param:') || colorBy.startsWith('metric:')) && present.length) {{
+      let min = Math.min(...present), max = Math.max(...present);
+      if (min === max) {{ min -= 0.5; max += 0.5; }}
+      return {{mode:'continuous', values, numeric, min, max, map:null, colorBy}};
+    }}
+    return {{mode:'categorical', values, numeric, min:null, max:null, map:palette(values), colorBy}};
+  }}
+  function pointColor(state, index) {{
+    if (state.mode === 'continuous') {{
+      const value = state.numeric[index];
+      return value === null ? '#9ca3af' : continuousBlue(value, state.min, state.max);
+    }}
+    return state.map.get(state.values[index]);
+  }}
   function drawAxes(xLabel, yLabel, width, height, margin) {{
     ctx.strokeStyle = '#d7e0ea'; ctx.lineWidth = 1 * devicePixelRatio;
     ctx.beginPath();
@@ -803,6 +1015,25 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
       if (y > 230 * devicePixelRatio) break;
     }}
   }}
+  function drawContinuousLegend(state, width) {{
+    const x = width - 210 * devicePixelRatio;
+    const y = 22 * devicePixelRatio;
+    const h = 118 * devicePixelRatio;
+    const w = 14 * devicePixelRatio;
+    ctx.font = `${{12 * devicePixelRatio}}px system-ui`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#edf3f8';
+    ctx.fillText(state.colorBy, x, y - 8 * devicePixelRatio);
+    for (let i = 0; i < 80; i++) {{
+      const t = i / 79;
+      const value = state.max - t * (state.max - state.min);
+      ctx.fillStyle = continuousBlue(value, state.min, state.max);
+      ctx.fillRect(x, y + t * h, w, h / 80 + 1);
+    }}
+    ctx.fillStyle = '#edf3f8';
+    ctx.fillText(String(Number(state.max.toPrecision(4))), x + 22 * devicePixelRatio, y + 8 * devicePixelRatio);
+    ctx.fillText(String(Number(state.min.toPrecision(4))), x + 22 * devicePixelRatio, y + h);
+  }}
   function mode() {{
     if (els.view.value !== 'auto') return els.view.value;
     return els.z.value ? '3d' : (els.y.value ? '2d' : '1d');
@@ -812,59 +1043,59 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
     const xParam = els.x.value, yParam = els.y.value, zParam = els.z.value;
     const colorBy = els.color.value;
     const activeMode = mode();
-    const colors = visible.map(record => colorValue(record, colorBy));
-    const colorMap = palette(colors);
+    const colors = colorState(visible, colorBy);
     els.visible.textContent = String(visible.length);
     els.mode.textContent = activeMode.toUpperCase();
-    els.classes.textContent = String(colorMap.size);
+    els.classes.textContent = colors.mode === 'continuous' ? 'gradient' : String(colors.map.size);
     const w = els.canvas.width, h = els.canvas.height, margin = 70 * devicePixelRatio;
     ctx.clearRect(0,0,w,h); ctx.fillStyle = '#101820'; ctx.fillRect(0,0,w,h);
     projected = [];
     if (!visible.length) return;
-    if (activeMode === '1d') draw1d(visible, xParam, colors, colorMap, w, h, margin);
-    else if (activeMode === '3d' && zParam) draw3d(visible, [xParam, yParam, zParam], colors, colorMap, w, h);
-    else draw2d(visible, xParam, yParam, colors, colorMap, w, h, margin);
-    drawLegend(colorMap, w);
+    if (activeMode === '1d') draw1d(visible, xParam, colors, w, h, margin);
+    else if (activeMode === '3d' && zParam) draw3d(visible, [xParam, yParam, zParam], colors, w, h);
+    else draw2d(visible, xParam, yParam, colors, w, h, margin);
+    if (colors.mode === 'continuous') drawContinuousLegend(colors, w);
+    else drawLegend(colors.map, w);
   }}
-  function draw1d(records, xParam, colors, colorMap, w, h, margin) {{
+  function draw1d(records, xParam, colors, w, h, margin) {{
     const values = records.map(r => numericValue(r, xParam));
-    const points = records.map((r,i) => [r, values[i], colors[i]]).filter(p => p[1] !== null);
+    const points = records.map((r,i) => [r, values[i], i]).filter(p => p[1] !== null);
     if (!points.length) return;
     const [min, max] = range(points.map(p => p[1]));
-    const bins = 28, counts = Array.from({{length: bins}}, () => new Map());
-    for (const [, value, color] of points) {{
+    const requestedBins = Number(els.bins.value);
+    const bins = Math.max(1, Math.min(500, Number.isFinite(requestedBins) ? Math.round(requestedBins) : 28));
+    if (String(bins) !== els.bins.value) els.bins.value = String(bins);
+    const counts = Array.from({{length: bins}}, () => []);
+    for (const [, value, index] of points) {{
       const idx = Math.min(Math.floor((value - min) / (max - min) * bins), bins - 1);
-      counts[idx].set(color, (counts[idx].get(color) || 0) + 1);
+      counts[idx].push(index);
     }}
-    const maxCount = Math.max(...counts.map(m => [...m.values()].reduce((a,b) => a+b, 0)), 1);
+    const maxCount = Math.max(...counts.map(items => items.length), 1);
     const barW = (w - 2 * margin) / bins;
-    counts.forEach((map, idx) => {{
-      let stacked = 0;
-      for (const [label, count] of map.entries()) {{
-        const bh = (h - 2 * margin) * count / maxCount;
-        ctx.fillStyle = colorMap.get(label);
-        ctx.fillRect(margin + idx * barW, h - margin - stacked - bh, barW - 1, bh);
-        stacked += bh;
-      }}
+    counts.forEach((items, idx) => {{
+      const bh = (h - 2 * margin) * items.length / maxCount;
+      const representative = items.length ? items[Math.floor(items.length / 2)] : 0;
+      ctx.fillStyle = items.length ? pointColor(colors, representative) : '#2563eb';
+      ctx.fillRect(margin + idx * barW, h - margin - bh, barW - 1, bh);
     }});
     drawAxes(xParam, 'count', w, h, margin);
   }}
-  function draw2d(records, xParam, yParam, colors, colorMap, w, h, margin) {{
-    const points = records.map((r,i) => [r, numericValue(r, xParam), numericValue(r, yParam), colors[i]]).filter(p => p[1] !== null && p[2] !== null);
+  function draw2d(records, xParam, yParam, colors, w, h, margin) {{
+    const points = records.map((r,i) => [r, numericValue(r, xParam), numericValue(r, yParam), i]).filter(p => p[1] !== null && p[2] !== null);
     if (!points.length) return;
     const [xMin, xMax] = range(points.map(p => p[1]));
     const [yMin, yMax] = range(points.map(p => p[2]));
     drawAxes(xParam, yParam, w, h, margin);
-    for (const [record, x, y, color] of points) {{
+    for (const [record, x, y, index] of points) {{
       const sx = margin + (x - xMin) / (xMax - xMin) * (w - 2 * margin);
       const sy = h - margin - (y - yMin) / (yMax - yMin) * (h - 2 * margin);
       ctx.beginPath(); ctx.arc(sx, sy, 4.2 * devicePixelRatio, 0, Math.PI * 2);
-      ctx.fillStyle = colorMap.get(color); ctx.globalAlpha = 0.78; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.fillStyle = pointColor(colors, index); ctx.globalAlpha = 0.78; ctx.fill(); ctx.globalAlpha = 1;
       projected.push({{x:sx, y:sy, record}});
     }}
   }}
-  function draw3d(records, params, colors, colorMap, w, h) {{
-    const points = records.map((r,i) => [r, ...params.map(p => numericValue(r,p)), colors[i]]).filter(p => p[1] !== null && p[2] !== null && p[3] !== null);
+  function draw3d(records, params, colors, w, h) {{
+    const points = records.map((r,i) => [r, ...params.map(p => numericValue(r,p)), i]).filter(p => p[1] !== null && p[2] !== null && p[3] !== null);
     if (!points.length) return;
     const ranges = [1,2,3].map(i => range(points.map(p => p[i])));
     function norm(v, i) {{ return (v - ranges[i][0]) / (ranges[i][1] - ranges[i][0]) * 2 - 1; }}
@@ -875,11 +1106,11 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
       const scale = Math.min(w,h) * 0.34 * zoom / (1.7 + z2);
       return {{x: w/2 + x1*scale, y: h/2 - y1*scale, z: z2}};
     }}
-    const drawn = points.map(([record,x,y,z,color]) => [record, project(norm(x,0), norm(y,1), norm(z,2)), color]).sort((a,b) => a[1].z - b[1].z);
+    const drawn = points.map(([record,x,y,z,index]) => [record, project(norm(x,0), norm(y,1), norm(z,2)), index]).sort((a,b) => a[1].z - b[1].z);
     ctx.fillStyle = '#edf3f8'; ctx.font = `${{13 * devicePixelRatio}}px system-ui`; ctx.fillText(params.join(' / '), 20 * devicePixelRatio, 28 * devicePixelRatio);
-    for (const [record, p, color] of drawn) {{
+    for (const [record, p, index] of drawn) {{
       ctx.beginPath(); ctx.arc(p.x, p.y, 4.2 * devicePixelRatio, 0, Math.PI * 2);
-      ctx.fillStyle = colorMap.get(color); ctx.globalAlpha = 0.8; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.fillStyle = pointColor(colors, index); ctx.globalAlpha = 0.8; ctx.fill(); ctx.globalAlpha = 1;
       projected.push({{x:p.x, y:p.y, record}});
     }}
   }}
@@ -897,21 +1128,84 @@ def _dynamic_explorer_html(summary: dict[str, Any], records: list[SampleRecord])
     const rows = filteredRecords();
     const paramSet = new Set(), metricSet = new Set();
     rows.forEach(r => {{ Object.keys(r.params).forEach(k => paramSet.add(k)); Object.keys(r.metrics).forEach(k => metricSet.add(k)); }});
-    const cols = ['sample_id','status','outcome','stop_condition','stop_reason', ...[...paramSet].map(k => 'param.'+k), ...[...metricSet].map(k => 'metric.'+k)];
+    const cols = ['sample_id','status','outcome','effective_outcome','stop_condition','effective_stop_condition','stop_reason', ...[...paramSet].map(k => 'param.'+k), ...[...metricSet].map(k => 'metric.'+k)];
     const esc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
     const lines = [cols.join(',')];
-    for (const r of rows) lines.push(cols.map(c => c.startsWith('param.') ? esc(r.params[c.slice(6)]) : c.startsWith('metric.') ? esc(r.metrics[c.slice(7)]) : esc(r[c])).join(','));
+    for (const r of rows) lines.push(cols.map(c => c === 'effective_outcome' ? esc(effectiveOutcome(r)) : c === 'effective_stop_condition' ? esc(effectiveStopCondition(r)) : c.startsWith('param.') ? esc(r.params[c.slice(6)]) : c.startsWith('metric.') ? esc(r.metrics[c.slice(7)]) : esc(r[c])).join(','));
     const blob = new Blob([lines.join('\\n')], {{type:'text/csv'}});
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'filtered_samples.csv'; a.click(); URL.revokeObjectURL(a.href);
   }}
+  function updateLabFieldOptions() {{
+    addOptions(els.labField, els.labSource.value === 'metric' ? metricNames : paramNames);
+  }}
+  function compareValue(value, op, raw) {{
+    const number = Number(value);
+    if (!Number.isFinite(number)) return false;
+    if (op === 'between' || op === 'outside') {{
+      const parts = String(raw).split(',').map(v => Number(v.trim()));
+      if (parts.length !== 2 || !parts.every(Number.isFinite)) return false;
+      const inside = number >= parts[0] && number <= parts[1];
+      return op === 'between' ? inside : !inside;
+    }}
+    const threshold = Number(raw);
+    if (!Number.isFinite(threshold)) return false;
+    if (op === 'lt') return number < threshold;
+    if (op === 'le') return number <= threshold;
+    if (op === 'gt') return number > threshold;
+    if (op === 'ge') return number >= threshold;
+    if (op === 'eq') return Math.abs(number - threshold) <= 1e-6;
+    return false;
+  }}
+  function applyLabOutcome() {{
+    const source = els.labSource.value;
+    const field = els.labField.value;
+    const op = els.labOp.value;
+    const raw = els.labValue.value;
+    const outcome = els.labOutcome.value;
+    const name = els.labName.value || 'draft_condition';
+    let triggered = 0;
+    for (const record of records) {{
+      const value = source === 'metric' ? record.metrics[field] : record.params[field];
+      const matched = compareValue(value, op, raw);
+      if (matched) triggered += 1;
+      record.lab_outcome = matched ? {{
+        test_outcome: outcome,
+        stop_condition: name,
+        stop_reason: `Lab condition '${{name}}' matched: ${{source}}.${{field}} ${{op}} ${{raw}}`,
+        condition_code: 'triggered',
+        condition_name: name,
+        triggered: true,
+        detail: `${{source}}.${{field}}=${{value}}`
+      }} : {{
+        test_outcome: record.post_outcome?.test_outcome || record.outcome || 'unknown',
+        stop_condition: record.post_outcome?.stop_condition || record.stop_condition || '',
+        stop_reason: record.post_outcome?.stop_reason || record.stop_reason || '',
+        condition_code: 'not_triggered',
+        condition_name: name,
+        triggered: false,
+        detail: `${{source}}.${{field}}=${{value ?? 'missing'}}`
+      }};
+    }}
+    els.outcomeSource.value = 'lab';
+    els.labSummary.textContent = `Applied ${{name}}\\nRule: ${{source}}.${{field}} ${{op}} ${{raw}} -> ${{outcome}}\\nTriggered records: ${{triggered}} / ${{records.length}}`;
+    rebuildOutcomeFilters();
+    draw();
+  }}
   addOptions(els.x, paramNames); addOptions(els.y, paramNames, true); addOptions(els.z, paramNames, true); addOptions(els.color, colorOptions());
+  updateLabFieldOptions();
   els.x.value = selected[0] || paramNames[0] || '';
   els.y.value = selected[1] || paramNames[1] || '';
   els.z.value = selected[2] || '';
   els.color.value = payload.defaultColorBy || 'outcome';
-  checkboxGroup(els.outcomes, records.map(r => r.outcome || 'unknown'));
+  els.bins.value = String(payload.defaultBins || 28);
+  renderPostSummary();
+  rebuildOutcomeFilters();
   checkboxGroup(els.statuses, records.map(r => r.status || 'unknown'));
-  [els.x,els.y,els.z,els.color,els.view].forEach(el => el.addEventListener('change', draw));
+  [els.x,els.y,els.z,els.color,els.view,els.bins].forEach(el => el.addEventListener('change', draw));
+  els.outcomeSource.addEventListener('change', () => {{ rebuildOutcomeFilters(); draw(); }});
+  els.labSource.addEventListener('change', updateLabFieldOptions);
+  els.labApply.addEventListener('click', applyLabOutcome);
+  els.bins.addEventListener('input', () => {{ if (mode() === '1d') draw(); }});
   els.download.addEventListener('click', downloadCsv);
   els.canvas.addEventListener('mousedown', e => {{ dragging = true; lastX = e.clientX; lastY = e.clientY; selectNearest(e.clientX, e.clientY); }});
   window.addEventListener('mouseup', () => dragging = false);
@@ -944,6 +1238,56 @@ def _color_value(record: SampleRecord, color_by: str) -> str:
     )
 
 
+def _build_color_spec(records: list[SampleRecord], color_by: str) -> ColorSpec:
+    values = [_color_value(record, color_by) for record in records]
+    numeric_values = [_numeric_color_value(record, color_by) for record in records]
+    present = [value for value in numeric_values if value is not None]
+    if present and _continuous_color_key(color_by):
+        lower, upper = min(present), max(present)
+        if math.isclose(lower, upper):
+            lower -= 0.5
+            upper += 0.5
+        return ColorSpec(
+            color_by=color_by,
+            mode="continuous",
+            values=values,
+            palette={},
+            numeric_values=numeric_values,
+            numeric_min=lower,
+            numeric_max=upper,
+        )
+    return ColorSpec(
+        color_by=color_by,
+        mode="categorical",
+        values=values,
+        palette=_build_palette(values),
+        numeric_values=numeric_values,
+    )
+
+
+def _continuous_color_key(color_by: str) -> bool:
+    return color_by.startswith("metric:") or color_by.startswith("param:")
+
+
+def _numeric_color_value(record: SampleRecord, color_by: str) -> float | None:
+    if color_by.startswith("param:"):
+        return _as_float(record.params.get(color_by.removeprefix("param:")))
+    if color_by.startswith("metric:"):
+        return _as_float(record.metrics.get(color_by.removeprefix("metric:")))
+    return None
+
+
+def _color_for_index(color_spec: ColorSpec, index: int) -> str:
+    if color_spec.mode == "continuous":
+        value = color_spec.numeric_values[index]
+        if value is None:
+            return "#9ca3af"
+        assert color_spec.numeric_min is not None
+        assert color_spec.numeric_max is not None
+        return _continuous_blue(value, color_spec.numeric_min, color_spec.numeric_max)
+    return color_spec.palette[color_spec.values[index]]
+
+
 def _build_palette(values: list[str]) -> dict[str, str]:
     ordered = [value for value, _ in Counter(values).most_common()]
     palette: dict[str, str] = {}
@@ -956,6 +1300,33 @@ def _build_palette(values: list[str]) -> dict[str, str]:
             palette[value] = DEFAULT_PALETTE[fallback_index % len(DEFAULT_PALETTE)]
             fallback_index += 1
     return palette
+
+
+def _color_overview_svg(color_spec: ColorSpec) -> str:
+    if color_spec.mode == "continuous":
+        return _continuous_color_overview_svg(color_spec)
+    return _class_counts_svg(color_spec.values, color_spec.palette)
+
+
+def _continuous_color_overview_svg(color_spec: ColorSpec) -> str:
+    width, height = 980, 220
+    if color_spec.numeric_min is None or color_spec.numeric_max is None:
+        return _empty_svg("No numeric color values", width, height)
+    parts = [_svg_header(width, height), _svg_title(f"Color scale: {color_spec.color_by}", width)]
+    x0, y0, w, h = 180, 92, 620, 34
+    steps = 80
+    for index in range(steps):
+        fraction = index / (steps - 1)
+        value = color_spec.numeric_min + fraction * (color_spec.numeric_max - color_spec.numeric_min)
+        x = x0 + index * w / steps
+        parts.append(
+            f'<rect x="{x:.1f}" y="{y0}" width="{w / steps + 1:.1f}" height="{h}" fill="{_continuous_blue(value, color_spec.numeric_min, color_spec.numeric_max)}"/>'
+        )
+    parts.append(_svg_text(x0, y0 + h + 24, f"{color_spec.numeric_min:.3g}", size=12))
+    parts.append(_svg_text(x0 + w, y0 + h + 24, f"{color_spec.numeric_max:.3g}", size=12, anchor="end"))
+    parts.append(_svg_text(width / 2, y0 + h + 50, "low to high continuous values", size=12, anchor="middle"))
+    parts.append("</svg>")
+    return "\n".join(parts)
 
 
 def _class_counts_svg(values: list[str], palette: dict[str, str]) -> str:
@@ -983,13 +1354,48 @@ def _class_counts_svg(values: list[str], palette: dict[str, str]) -> str:
 def _histogram_svg(
     param: str,
     values: list[Any],
-    color_values: list[str],
-    palette: dict[str, str],
+    color_spec: ColorSpec,
+    *,
+    bins: int,
 ) -> str:
     numeric_values = [_as_float(value) for value in values]
     if any(value is not None for value in numeric_values):
-        return _numeric_histogram_svg(param, numeric_values, color_values, palette)
+        if color_spec.mode == "continuous":
+            return _numeric_histogram_svg_plain(param, numeric_values, bins=bins)
+        return _numeric_histogram_svg(param, numeric_values, color_spec.values, color_spec.palette, bins=bins)
     return _categorical_histogram_svg(param, values)
+
+
+def _numeric_histogram_svg_plain(param: str, values: list[float | None], *, bins: int) -> str:
+    present = [value for value in values if value is not None]
+    width, height = 980, 420
+    margin = 70
+    if not present:
+        return _empty_svg(f"No numeric values for {param}", width, height)
+    lower, upper = min(present), max(present)
+    if lower == upper:
+        lower -= 0.5
+        upper += 0.5
+    bin_count = bins
+    bins = [0 for _ in range(bin_count)]
+    for value in present:
+        index = min(int((value - lower) / (upper - lower) * bin_count), bin_count - 1)
+        bins[index] += 1
+    max_count = max(bins) or 1
+    parts = [_svg_header(width, height), _svg_title(f"Distribution: {param}", width)]
+    plot_h = height - 2 * margin
+    plot_w = width - 2 * margin
+    bar_w = plot_w / bin_count
+    for index, count in enumerate(bins):
+        x = margin + index * bar_w
+        h = plot_h * count / max_count
+        y = height - margin - h
+        parts.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w - 1:.1f}" height="{h:.1f}" fill="#2563eb"/>'
+        )
+    parts.extend(_axis(width, height, margin, f"{lower:.3g}", f"{upper:.3g}"))
+    parts.append("</svg>")
+    return "\n".join(parts)
 
 
 def _numeric_histogram_svg(
@@ -997,6 +1403,8 @@ def _numeric_histogram_svg(
     values: list[float | None],
     color_values: list[str],
     palette: dict[str, str],
+    *,
+    bins: int,
 ) -> str:
     present = [value for value in values if value is not None]
     width, height = 980, 420
@@ -1007,7 +1415,7 @@ def _numeric_histogram_svg(
     if lower == upper:
         lower -= 0.5
         upper += 0.5
-    bin_count = min(30, max(6, int(math.sqrt(len(present)))))
+    bin_count = bins
     bins = [0 for _ in range(bin_count)]
     class_bins: dict[str, list[int]] = {key: [0 for _ in range(bin_count)] for key in palette}
     for value, color_value in zip(values, color_values, strict=True):
@@ -1050,24 +1458,27 @@ def _scatter_2d_svg(
     records: list[SampleRecord],
     x_param: str,
     y_param: str,
-    color_values: list[str],
-    palette: dict[str, str],
+    color_spec: ColorSpec,
 ) -> str:
     xs = [_as_float(record.params.get(x_param)) for record in records]
     ys = [_as_float(record.params.get(y_param)) for record in records]
-    points = [(x, y, color) for x, y, color in zip(xs, ys, color_values, strict=True) if x is not None and y is not None]
+    points = [
+        (index, x, y)
+        for index, (x, y) in enumerate(zip(xs, ys, strict=True))
+        if x is not None and y is not None
+    ]
     width, height, margin = 980, 700, 80
     if not points:
         return _empty_svg(f"No numeric 2D points for {x_param} / {y_param}", width, height)
-    x_min, x_max = _range([point[0] for point in points])
-    y_min, y_max = _range([point[1] for point in points])
+    x_min, x_max = _range([point[1] for point in points])
+    y_min, y_max = _range([point[2] for point in points])
     parts = [_svg_header(width, height), _svg_title(f"2D scatter: {x_param} vs {y_param}", width)]
     parts.extend(_axis(width, height, margin, f"{x_min:.3g}", f"{x_max:.3g}", y_label=y_param, x_label=x_param))
-    for x, y, color in points:
+    for index, x, y in points:
         sx = margin + (x - x_min) / (x_max - x_min) * (width - 2 * margin)
         sy = height - margin - (y - y_min) / (y_max - y_min) * (height - 2 * margin)
-        parts.append(f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="4" fill="{palette[color]}" fill-opacity="0.72"/>')
-    parts.append(_legend(palette, width - 220, 70))
+        parts.append(f'<circle cx="{sx:.2f}" cy="{sy:.2f}" r="4" fill="{_color_for_index(color_spec, index)}" fill-opacity="0.78"/>')
+    parts.append(_color_legend(color_spec, width - 220, 70))
     parts.append("</svg>")
     return "\n".join(parts)
 
@@ -1108,8 +1519,7 @@ def _coverage_heatmap_svg(records: list[SampleRecord], x_param: str, y_param: st
 def _pair_matrix_svg(
     records: list[SampleRecord],
     params: list[str],
-    color_values: list[str],
-    palette: dict[str, str],
+    color_spec: ColorSpec,
 ) -> str:
     size = 260
     margin = 55
@@ -1129,14 +1539,14 @@ def _pair_matrix_svg(
                 continue
             x_min, x_max = ranges[x_param]
             y_min, y_max = ranges[y_param]
-            for record, color in zip(records, color_values, strict=True):
+            for index, record in enumerate(records):
                 x = _as_float(record.params.get(x_param))
                 y = _as_float(record.params.get(y_param))
                 if x is None or y is None:
                     continue
                 sx = x0 + 18 + (x - x_min) / (x_max - x_min) * (size - 36)
                 sy = y0 + size - 18 - (y - y_min) / (y_max - y_min) * (size - 36)
-                parts.append(f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="2.4" fill="{palette[color]}" fill-opacity="0.65"/>')
+                parts.append(f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="2.4" fill="{_color_for_index(color_spec, index)}" fill-opacity="0.7"/>')
     parts.append("</svg>")
     return "\n".join(parts)
 
@@ -1144,11 +1554,10 @@ def _pair_matrix_svg(
 def _scatter_3d_html(
     records: list[SampleRecord],
     params: list[str],
-    color_values: list[str],
-    palette: dict[str, str],
+    color_spec: ColorSpec,
 ) -> str:
     points = []
-    for record, color_value in zip(records, color_values, strict=True):
+    for index, record in enumerate(records):
         coords = [_as_float(record.params.get(param)) for param in params]
         if any(coord is None for coord in coords):
             continue
@@ -1158,8 +1567,8 @@ def _scatter_3d_html(
                 "x": coords[0],
                 "y": coords[1],
                 "z": coords[2],
-                "color": palette[color_value],
-                "label": color_value,
+                "color": _color_for_index(color_spec, index),
+                "label": color_spec.values[index],
             }
         )
     data = json.dumps({"params": params, "points": points})
@@ -1272,6 +1681,27 @@ def _legend(palette: dict[str, str], x: float, y: float) -> str:
     return "\n".join(parts)
 
 
+def _color_legend(color_spec: ColorSpec, x: float, y: float) -> str:
+    if color_spec.mode == "categorical":
+        return _legend(color_spec.palette, x, y)
+    if color_spec.numeric_min is None or color_spec.numeric_max is None:
+        return ""
+    parts = [f'<g transform="translate({x:.1f},{y:.1f})">']
+    parts.append(_svg_text(0, -10, color_spec.color_by, size=11, weight="600"))
+    steps = 48
+    for index in range(steps):
+        fraction = index / (steps - 1)
+        value = color_spec.numeric_min + fraction * (color_spec.numeric_max - color_spec.numeric_min)
+        yy = index * 2.2
+        parts.append(
+            f'<rect x="0" y="{yy:.1f}" width="14" height="2.5" fill="{_continuous_blue(value, color_spec.numeric_min, color_spec.numeric_max)}"/>'
+        )
+    parts.append(_svg_text(20, 4, f"{color_spec.numeric_max:.3g}", size=11))
+    parts.append(_svg_text(20, 104, f"{color_spec.numeric_min:.3g}", size=11))
+    parts.append("</g>")
+    return "\n".join(parts)
+
+
 def _empty_svg(message: str, width: int, height: int) -> str:
     return "\n".join(
         [
@@ -1296,6 +1726,11 @@ def _blue_scale(value: float) -> str:
     g = int(246 - value * 111)
     b = int(255 - value * 35)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _continuous_blue(value: float, lower: float, upper: float) -> str:
+    fraction = 0.5 if upper <= lower else (value - lower) / (upper - lower)
+    return _blue_scale(fraction)
 
 
 def _param_is_numeric(records: list[SampleRecord], param: str) -> bool:

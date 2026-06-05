@@ -1,0 +1,8 @@
+condition:
+  type: agent_state_threshold
+  name: agent_0_x_out_of_range
+  outcome: Invalid
+  agent_id: 0
+  metric: x
+  rule: outside
+  values: [-20, 120]

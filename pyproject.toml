@@ -13,6 +13,9 @@ dependencies = [
 pisa-sample-export = "pisa_sample_tools.cli:main"
 pisa-sample-analyze = "pisa_sample_tools.analyze_cli:main"
 pisa-sample-test = "pisa_sample_tools.sampler_test_cli:main"
+pisa-sample-trajectory = "pisa_sample_tools.trajectory_cli:main"
+pisa-trajectory-compare = "pisa_sample_tools.trajectory_compare_cli:main"
+pisa-outcome-eval = "pisa_sample_tools.outcome_eval_cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]

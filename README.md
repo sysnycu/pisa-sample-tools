@@ -21,11 +21,14 @@ If the runner repo moves, update that path and run `uv sync` again. The runner r
 
 ## CLI
 
-This repo provides three commands:
+This repo provides these commands:
 
-- `pisa-sample-test`: preview raw sampler output from one sampler source file.
-- `pisa-sample-export`: materialize samples and split them into runner-ready bundle folders.
-- `pisa-sample-analyze`: inspect planned samples, generated explicit samples, or completed runner results.
+- `pisa-sample-test`: preview raw sampler output from one sampler source file. See [docs/sampler-preview](docs/sampler-preview/README.md).
+- `pisa-sample-export`: materialize samples and split them into runner-ready bundle folders. See [docs/sample-export](docs/sample-export/README.md).
+- `pisa-sample-analyze`: inspect planned samples, generated explicit samples, or completed runner results. See [docs/sample-analyze](docs/sample-analyze/README.md).
+- `pisa-sample-trajectory`: render agent trajectory SVGs from completed runner results. See [docs/trajectory](docs/trajectory/README.md).
+- `pisa-trajectory-compare`: compare non-ego trajectories between two simulator result sets. See [docs/trajectory-compare](docs/trajectory-compare/README.md).
+- `pisa-outcome-eval`: evaluate offline condition trees against completed monitor logs. See [docs/outcome-eval](docs/outcome-eval/README.md).
 
 ## Sampler Preview
 
@@ -182,18 +185,18 @@ output/
   sakura_cutin_1-lhs-1000/
     sakura_cutin_1-lhs1/
       sakura_cutin_1.xosc
-      explicit.yaml
+      explicit_samples.yaml
       spec.yaml
       stop_conditions.yaml
     sakura_cutin_1-lhs2/
       sakura_cutin_1.xosc
-      explicit.yaml
+      explicit_samples.yaml
       spec.yaml
       stop_conditions.yaml
     manifest.yaml
 ```
 
-Every bundle uses the same file names. `explicit.yaml` contains that bundle's explicit samples:
+Every bundle uses the same file names. `explicit_samples.yaml` contains that bundle's explicit samples:
 
 ```yaml
 samples:
@@ -206,6 +209,8 @@ samples:
       ego_speed: 11.0
 ```
 
+The exported `params` are `Sample.sim_params`: only simulator-facing parameters are written. Sampler metadata and intermediate sampled parameters are intentionally omitted from bundle explicit files.
+
 Sample ids are strings. When the source sampler returns no id, ids start at `'1'` with no zero padding.
 
 `manifest.yaml` records every bundle:
@@ -217,7 +222,7 @@ shards:
   - bundle_id: 1
     sample_count: 50
     bundle_path: output/sakura_cutin_1-lhs-1000/sakura_cutin_1-lhs1
-    sample_file_path: output/sakura_cutin_1-lhs-1000/sakura_cutin_1-lhs1/explicit.yaml
+    sample_file_path: output/sakura_cutin_1-lhs-1000/sakura_cutin_1-lhs1/explicit_samples.yaml
     first_sample_id: '1'
     last_sample_id: '50'
 ```
@@ -226,14 +231,14 @@ When `--zip` is used, the archive contains the generated bundle folders and excl
 
 ## Runner Use
 
-Give each machine a different bundle directory. Point that run at the bundle's copied `{scenario_name}.xosc`, `spec.yaml`, and `stop_conditions.yaml`, and use the bundle `explicit.yaml` as the explicit sample source.
+Give each machine a different bundle directory. Point that run at the bundle's copied `{scenario_name}.xosc`, `spec.yaml`, and `stop_conditions.yaml`, and use the bundle `explicit_samples.yaml` as the explicit sample source.
 
 If your runner invocation expects a sampler config file, create one that points at the bundle:
 
 ```yaml
 source:
   type: explicit
-  path: /path/to/bundle/explicit.yaml
+  path: /path/to/bundle/explicit_samples.yaml
 max_samples: null
 ```
 
@@ -246,7 +251,7 @@ Then use sampler name `explicit` in the runner spec.
 Supported inputs:
 
 - `--runner-spec`: materializes samples from a runner JSON/YAML spec using `simcore.sampler`.
-- `--samples`: reads an `explicit.yaml`, a generated bundle output directory, a single bundle directory, or a CSV sample table.
+- `--samples`: reads an `explicit_samples.yaml`, a legacy `explicit.yaml`, a generated bundle output directory, a single bundle directory, or a CSV sample table.
 - `--results`: reads a runner output directory containing `iteration_*/monitor/result.csv`.
 
 Analyze planned sampler output:
@@ -254,7 +259,6 @@ Analyze planned sampler output:
 ```bash
 uv run pisa-sample-analyze \
   --runner-spec /path/to/runner_spec.json \
-  --params Agent_S,Ego_Speed,Agent_Cutin_Distance \
   --output analysis/sakura-planned
 ```
 
@@ -263,7 +267,6 @@ Analyze generated bundles:
 ```bash
 uv run pisa-sample-analyze \
   --samples output/sakura_cutin_1-lhs-1000 \
-  --params Agent_S,Ego_Speed \
   --output analysis/sakura-bundles
 ```
 
@@ -272,12 +275,20 @@ Analyze completed runner results and color points by outcome:
 ```bash
 uv run pisa-sample-analyze \
   --results /home/hcis-s05/ysws/PISA/runner/outputs/carla-esmini-lhs1000 \
-  --params Agent_S,Ego_Speed,Agent_Cutin_Distance \
   --color-by outcome \
+  --post-outcome-config examples/outcome_eval/low_ttc_result.yaml \
+  --bins 40 \
   --output analysis/sakura-results
 ```
 
-`--params` accepts at most 3 parameters. If omitted, the tool auto-selects up to 3 numeric parameters.
+The analyzer discovers every parameter and metric in the input. `--params` is optional and only controls the initial X/Y/Z axes shown when the report opens; all discovered parameters remain selectable in `report.html`.
+`--bins` controls the default 1D histogram bin count for the static SVG histograms and for the report's dynamic explorer. You can still adjust the 1D bin count directly inside `report.html` without regenerating the report.
+With `--post-outcome-config`, the analyzer runs offline outcome evaluation and embeds both original and post-evaluated outcomes. In `report.html`, use `Outcome source` to switch the analysis view, or use `Post Outcome Lab` to draft quick metric/param rules directly in the browser.
+
+Post outcome evaluation has two modes:
+
+- `--post-outcome-mode overlay` keeps the original runner outcome unless the post condition tree triggers. Use this for extra filters such as "mark existing results as fail when `min_ttc < 1.0`". This is the analysis default.
+- `--post-outcome-mode replace` treats the post condition tree as the complete outcome definition. Conditions must explicitly produce `success`, `fail`, or `invalid`; records with no triggered condition become `unknown`.
 
 Coloring supports:
 
@@ -287,6 +298,8 @@ Coloring supports:
 - `--color-by stop_condition`
 - `--color-by param:<name>`
 - `--color-by metric:<name>`
+
+Numeric `param:<name>` and `metric:<name>` values use a continuous light-to-dark blue scale instead of discrete class colors. This is useful for trends such as plotting `Ego_Speed` while coloring by `metric:ego_to_agent_1.min_ttc_s`.
 
 CSV sample input can use either explicit prefixes or plain parameter columns:
 
@@ -319,12 +332,220 @@ analysis/sakura-results/
 
 - choose X, Y, and optional Z parameters from dropdowns
 - switch between auto, 1D, 2D, and 3D views
+- adjust the 1D histogram bin count
 - recolor by outcome, status, stop condition, parameter value, or metric value
 - filter visible samples by outcome and status
 - click a point to inspect the full sample row
 - download the currently filtered rows as CSV
 
 For runner results, the analyzer reads each `iteration_<id>/monitor/result.csv`, parses `run.params` as sample parameters, uses `run.status`, `run.test_outcome`, `run.stop_condition`, and `run.stop_reason` for classification, and treats non-`run.*` columns as summary metrics.
+
+## Trajectory SVGs
+
+`pisa-sample-trajectory` visualizes `agent_state.csv` or `agent_states.csv` files from completed concrete scenarios.
+
+Render one concrete scenario:
+
+```bash
+uv run pisa-sample-trajectory \
+  --input /path/to/results/iteration_1 \
+  --output-dir analysis/trajectories
+```
+
+Render every concrete scenario in a runner results folder:
+
+```bash
+uv run pisa-sample-trajectory \
+  --input /path/to/results \
+  --output-dir analysis/trajectories
+```
+
+The tool finds `iteration_*/monitor/agent_states.csv` first. It also supports the singular filename `agent_state.csv` and can accept a CSV file directly through `--input`.
+
+Limit the plotted area with x/y ranges:
+
+```bash
+uv run pisa-sample-trajectory \
+  --input /path/to/results \
+  --output-dir analysis/trajectories-window \
+  --x-range -20,80 \
+  --y-range -10,30
+```
+
+Only points inside the requested ranges are drawn. The SVG plot uses equal x/y scaling, so one meter on x occupies the same pixel distance as one meter on y; if the requested range is wide or tall, the plot area is resized inside the SVG instead of stretching the trajectory.
+
+If you prefer filling the plot area even when x/y scale differs, use stretch mode:
+
+```bash
+uv run pisa-sample-trajectory \
+  --input /path/to/results \
+  --output-dir analysis/trajectories-stretched \
+  --x-range -20,80 \
+  --y-range -10,30 \
+  --scale-mode stretch
+```
+
+The default is `--scale-mode equal`.
+
+Each SVG draws `x/y` trajectories for all agents in one concrete scenario:
+
+- every `agent_id` gets a distinct color
+- the legend maps color to `agent_id`
+- line opacity represents speed; faster segments are darker
+- hollow circles mark trajectory starts and filled circles mark ends
+- the right side also shows the parameter combination and run result when `monitor/result.csv` is available
+
+Batch output:
+
+```text
+analysis/trajectories/
+  iteration_1_trajectory.svg
+  iteration_2_trajectory.svg
+  manifest.yaml
+```
+
+Existing output directories are rejected by default. Use `--overwrite` only for directories previously generated by this tool; non-tool directories are refused.
+
+## Trajectory Comparison
+
+`pisa-trajectory-compare` compares the same concrete scenario across two simulator/result sets. It reads `agent_states.csv` from each side, ignores `agent_id == 1` by default, compares overlapping non-ego agents, truncates each agent to the shorter timestep count, and writes metrics plus side-by-side trajectory SVGs.
+
+Compare one concrete scenario:
+
+```bash
+uv run pisa-trajectory-compare \
+  --left /path/to/carla-carla-lhs1234/iteration_1 \
+  --right /path/to/carla-esmini-lhs1234/iteration_1 \
+  --left-label carla \
+  --right-label esmini \
+  --output-dir analysis/trajectory-compare-one
+```
+
+Compare every shared parameter combination in a logical scenario result folder:
+
+```bash
+uv run pisa-trajectory-compare \
+  --left /path/to/carla-carla-lhs1234 \
+  --right /path/to/carla-esmini-lhs1234 \
+  --left-label carla \
+  --right-label esmini \
+  --output-dir analysis/trajectory-compare
+```
+
+The batch mode pairs shared `iteration_*` directories by name. If one result set has extra iterations, those are skipped because there is no matching parameter combination to compare.
+
+Metrics:
+
+- `ADE`: average displacement error across compared timesteps
+- `FDE`: final displacement error at the last compared timestep
+- `RMSE`: root mean square position error
+- `max_error`: largest timestep position error
+- `mean_speed_delta`: average absolute speed difference
+
+Each comparison SVG uses solid lines for the left result set, dashed lines for the right result set, and thin connector lines between matched timesteps. The side panel lists per-agent metrics, ignored agents, sample params, and compact run results when `monitor/result.csv` is available.
+
+Output:
+
+```text
+analysis/trajectory-compare/
+  iteration_1_comparison.svg
+  iteration_2_comparison.svg
+  summary.csv
+  manifest.yaml
+```
+
+`summary.csv` contains per-agent metrics for downstream analysis. `manifest.yaml` contains overall metrics and one entry per comparison. Existing output directories are rejected by default; `--overwrite` only replaces directories previously generated by `pisa-trajectory-compare`.
+
+## Offline Outcome Evaluation
+
+`pisa-outcome-eval` evaluates a new condition tree after a scenario has already run. It reads completed runner monitor logs and produces a new analysis outcome without rerunning the simulator.
+
+The base version supports offline leaf conditions for thresholds, expressions, and agent-pair comparisons:
+
+- `agent_state_threshold`: reads `monitor/agent_states.csv`, filters one `agent_id`, and checks a column such as `x`, `y`, `speed`, or `z`.
+- `frame_metric_threshold`: reads `monitor/frame_metrics.csv` and checks a per-frame metric such as `ego_to_agent_1.ttc_s`.
+- `result_metric_threshold`: reads `monitor/result.csv` and checks summary metrics such as `ego_to_agent_1.min_ttc_s`.
+- `agent_state_expression`, `frame_metric_expression`, `result_metric_expression`: evaluate runner-style numeric expressions over CSV row values.
+- `agent_pair_expression`: compares two agents from `agent_states.csv` on shared timesteps.
+
+The config intentionally looks like runner `stop_conditions.yaml`: a top-level list is treated as OR, and each triggering condition can set `outcome: Success`, `Fail`, or `Invalid`. Numeric rules reuse runner `simcore.metrics.rules.NumericRule`; expressions reuse runner `simcore.metrics.expressions.evaluate_numeric_expression`; `and`/`or` nodes reuse runner logical condition nodes.
+
+Example: mark a completed run as failed if any frame has TTC below 1.0 second:
+
+```yaml
+- type: frame_metric_threshold
+  name: low_ttc_reanalysis
+  outcome: Fail
+  metric: ego_to_agent_1.ttc_s
+  rule: lt
+  value: 1.0
+```
+
+Example: mark a run invalid if agent `0` ever leaves an x range:
+
+```yaml
+condition:
+  type: agent_state_threshold
+  name: agent_0_x_out_of_range
+  outcome: Invalid
+  agent_id: 0
+  metric: x
+  rule: outside
+  values: [-20, 120]
+```
+
+Example: use a summary metric from `result.csv`:
+
+```yaml
+condition:
+  type: result_metric_threshold
+  name: low_summary_ttc
+  outcome: Fail
+  metric: ego_to_agent_1.min_ttc_s
+  rule: lt
+  value: 1.0
+```
+
+See reusable YAML examples in [`examples/outcome_eval`](examples/outcome_eval).
+
+Run it on one concrete scenario:
+
+```bash
+uv run pisa-outcome-eval \
+  --input /path/to/results/iteration_1 \
+  --config analysis_conditions.yaml \
+  --output-dir analysis/outcomes-one
+```
+
+Run it on every `iteration_*` under a logical scenario result folder:
+
+```bash
+uv run pisa-outcome-eval \
+  --input /path/to/results \
+  --config analysis_conditions.yaml \
+  --output-dir analysis/outcomes
+```
+
+Output:
+
+```text
+analysis/outcomes/
+  offline_outcomes.csv
+  manifest.yaml
+```
+
+By default this does not change the original runner logs. Add `--write-monitor-outcome` to also write `monitor/offline_outcome.csv` beside each evaluated `result.csv`. This creates a separate analysis outcome file with `run.analysis_test_outcome`, `run.analysis_stop_condition`, and `run.analysis_stop_reason`; it does not overwrite the original `run.test_outcome` columns.
+
+Supported operators:
+
+- `<`, `<=`, `>`, `>=`, `==`
+- aliases from runner `NumericRule`, including `lt`, `le`, `gt`, `ge`, `eq`
+- `between` with `values: [min, max]`
+- `outside` or `out_of_range` with `values: [min, max]`
+
+For frame-like CSVs, conditions default to `aggregation: any`. You can also use `all`, `min`, `max`, `first`, or `last`.
+
+If a condition references a required file or column that is not present, the tool fails instead of silently treating the condition as false.
 
 ## Why Separate
 

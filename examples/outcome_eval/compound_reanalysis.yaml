@@ -1,0 +1,18 @@
+condition:
+  type: or
+  name: offline_reanalysis
+  children:
+    - type: result_metric_threshold
+      name: low_summary_ttc
+      outcome: Fail
+      metric: ego_to_agent_1.min_ttc_s
+      rule: lt
+      value: 1.0
+    - type: agent_pair_expression
+      name: agent_speed_gap_invalid
+      outcome: Invalid
+      source_agent_id: 0
+      target_agent_id: 1
+      expression: abs(source_speed - target_speed)
+      rule: gt
+      value: 50.0

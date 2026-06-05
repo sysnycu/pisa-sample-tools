@@ -24,6 +24,9 @@ class SourcePathMode(StrEnum):
     RELATIVE_TO_OUTPUT = "relative-to-output"
 
 
+EXPLICIT_SAMPLE_FILE_NAME = "explicit_samples.yaml"
+
+
 @dataclass(frozen=True)
 class ExportResult:
     output_dir: Path
@@ -98,7 +101,7 @@ def export_samples(
         bundle_id = index + 1
         bundle_dir = output_dir / f"{scenario_assets.name}-{sampler_runtime_spec.get('name')}{bundle_id}"
         xosc_path = bundle_dir / f"{scenario_assets.name}.xosc"
-        explicit_path = bundle_dir / "explicit.yaml"
+        explicit_path = bundle_dir / EXPLICIT_SAMPLE_FILE_NAME
         spec_path = bundle_dir / "spec.yaml"
         stop_conditions_path = bundle_dir / "stop_conditions.yaml"
 
@@ -472,13 +475,10 @@ def _split_samples(
 
 
 def _sample_to_dict(sample: Sample) -> dict[str, Any]:
-    data: dict[str, Any] = {
+    return {
         "id": sample.id,
-        "params": sample.params,
+        "params": sample.sim_params,
     }
-    if sample.metadata:
-        data["metadata"] = sample.metadata
-    return data
 
 
 def _config_source_path(

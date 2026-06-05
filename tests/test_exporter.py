@@ -16,7 +16,12 @@ def _write_yaml(path: Path, data: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def _make_runner_fixture(tmp_path: Path, *, sample_count: int = 5) -> Path:
+def _make_runner_fixture(
+    tmp_path: Path,
+    *,
+    sample_count: int = 5,
+    outputs: dict[str, Any] | None = None,
+) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     scenario_dir = tmp_path / "scenario"
     config_dir = tmp_path / "configs"
@@ -31,18 +36,18 @@ def _make_runner_fixture(tmp_path: Path, *, sample_count: int = 5) -> Path:
         scenario_dir / "stop_conditions.yaml",
         [{"type": "timeout", "name": "timeout", "timeout_ms": 1000}],
     )
-    _write_yaml(
-        scenario_dir / "params.yaml",
-        {
-            "parameters": [
-                {
-                    "name": "speed",
-                    "type": "int",
-                    "values": list(range(1, sample_count + 1)),
-                }
-            ]
-        },
-    )
+    params_config: dict[str, Any] = {
+        "parameters": [
+            {
+                "name": "speed",
+                "type": "int",
+                "values": list(range(1, sample_count + 1)),
+            }
+        ]
+    }
+    if outputs is not None:
+        params_config["outputs"] = outputs
+    _write_yaml(scenario_dir / "params.yaml", params_config)
     sampler_config = config_dir / "grid.yaml"
     _write_yaml(
         sampler_config,
@@ -87,7 +92,7 @@ def test_shard_size_splits_samples(tmp_path: Path) -> None:
     manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["shard_count"] == 3
     assert [shard["sample_count"] for shard in manifest["shards"]] == [2, 2, 1]
-    assert (output_dir / "demo_scenario-grid1" / "explicit.yaml").exists()
+    assert (output_dir / "demo_scenario-grid1" / "explicit_samples.yaml").exists()
     assert (output_dir / "demo_scenario-grid1" / "demo_scenario.xosc").exists()
     assert (output_dir / "demo_scenario-grid1" / "spec.yaml").exists()
     assert (output_dir / "demo_scenario-grid1" / "stop_conditions.yaml").exists()
@@ -111,9 +116,25 @@ def test_missing_sample_id_gets_stable_id(tmp_path: Path) -> None:
     export_samples(runner_spec_path=runner_spec, output_dir=output_dir, shard_size=10)
 
     shard = yaml.safe_load(
-        (output_dir / "demo_scenario-grid1" / "explicit.yaml").read_text(encoding="utf-8")
+        (output_dir / "demo_scenario-grid1" / "explicit_samples.yaml").read_text(encoding="utf-8")
     )
     assert [sample["id"] for sample in shard["samples"]] == ["1", "2"]
+
+
+def test_export_writes_only_sim_params_without_metadata(tmp_path: Path) -> None:
+    runner_spec = _make_runner_fixture(
+        tmp_path,
+        sample_count=1,
+        outputs={"ego_speed": {"expression": "speed * 2", "type": "int"}},
+    )
+    output_dir = tmp_path / "out"
+
+    export_samples(runner_spec_path=runner_spec, output_dir=output_dir, shard_size=10)
+
+    shard = yaml.safe_load(
+        (output_dir / "demo_scenario-grid1" / "explicit_samples.yaml").read_text(encoding="utf-8")
+    )
+    assert shard["samples"] == [{"id": "1", "params": {"ego_speed": 2}}]
 
 
 def test_manifest_contains_shard_details(tmp_path: Path) -> None:
@@ -135,7 +156,7 @@ def test_manifest_contains_shard_details(tmp_path: Path) -> None:
     assert manifest["shards"][0]["sample_count"] == 2
     assert manifest["shards"][0]["bundle_path"] == str(output_dir / "demo_scenario-grid1")
     assert manifest["shards"][0]["sample_file_path"] == str(
-        output_dir / "demo_scenario-grid1" / "explicit.yaml"
+        output_dir / "demo_scenario-grid1" / "explicit_samples.yaml"
     )
     assert manifest["shards"][0]["scenario_file_path"] == str(
         output_dir / "demo_scenario-grid1" / "demo_scenario.xosc"
@@ -199,7 +220,7 @@ def test_sampler_spec_input_builds_bundle(tmp_path: Path) -> None:
         shard_size=2,
     )
 
-    assert (output_dir / "demo_scenario-grid1" / "explicit.yaml").exists()
+    assert (output_dir / "demo_scenario-grid1" / "explicit_samples.yaml").exists()
 
 
 def test_missing_required_scenario_file_errors(tmp_path: Path) -> None:
@@ -228,7 +249,7 @@ def test_zip_output_excludes_manifest(tmp_path: Path) -> None:
 
     assert "manifest.yaml" not in names
     assert all(not name.endswith("/manifest.yaml") for name in names)
-    assert "demo_scenario-grid1/explicit.yaml" in names
+    assert "demo_scenario-grid1/explicit_samples.yaml" in names
     assert "demo_scenario-grid2/demo_scenario.xosc" in names
 
 
