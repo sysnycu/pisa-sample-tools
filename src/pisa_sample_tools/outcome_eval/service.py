@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import csv
 import re
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -14,86 +10,25 @@ from simcore.conditions.logical_nodes import AndNode, OrNode
 from simcore.metrics.expressions import evaluate_numeric_expression
 from simcore.metrics.rules import NumericRule
 
+from pisa_sample_tools.common.sorting import natural_key
 
-class OutcomeEvalError(ValueError):
-    """Raised for user-facing offline outcome evaluation failures."""
-
-
-class OutcomeEvalMode(StrEnum):
-    OVERLAY = "overlay"
-    REPLACE = "replace"
-
-
-OUTCOME_ALIASES = {
-    "success": "success",
-    "succeed": "success",
-    "pass": "success",
-    "passed": "success",
-    "ok": "success",
-    "fail": "fail",
-    "failure": "fail",
-    "failed": "fail",
-    "invalid": "invalid",
-}
-
-
-@dataclass(frozen=True)
-class ScenarioOutcome:
-    scenario_path: Path
-    monitor_path: Path
-    condition_name: str
-    code: ConditionCode
-    test_outcome: str
-    stop_condition: str
-    stop_reason: str
-    detail: str
-    triggered: bool
-    output_path: Path | None = None
-
-
-@dataclass(frozen=True)
-class OutcomeEvalResult:
-    input_path: Path
-    output_dir: Path
-    manifest_path: Path
-    summary_csv_path: Path
-    outcomes: list[ScenarioOutcome]
-
-
-@dataclass
-class ScenarioLog:
-    scenario_path: Path
-    monitor_path: Path
-    _agent_state_rows: list[dict[str, str]] | None = None
-    _frame_metric_rows: list[dict[str, str]] | None = None
-    _result_rows: list[dict[str, str]] | None = None
-
-    @property
-    def agent_states_path(self) -> Path:
-        return self.monitor_path / "agent_states.csv"
-
-    @property
-    def frame_metrics_path(self) -> Path:
-        return self.monitor_path / "frame_metrics.csv"
-
-    @property
-    def result_path(self) -> Path:
-        return self.monitor_path / "result.csv"
-
-    def agent_state_rows(self) -> list[dict[str, str]]:
-        if self._agent_state_rows is None:
-            self._agent_state_rows = _read_csv_dicts_required(self.agent_states_path)
-        return self._agent_state_rows
-
-    def frame_metric_rows(self) -> list[dict[str, str]]:
-        if self._frame_metric_rows is None:
-            self._frame_metric_rows = _read_csv_dicts_required(self.frame_metrics_path)
-        return self._frame_metric_rows
-
-    def result_rows(self) -> list[dict[str, str]]:
-        if self._result_rows is None:
-            self._result_rows = _read_csv_dicts_required(self.result_path)
-        return self._result_rows
+from .logs import ScenarioLog, discover_scenario_logs
+from .models import (
+    OUTCOME_ALIASES,
+    OutcomeEvalError,
+    OutcomeEvalMode,
+    OutcomeEvalResult,
+    ScenarioOutcome,
+)
+from .output import (
+    condition_code_label,
+    prepare_output_dir,
+    write_manifest,
+    write_summary_csv,
+)
+from .output import (
+    write_monitor_outcome as write_monitor_outcome_file,
+)
 
 
 class OfflineCondition(ConditionNode):
@@ -303,19 +238,19 @@ def evaluate_outcomes(
         raise OutcomeEvalError(f"no scenario monitor logs found in {input_path}")
     mode = OutcomeEvalMode(mode)
     default_outcome = _normalize_outcome(default_outcome, allow_unknown=True)
-    _prepare_output_dir(output_dir, overwrite=overwrite)
+    prepare_output_dir(output_dir, overwrite=overwrite)
 
     outcomes = [
         _evaluate_one(log, condition, mode=mode, default_outcome=default_outcome)
         for log in logs
     ]
     if write_monitor_outcome:
-        outcomes = [_write_monitor_outcome(outcome) for outcome in outcomes]
+        outcomes = [write_monitor_outcome_file(outcome) for outcome in outcomes]
 
     summary_csv_path = output_dir / "offline_outcomes.csv"
-    _write_summary_csv(summary_csv_path, outcomes)
+    write_summary_csv(summary_csv_path, outcomes)
     manifest_path = output_dir / "manifest.yaml"
-    _write_manifest(
+    write_manifest(
         manifest_path,
         input_path=input_path,
         config_path=config_path,
@@ -340,22 +275,6 @@ def build_condition_tree(config: Any) -> ConditionNode:
 
 def build_offline_condition_tree(config: Any) -> ConditionNode:
     return _build_node(_normalize_condition_config(config))
-
-
-def discover_scenario_logs(input_path: Path) -> list[ScenarioLog]:
-    input_path = input_path.expanduser()
-    if not input_path.exists():
-        raise OutcomeEvalError(f"input path does not exist: {input_path}")
-    if input_path.is_file():
-        raise OutcomeEvalError("input must be an iteration directory or runner result directory")
-    if _monitor_path(input_path).exists():
-        return [ScenarioLog(scenario_path=input_path, monitor_path=_monitor_path(input_path))]
-    logs: list[ScenarioLog] = []
-    for iteration_dir in sorted(input_path.glob("iteration_*"), key=_natural_path_key):
-        monitor = _monitor_path(iteration_dir)
-        if iteration_dir.is_dir() and monitor.exists():
-            logs.append(ScenarioLog(scenario_path=iteration_dir, monitor_path=monitor))
-    return logs
 
 
 def _build_node(config: dict[str, Any]) -> ConditionNode:
@@ -663,35 +582,6 @@ def _pair_variables(
     return variables
 
 
-def _write_monitor_outcome(outcome: ScenarioOutcome) -> ScenarioOutcome:
-    output_path = outcome.monitor_path / "offline_outcome.csv"
-    _write_csv_rows(
-        output_path,
-        [
-            {
-                "run.analysis_test_outcome": outcome.test_outcome,
-                "run.analysis_stop_condition": outcome.stop_condition,
-                "run.analysis_stop_reason": outcome.stop_reason,
-                "run.analysis_condition_code": _condition_code_label(outcome.code),
-                "run.analysis_condition_name": outcome.condition_name,
-                "run.analysis_triggered": str(outcome.triggered).lower(),
-            }
-        ],
-    )
-    return ScenarioOutcome(
-        scenario_path=outcome.scenario_path,
-        monitor_path=outcome.monitor_path,
-        condition_name=outcome.condition_name,
-        code=outcome.code,
-        test_outcome=outcome.test_outcome,
-        stop_condition=outcome.stop_condition,
-        stop_reason=outcome.stop_reason,
-        detail=outcome.detail,
-        triggered=outcome.triggered,
-        output_path=output_path,
-    )
-
-
 def _original_result_fields(log: ScenarioLog) -> dict[str, str]:
     try:
         rows = log.result_rows()
@@ -738,126 +628,11 @@ def _load_config(path: Path) -> Any:
         raise OutcomeEvalError(f"could not parse config: {exc}") from exc
 
 
-def _read_csv_dicts_required(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        raise OutcomeEvalError(f"required log file not found: {path}")
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, skipinitialspace=True)
-        if reader.fieldnames is None:
-            raise OutcomeEvalError(f"CSV has no header: {path}")
-        rows: list[dict[str, str]] = []
-        for raw_row in reader:
-            clean = {
-                (key or "").strip(): (value.strip() if isinstance(value, str) else "")
-                for key, value in raw_row.items()
-                if key is not None
-            }
-            if any(value not in {"", None} for value in clean.values()):
-                rows.append(clean)
-    return rows
-
-
 def _require_column(rows: list[dict[str, str]], column: str, path: Path) -> None:
     if not rows:
         raise OutcomeEvalError(f"{path} has no rows")
     if column not in rows[0]:
         raise OutcomeEvalError(f"required column '{column}' not found in {path}")
-
-
-def _write_summary_csv(path: Path, outcomes: list[ScenarioOutcome]) -> None:
-    _write_csv_rows(
-        path,
-        [
-            {
-                "scenario_path": outcome.scenario_path,
-                "monitor_path": outcome.monitor_path,
-                "test_outcome": outcome.test_outcome,
-                "stop_condition": outcome.stop_condition,
-                "condition_code": _condition_code_label(outcome.code),
-                "condition_name": outcome.condition_name,
-                "triggered": str(outcome.triggered).lower(),
-                "detail": outcome.detail,
-                "offline_outcome_path": outcome.output_path or "",
-            }
-            for outcome in outcomes
-        ],
-    )
-
-
-def _write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        raise OutcomeEvalError("cannot write empty CSV")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _write_manifest(
-    path: Path,
-    *,
-    input_path: Path,
-    config_path: Path,
-    mode: OutcomeEvalMode,
-    default_outcome: str,
-    write_monitor_outcome: bool,
-    outcomes: list[ScenarioOutcome],
-    summary_csv_path: Path,
-) -> None:
-    manifest = {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "input_path": str(input_path),
-        "config_path": str(config_path),
-        "mode": mode.value,
-        "default_outcome": default_outcome,
-        "write_monitor_outcome": write_monitor_outcome,
-        "scenario_count": len(outcomes),
-        "triggered_count": sum(outcome.triggered for outcome in outcomes),
-        "summary_csv_path": str(summary_csv_path),
-        "outcomes": [
-            {
-                "scenario_path": str(outcome.scenario_path),
-                "test_outcome": outcome.test_outcome,
-                "stop_condition": outcome.stop_condition,
-                "condition_code": _condition_code_label(outcome.code),
-                "condition_name": outcome.condition_name,
-                "triggered": outcome.triggered,
-                "detail": outcome.detail,
-                "offline_outcome_path": str(outcome.output_path) if outcome.output_path else None,
-            }
-            for outcome in outcomes
-        ],
-    }
-    path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
-
-
-def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
-    if output_dir.exists():
-        if not output_dir.is_dir():
-            raise OutcomeEvalError(f"output path exists and is not a directory: {output_dir}")
-        if not overwrite:
-            raise OutcomeEvalError(f"output directory already exists: {output_dir}")
-        if not any(output_dir.iterdir()):
-            return
-        _clear_previous_output(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-
-def _clear_previous_output(output_dir: Path) -> None:
-    manifest_path = output_dir / "manifest.yaml"
-    if not manifest_path.exists():
-        raise OutcomeEvalError(
-            "output directory already exists and is not empty, but no manifest.yaml was found; "
-            "refusing to overwrite non-tool output"
-        )
-    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    if "outcomes" not in manifest or "summary_csv_path" not in manifest:
-        raise OutcomeEvalError("existing manifest.yaml does not look like outcome eval tool output")
-    summary_csv_path = Path(str(manifest.get("summary_csv_path", "")))
-    if summary_csv_path.exists() and summary_csv_path.is_file() and _is_relative_to(summary_csv_path, output_dir):
-        summary_csv_path.unlink()
-    manifest_path.unlink()
 
 
 def _parse_agent_ids(config: dict[str, Any]) -> frozenset[str] | None:
@@ -953,33 +728,13 @@ def _variable_name(value: str) -> str:
     return name
 
 
-def _condition_code_label(code: ConditionCode) -> str:
-    if code == ConditionCode.TRIGGERED:
-        return "triggered"
-    if code == ConditionCode.NOT_TRIGGERED:
-        return "not_triggered"
-    return "not_evaluated"
-
-
-def _monitor_path(path: Path) -> Path:
-    return path / "monitor"
-
-
-def _natural_path_key(path: Path) -> list[Any]:
-    return _natural_key(str(path))
-
-
 def _natural_key(value: Any) -> list[Any]:
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value))]
+    return natural_key(value)
 
 
 def _is_any_agent(raw_value: Any) -> bool:
     return isinstance(raw_value, str) and raw_value.strip().lower() in {"any", "*", "all"}
 
 
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.resolve().relative_to(parent.resolve())
-    except ValueError:
-        return False
-    return True
+def _condition_code_label(code: ConditionCode) -> str:
+    return condition_code_label(code)
