@@ -1,8 +1,11 @@
-# pisa-sample-tools
+# pisa-analysis-tools
 
-Offline sampling and sharding tools for PISA runner sampler specs.
+Offline sampling and scenario-based validation evidence tools for PISA experiments.
 
-This project reuses the runner package `simcore` sampler API to materialize every sample from one logical scenario, then writes bundle folders that can be distributed across machines.
+The distribution is being renamed from `pisa-sample-tools` because it now covers the full
+offline workflow: sampler inspection/export, outcome re-evaluation, trajectory analysis,
+component comparison, and paper-ready validation evidence. Existing Python imports and CLI
+commands remain compatible.
 
 ## Install
 
@@ -23,12 +26,26 @@ If the runner repo moves, update that path and run `uv sync` again. The runner r
 
 This repo provides these commands:
 
+- `pisa-analysis`: build reproducible evidence bundles and access the unified CLI. See [docs/validation-evidence](docs/validation-evidence/README.md).
 - `pisa-sample-test`: preview raw sampler output from one sampler source file. See [docs/sampler-preview](docs/sampler-preview/README.md).
 - `pisa-sample-export`: materialize samples and split them into runner-ready bundle folders. See [docs/sample-export](docs/sample-export/README.md).
 - `pisa-sample-analyze`: inspect planned samples, generated explicit samples, or completed runner results. See [docs/sample-analyze](docs/sample-analyze/README.md).
 - `pisa-sample-trajectory`: render agent trajectory SVGs from completed runner results. See [docs/trajectory](docs/trajectory/README.md).
 - `pisa-trajectory-compare`: compare non-ego trajectories between two simulator result sets. See [docs/trajectory-compare](docs/trajectory-compare/README.md).
 - `pisa-outcome-eval`: evaluate offline condition trees against completed monitor logs. See [docs/outcome-eval](docs/outcome-eval/README.md).
+
+## Validation Evidence
+
+```bash
+uv run pisa-analysis build \
+  --results /path/to/runner/results \
+  --spec examples/analysis_spec.yaml \
+  --output analysis/cutin
+```
+
+This produces normalized summary tables, parameter-space safety maps, metric distributions,
+representative trajectories and traces, component/repeated-run comparisons, an offline
+evidence dashboard, Markdown/LaTeX report artifacts, and complete provenance.
 
 ## Sampler Preview
 
@@ -387,6 +404,17 @@ uv run pisa-sample-trajectory \
 
 The default is `--scale-mode equal`.
 
+Use an agent's first position as the origin when you want relative coordinates:
+
+```bash
+uv run pisa-sample-trajectory \
+  --input /path/to/results \
+  --output-dir analysis/trajectories-relative \
+  --origin-agent-id 1
+```
+
+The tool translates every point by that first `agent_id` position before plotting. If you also pass `--ignore-agent-id`, the origin is still computed from the original data first, so you can use an agent as the origin without drawing it.
+
 Each SVG draws `x/y` trajectories for all agents in one concrete scenario:
 
 - every `agent_id` gets a distinct color
@@ -408,7 +436,7 @@ Existing output directories are rejected by default. Use `--overwrite` only for 
 
 ## Trajectory Comparison
 
-`pisa-trajectory-compare` compares the same concrete scenario across two simulator/result sets. It reads `agent_states.csv` from each side, ignores `agent_id == 1` by default, compares overlapping non-ego agents, truncates each agent to the shorter timestep count, and writes metrics plus side-by-side trajectory SVGs.
+`pisa-trajectory-compare` compares the same concrete scenario across two simulator/result sets. It reads `agent_states.csv` from each side, ignores `agent_id == 1` by default, compares overlapping non-ego agents, truncates each agent to the shorter timestep count, and writes metrics plus overlaid trajectory SVGs.
 
 Compare one concrete scenario:
 
@@ -442,7 +470,7 @@ Metrics:
 - `max_error`: largest timestep position error
 - `mean_speed_delta`: average absolute speed difference
 
-Each comparison SVG uses solid lines for the left result set, dashed lines for the right result set, and thin connector lines between matched timesteps. The side panel lists per-agent metrics, ignored agents, sample params, and compact run results when `monitor/result.csv` is available.
+Each comparison SVG overlays both trajectories in one plot: solid lines for the left result set and dashed lines for the right result set. Thin dark connector lines show the matched timesteps used for error metrics; those straight segments are not trajectories. The default `--scale-mode equal` preserves the same x/y scale used by `pisa-sample-trajectory`; use `--scale-mode stretch` only when you want the plot stretched to fill the available area. The side panel lists per-agent metrics, ignored agents, sample params, and compact run results when `monitor/result.csv` is available.
 
 Output:
 

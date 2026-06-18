@@ -53,6 +53,9 @@ class TrajectorySvgResult:
     max_speed: float
     params: dict[str, Any]
     result: dict[str, Any]
+    origin_agent_id: str | None = None
+    origin_x: float | None = None
+    origin_y: float | None = None
 
 
 @dataclass(frozen=True)
@@ -60,4 +63,3 @@ class TrajectoryBatchResult:
     output_dir: Path
     manifest_path: Path
     results: list[TrajectorySvgResult]
-

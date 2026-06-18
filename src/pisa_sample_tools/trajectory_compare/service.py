@@ -27,6 +27,7 @@ def compare_trajectory_sets(
     overwrite: bool = False,
     width: int = 1200,
     height: int = 820,
+    equal_scale: bool = True,
 ) -> TrajectoryCompareBatchResult:
     ignore_agent_ids = ignore_agent_ids or {"1"}
     pairs = pair_agent_state_files(left_path.expanduser(), right_path.expanduser())
@@ -47,6 +48,7 @@ def compare_trajectory_sets(
             ignore_agent_ids=ignore_agent_ids,
             width=width,
             height=height,
+            equal_scale=equal_scale,
         )
         if comparison.agents:
             comparisons.append(comparison)
@@ -64,6 +66,7 @@ def compare_trajectory_sets(
         left_label=left_label or _default_label(left_path),
         right_label=right_label or _default_label(right_path),
         ignore_agent_ids=ignore_agent_ids,
+        equal_scale=equal_scale,
         comparisons=comparisons,
         summary_csv_path=summary_csv_path,
     )
@@ -86,6 +89,7 @@ def compare_agent_state_files(
     ignore_agent_ids: set[str],
     width: int = 1200,
     height: int = 820,
+    equal_scale: bool = True,
 ) -> TrajectoryComparison:
     left_states = load_agent_states(left_file)
     right_states = load_agent_states(right_file)
@@ -117,6 +121,7 @@ def compare_agent_state_files(
         ignore_agent_ids=ignore_agent_ids,
         width=width,
         height=height,
+        equal_scale=equal_scale,
     )
     svg_path.write_text(svg, encoding="utf-8")
     return TrajectoryComparison(
@@ -139,4 +144,3 @@ def _default_label(path: Path) -> str:
                 return parent.parent.parent.name if parent.parent.name == "monitor" else parent.name
         return path.stem
     return path.name
-

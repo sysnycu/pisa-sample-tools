@@ -12,19 +12,37 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pisa-trajectory-compare",
         description="Compare non-ego agent trajectories from two simulator result sets.",
     )
-    parser.add_argument("--left", type=Path, required=True, help="Left result dir, iteration dir, or agent_states.csv.")
-    parser.add_argument("--right", type=Path, required=True, help="Right result dir, iteration dir, or agent_states.csv.")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for comparison SVGs and metrics.")
+    parser.add_argument(
+        "--left",
+        type=Path,
+        required=True,
+        help="Left result dir, iteration dir, or agent_states.csv.",
+    )
+    parser.add_argument(
+        "--right",
+        type=Path,
+        required=True,
+        help="Right result dir, iteration dir, or agent_states.csv.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, required=True, help="Directory for comparison SVGs and metrics."
+    )
     parser.add_argument("--left-label", help="Display label for the left simulator/result set.")
     parser.add_argument("--right-label", help="Display label for the right simulator/result set.")
     parser.add_argument(
         "--ignore-agent-id",
         action="append",
-        default=["1"],
-        help="Agent id to ignore. Defaults to 1. Can be repeated.",
+        default=["0"],
+        help="Agent id to ignore. Defaults to 0. Can be repeated.",
     )
     parser.add_argument("--width", type=int, default=1200, help="SVG width in pixels.")
     parser.add_argument("--height", type=int, default=820, help="SVG height in pixels.")
+    parser.add_argument(
+        "--scale-mode",
+        choices=["equal", "stretch"],
+        default="equal",
+        help="Use equal x/y scale or stretch x/y independently to fill the plot area.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -47,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             width=args.width,
             height=args.height,
+            equal_scale=args.scale_mode == "equal",
         )
     except (TrajectoryCompareError, ValueError) as exc:
         parser.error(str(exc))
@@ -59,4 +78,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

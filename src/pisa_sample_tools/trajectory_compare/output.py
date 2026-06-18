@@ -60,6 +60,7 @@ def write_manifest(
     left_label: str,
     right_label: str,
     ignore_agent_ids: set[str],
+    equal_scale: bool,
     comparisons: list[TrajectoryComparison],
     summary_csv_path: Path,
 ) -> None:
@@ -69,6 +70,7 @@ def write_manifest(
         "left_label": left_label,
         "right_label": right_label,
         "ignore_agent_ids": sorted(ignore_agent_ids, key=natural_key),
+        "scale_mode": "equal" if equal_scale else "stretch",
         "comparison_count": len(comparisons),
         "summary_csv_path": str(summary_csv_path),
         "overall": {
@@ -129,4 +131,3 @@ def clear_previous_compare_output(output_dir: Path, manifest: dict[str, Any]) ->
         and is_relative_to(summary_csv_path, output_dir)
     ):
         summary_csv_path.unlink()
-

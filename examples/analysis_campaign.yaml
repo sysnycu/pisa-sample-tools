@@ -1,0 +1,24 @@
+version: 1
+
+datasets:
+  - id: carla-behavior-r1
+    results: /path/to/carla-behavior-results
+    logical_scenario_name: cut-in
+    labels:
+      simulator: CARLA
+      av: Behavior Agent
+      sampler: Grid
+    grouping:
+      seed: 7
+      repeat_id: 1
+
+  - id: carla-autoware-r1
+    results: /path/to/carla-autoware-results
+    logical_scenario_name: cut-in
+    labels:
+      simulator: CARLA
+      av: Autoware
+      sampler: Grid
+    grouping:
+      seed: 7
+      repeat_id: 1

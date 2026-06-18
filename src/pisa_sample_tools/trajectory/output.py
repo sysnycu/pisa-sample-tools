@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from pisa_sample_tools.common.output import prepare_manifest_output_dir, unlink_manifest_paths
+from pisa_sample_tools.common.sorting import natural_key
 from pisa_sample_tools.common.yaml import write_yaml
 
 from .models import TrajectoryError, TrajectorySvgResult
@@ -32,6 +33,8 @@ def write_manifest(
     x_range: tuple[float, float] | None,
     y_range: tuple[float, float] | None,
     equal_scale: bool,
+    ignore_agent_ids: set[str],
+    origin_agent_id: str | None,
 ) -> None:
     manifest = {
         "input_path": str(input_path),
@@ -39,6 +42,8 @@ def write_manifest(
         "x_range": list(x_range) if x_range is not None else None,
         "y_range": list(y_range) if y_range is not None else None,
         "scale_mode": "equal" if equal_scale else "stretch",
+        "ignore_agent_ids": sorted(ignore_agent_ids, key=natural_key),
+        "origin_agent_id": origin_agent_id,
         "outputs": [
             {
                 "source_path": str(result.source_path),
@@ -49,9 +54,11 @@ def write_manifest(
                 "max_speed": result.max_speed,
                 "params": result.params,
                 "result": result.result,
+                "origin_agent_id": result.origin_agent_id,
+                "origin_x": result.origin_x,
+                "origin_y": result.origin_y,
             }
             for result in results
         ],
     }
     write_yaml(manifest_path, manifest)
-

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from pisa_sample_tools.common.formatting import format_number, panel_value, wrap_text
 from pisa_sample_tools.common.sorting import natural_key
 from pisa_sample_tools.common.svg import escape, svg_header, svg_rect, svg_text
 from pisa_sample_tools.trajectory import AGENT_COLORS, AgentState
+from pisa_sample_tools.trajectory.render import axes, equal_scale_plot_area, expanded_range
 
 from .metrics import states_by_agent
 from .models import AgentComparison
@@ -26,6 +26,7 @@ def comparison_to_svg(
     ignore_agent_ids: set[str],
     width: int = 1200,
     height: int = 820,
+    equal_scale: bool = True,
 ) -> str:
     included_agent_ids = {agent.agent_id for agent in agents}
     left_plot = [state for state in left_states if state.agent_id in included_agent_ids]
@@ -35,16 +36,28 @@ def comparison_to_svg(
 
     xs = [state.x for state in [*left_plot, *right_plot]]
     ys = [state.y for state in [*left_plot, *right_plot]]
-    min_x, max_x = _expanded_range(min(xs), max(xs))
-    min_y, max_y = _expanded_range(min(ys), max(ys))
+    min_x, max_x = expanded_range(min(xs), max(xs))
+    min_y, max_y = expanded_range(min(ys), max(ys))
 
     side_width = 330
     margin_left = 78
     margin_top = 78
     margin_right = side_width + 36
     margin_bottom = 70
-    plot_width = width - margin_left - margin_right
-    plot_height = height - margin_top - margin_bottom
+    available_width = width - margin_left - margin_right
+    available_height = height - margin_top - margin_bottom
+    if equal_scale:
+        margin_left, margin_top, plot_width, plot_height = equal_scale_plot_area(
+            base_left=margin_left,
+            base_top=margin_top,
+            available_width=available_width,
+            available_height=available_height,
+            x_span=max_x - min_x,
+            y_span=max_y - min_y,
+        )
+    else:
+        plot_width = available_width
+        plot_height = available_height
 
     def sx(x: float) -> float:
         return margin_left + (x - min_x) / (max_x - min_x) * plot_width
@@ -58,7 +71,7 @@ def comparison_to_svg(
     parts = [svg_header(width, height)]
     parts.append(svg_rect(0, 0, width, height, "#ffffff"))
     parts.append(svg_text(width / 2, 30, f"Trajectory Comparison: {name}", size=19, weight="700", anchor="middle"))
-    parts.extend(_axes(margin_left, margin_top, plot_width, plot_height, min_x, max_x, min_y, max_y))
+    parts.extend(axes(margin_left, margin_top, plot_width, plot_height, min_x, max_x, min_y, max_y))
 
     for index, agent in enumerate(agents):
         color = AGENT_COLORS[index % len(AGENT_COLORS)]
@@ -191,44 +204,6 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _axes(
-    margin_left: float,
-    margin_top: float,
-    plot_width: float,
-    plot_height: float,
-    min_x: float,
-    max_x: float,
-    min_y: float,
-    max_y: float,
-) -> list[str]:
-    x0 = margin_left
-    y0 = margin_top + plot_height
-    parts = [
-        f'<rect x="{margin_left:.2f}" y="{margin_top:.2f}" width="{plot_width:.2f}" height="{plot_height:.2f}" fill="#f8fafc" stroke="#d1d5db"/>',
-    ]
-    for tick in range(6):
-        fraction = tick / 5
-        x = margin_left + fraction * plot_width
-        y = margin_top + plot_height - fraction * plot_height
-        x_value = min_x + fraction * (max_x - min_x)
-        y_value = min_y + fraction * (max_y - min_y)
-        parts.append(f'<line x1="{x:.2f}" y1="{margin_top:.2f}" x2="{x:.2f}" y2="{y0:.2f}" stroke="#e5e7eb"/>')
-        parts.append(f'<line x1="{x0:.2f}" y1="{y:.2f}" x2="{x0 + plot_width:.2f}" y2="{y:.2f}" stroke="#e5e7eb"/>')
-        parts.append(svg_text(x, y0 + 24, format_number(x_value), size=11, anchor="middle"))
-        parts.append(svg_text(x0 - 14, y + 4, format_number(y_value), size=11, anchor="end"))
-    parts.append(svg_text(margin_left + plot_width / 2, y0 + 50, "x", size=13, weight="700", anchor="middle"))
-    parts.append(svg_text(18, margin_top + plot_height / 2, "y", size=13, weight="700", anchor="middle", rotate=-90))
-    return parts
-
-
-def _expanded_range(min_value: float, max_value: float) -> tuple[float, float]:
-    if math.isclose(min_value, max_value):
-        delta = max(1.0, abs(min_value) * 0.1)
-        return min_value - delta, max_value + delta
-    padding = (max_value - min_value) * 0.06
-    return min_value - padding, max_value + padding
-
-
 def _empty_comparison_svg(name: str, width: int, height: int) -> str:
     return "\n".join(
         [
@@ -241,4 +216,3 @@ def _empty_comparison_svg(name: str, width: int, height: int) -> str:
 
 def _format_panel_value(value: Any) -> str:
     return panel_value(value)
-

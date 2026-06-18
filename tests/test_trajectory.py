@@ -13,7 +13,9 @@ from pisa_sample_tools.trajectory import (
     TrajectoryError,
     discover_agent_state_files,
     load_agent_states,
+    origin_for_agent,
     states_to_svg,
+    translate_states,
     visualize_trajectories,
 )
 from pisa_sample_tools.trajectory_cli import main
@@ -172,6 +174,8 @@ def test_visualize_results_folder_writes_all_iteration_svgs_and_manifest(tmp_pat
     assert (output_dir / "iteration_2_trajectory.svg").exists()
     manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["svg_count"] == 2
+    assert manifest["ignore_agent_ids"] == []
+    assert manifest["origin_agent_id"] is None
     assert manifest["outputs"][0]["agent_count"] == 2
     assert manifest["outputs"][0]["state_count"] == 4
 
@@ -212,6 +216,95 @@ def test_visualize_filters_points_by_xy_range(tmp_path: Path) -> None:
     assert "speed 10" not in svg
     assert manifest["x_range"] == [-1, 1]
     assert manifest["y_range"] == [-1, 6]
+
+
+def test_visualize_can_ignore_agent_ids(tmp_path: Path) -> None:
+    iteration_dir = tmp_path / "results" / "iteration_1"
+    _write_agent_states(iteration_dir / "monitor" / "agent_states.csv", _rows())
+    output_dir = tmp_path / "trajectories"
+
+    result = visualize_trajectories(
+        input_path=iteration_dir,
+        output_dir=output_dir,
+        ignore_agent_ids={"1"},
+    )
+
+    svg = (output_dir / "iteration_1_trajectory.svg").read_text(encoding="utf-8")
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert result.results[0].agent_count == 1
+    assert result.results[0].state_count == 2
+    assert "agent 0" in svg
+    assert "agent 1" not in svg
+    assert manifest["ignore_agent_ids"] == ["1"]
+
+
+def test_visualize_can_translate_origin_to_agent_first_position(tmp_path: Path) -> None:
+    iteration_dir = tmp_path / "results" / "iteration_1"
+    _write_agent_states(iteration_dir / "monitor" / "agent_states.csv", _rows(offset=10))
+    output_dir = tmp_path / "trajectories"
+
+    result = visualize_trajectories(
+        input_path=iteration_dir,
+        output_dir=output_dir,
+        origin_agent_id="1",
+    )
+
+    svg = (output_dir / "iteration_1_trajectory.svg").read_text(encoding="utf-8")
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert result.results[0].origin_agent_id == "1"
+    assert result.results[0].origin_x == pytest.approx(10.0)
+    assert result.results[0].origin_y == pytest.approx(5.0)
+    assert manifest["origin_agent_id"] == "1"
+    assert manifest["outputs"][0]["origin_x"] == pytest.approx(10.0)
+    assert manifest["outputs"][0]["origin_y"] == pytest.approx(5.0)
+    assert "agent 1 start" in svg
+
+
+def test_translate_states_moves_origin_agent_first_position_to_zero() -> None:
+    states = load_agent_states_from_rows(_rows(offset=10))
+    origin = origin_for_agent(states, "1")
+
+    assert origin == pytest.approx((10.0, 5.0))
+    translated = translate_states(states, origin=origin)
+    agent_1_start = next(state for state in translated if state.agent_id == "1" and state.step_index == 0)
+    agent_0_start = next(state for state in translated if state.agent_id == "0" and state.step_index == 0)
+    assert agent_1_start.x == pytest.approx(0.0)
+    assert agent_1_start.y == pytest.approx(0.0)
+    assert agent_0_start.x == pytest.approx(0.0)
+    assert agent_0_start.y == pytest.approx(-5.0)
+
+
+def test_visualize_can_use_ignored_agent_as_origin(tmp_path: Path) -> None:
+    iteration_dir = tmp_path / "results" / "iteration_1"
+    _write_agent_states(iteration_dir / "monitor" / "agent_states.csv", _rows(offset=10))
+    output_dir = tmp_path / "trajectories"
+
+    result = visualize_trajectories(
+        input_path=iteration_dir,
+        output_dir=output_dir,
+        ignore_agent_ids={"1"},
+        origin_agent_id="1",
+    )
+
+    svg = (output_dir / "iteration_1_trajectory.svg").read_text(encoding="utf-8")
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert result.results[0].agent_count == 1
+    assert "agent 1" not in svg
+    assert manifest["ignore_agent_ids"] == ["1"]
+    assert manifest["origin_agent_id"] == "1"
+
+
+def test_visualize_origin_agent_id_must_exist(tmp_path: Path) -> None:
+    iteration_dir = tmp_path / "results" / "iteration_1"
+    _write_agent_states(iteration_dir / "monitor" / "agent_states.csv", _rows())
+    output_dir = tmp_path / "trajectories"
+
+    with pytest.raises(TrajectoryError, match="origin agent id not found"):
+        visualize_trajectories(
+            input_path=iteration_dir,
+            output_dir=output_dir,
+            origin_agent_id="missing",
+        )
 
 
 def test_states_to_svg_uses_equal_xy_scale() -> None:
@@ -359,6 +452,57 @@ def test_cli_trajectory_accepts_stretch_scale_mode(tmp_path: Path) -> None:
     )
     assert rect is not None
     assert float(rect.group("width")) / float(rect.group("height")) != pytest.approx(10.0)
+
+
+def test_cli_trajectory_accepts_ignored_agent_ids(tmp_path: Path) -> None:
+    results_dir = tmp_path / "results"
+    _write_agent_states(results_dir / "iteration_1" / "monitor" / "agent_states.csv", _rows())
+    output_dir = tmp_path / "trajectories"
+
+    assert (
+        main(
+            [
+                "--input",
+                str(results_dir),
+                "--output-dir",
+                str(output_dir),
+                "--ignore-agent-id",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    svg = (output_dir / "iteration_1_trajectory.svg").read_text(encoding="utf-8")
+    assert manifest["ignore_agent_ids"] == ["1"]
+    assert manifest["outputs"][0]["agent_count"] == 1
+    assert "agent 1" not in svg
+
+
+def test_cli_trajectory_accepts_origin_agent_id(tmp_path: Path) -> None:
+    results_dir = tmp_path / "results"
+    _write_agent_states(results_dir / "iteration_1" / "monitor" / "agent_states.csv", _rows(offset=10))
+    output_dir = tmp_path / "trajectories"
+
+    assert (
+        main(
+            [
+                "--input",
+                str(results_dir),
+                "--output-dir",
+                str(output_dir),
+                "--origin-agent-id",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["origin_agent_id"] == "1"
+    assert manifest["outputs"][0]["origin_x"] == pytest.approx(10.0)
+    assert manifest["outputs"][0]["origin_y"] == pytest.approx(5.0)
 
 
 def load_agent_states_from_rows(rows: list[dict[str, object]]) -> list[AgentState]:

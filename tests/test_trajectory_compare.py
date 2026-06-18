@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,7 @@ def test_compare_single_iteration_writes_svg_summary_and_manifest(tmp_path: Path
     assert (output_dir / "summary.csv").exists()
     manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["comparison_count"] == 1
+    assert manifest["scale_mode"] == "equal"
     assert manifest["ignore_agent_ids"] == ["1"]
     assert manifest["comparisons"][0]["agents"][0]["agent_id"] == "0"
     svg = (output_dir / "iteration_1_comparison.svg").read_text(encoding="utf-8")
@@ -93,6 +95,38 @@ def test_compare_single_iteration_writes_svg_summary_and_manifest(tmp_path: Path
     assert "solid" in svg
     assert "dashed" in svg
     assert "ignored agents: 1" in svg
+
+
+def test_compare_svg_defaults_to_equal_scale_like_trajectory(tmp_path: Path) -> None:
+    left = tmp_path / "left" / "iteration_1"
+    right = tmp_path / "right" / "iteration_1"
+    _write_agent_states(left / "monitor" / "agent_states.csv", _left_rows())
+    _write_agent_states(right / "monitor" / "agent_states.csv", _right_rows())
+    output_dir = tmp_path / "compare"
+
+    compare_trajectory_sets(left_path=left, right_path=right, output_dir=output_dir)
+
+    svg = (output_dir / "iteration_1_comparison.svg").read_text(encoding="utf-8")
+    match = re.search(r'id="trajectory-plot-area"[^>]*width="(?P<width>[^"]+)"[^>]*height="(?P<height>[^"]+)"', svg)
+    assert match is not None
+    assert float(match.group("height")) < 672.0
+
+
+def test_compare_svg_can_use_stretch_scale(tmp_path: Path) -> None:
+    left = tmp_path / "left" / "iteration_1"
+    right = tmp_path / "right" / "iteration_1"
+    _write_agent_states(left / "monitor" / "agent_states.csv", _left_rows())
+    _write_agent_states(right / "monitor" / "agent_states.csv", _right_rows())
+    output_dir = tmp_path / "compare"
+
+    compare_trajectory_sets(left_path=left, right_path=right, output_dir=output_dir, equal_scale=False)
+
+    svg = (output_dir / "iteration_1_comparison.svg").read_text(encoding="utf-8")
+    match = re.search(r'id="trajectory-plot-area"[^>]*width="(?P<width>[^"]+)"[^>]*height="(?P<height>[^"]+)"', svg)
+    assert match is not None
+    assert float(match.group("height")) == pytest.approx(672.0)
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["scale_mode"] == "stretch"
 
 
 def test_compare_batch_pairs_shared_iterations(tmp_path: Path) -> None:

@@ -1,0 +1,44 @@
+version: 1
+
+metadata:
+  logical_scenario_name: cut-in
+
+parameters:
+  axes:
+    x: Agent_Cutin_Distance
+    y: Agent_Speed
+  units:
+    Agent_Cutin_Distance: m
+    Agent_Speed: m/s
+
+metrics:
+  min_ttc:
+    summary: ego_to_agent_1.min_ttc_s
+    series: ego_to_agent_1.ttc_s
+    label: Minimum TTC
+    unit: s
+  min_distance:
+    summary: ego_to_agent_1.min_distance_m
+    series: ego_to_agent_1.distance_m
+    label: Minimum ego-agent distance
+    unit: m
+  max_deceleration:
+    summary: ego_deceleration.max
+    series: ego.acceleration
+    label: Maximum ego deceleration
+    unit: m/s^2
+
+outcomes:
+  success: [success]
+  failure: [fail, failure, failed, test_fail]
+  invalid: [invalid]
+  collision_reasons: [collision, collision_guard]
+
+thresholds:
+  near_critical_ttc_s: 2.0
+
+heatmap:
+  bins: 30
+
+output:
+  formats: [svg, png]

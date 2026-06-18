@@ -41,6 +41,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use equal x/y scale or stretch x/y independently to fill the plot area.",
     )
     parser.add_argument(
+        "--ignore-agent-id",
+        action="append",
+        default=[],
+        help="Agent id to omit from trajectory SVGs. Can be repeated. Defaults to none.",
+    )
+    parser.add_argument(
+        "--origin-agent-id",
+        help="Translate coordinates so this agent's first position is x=0,y=0. Defaults to original coordinates.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite a previous trajectory output directory containing manifest.yaml.",
@@ -63,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
             x_range=x_range,
             y_range=y_range,
             equal_scale=args.scale_mode == "equal",
+            ignore_agent_ids=set(args.ignore_agent_id),
+            origin_agent_id=args.origin_agent_id,
         )
     except TrajectoryError as exc:
         parser.error(str(exc))
@@ -87,4 +99,3 @@ def _parse_range(value: str | None, *, label: str) -> tuple[float, float] | None
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

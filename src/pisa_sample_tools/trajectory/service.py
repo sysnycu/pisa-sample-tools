@@ -7,7 +7,13 @@ from pisa_sample_tools.common.formatting import slug
 from .io import discover_agent_state_files, load_agent_states, load_run_info_for_agent_state_file
 from .models import TrajectoryBatchResult, TrajectoryError, TrajectorySvgResult
 from .output import prepare_output_dir, write_manifest
-from .render import filter_states_by_range, states_to_svg
+from .render import (
+    filter_states_by_agent,
+    filter_states_by_range,
+    origin_for_agent,
+    states_to_svg,
+    translate_states,
+)
 
 
 def render_agent_trajectory_svg(
@@ -19,8 +25,16 @@ def render_agent_trajectory_svg(
     x_range: tuple[float, float] | None = None,
     y_range: tuple[float, float] | None = None,
     equal_scale: bool = True,
+    ignore_agent_ids: set[str] | None = None,
+    origin_agent_id: str | None = None,
 ) -> str:
     states = load_agent_states(source_path)
+    if origin_agent_id is not None:
+        origin = origin_for_agent(states, origin_agent_id)
+        if origin is None:
+            raise TrajectoryError(f"origin agent id not found in {source_path}: {origin_agent_id}")
+        states = translate_states(states, origin=origin)
+    states = filter_states_by_agent(states, ignore_agent_ids=ignore_agent_ids)
     states = filter_states_by_range(states, x_range=x_range, y_range=y_range)
     if not states:
         raise TrajectoryError(f"no agent states found in requested range for {source_path}")
@@ -46,7 +60,10 @@ def visualize_trajectories(
     x_range: tuple[float, float] | None = None,
     y_range: tuple[float, float] | None = None,
     equal_scale: bool = True,
+    ignore_agent_ids: set[str] | None = None,
+    origin_agent_id: str | None = None,
 ) -> TrajectoryBatchResult:
+    ignore_agent_ids = ignore_agent_ids or set()
     input_path = input_path.expanduser()
     source_files = discover_agent_state_files(input_path)
     if not source_files:
@@ -56,6 +73,13 @@ def visualize_trajectories(
     results: list[TrajectorySvgResult] = []
     for source_file in source_files:
         states = load_agent_states(source_file)
+        origin: tuple[float, float] | None = None
+        if origin_agent_id is not None:
+            origin = origin_for_agent(states, origin_agent_id)
+            if origin is None:
+                raise TrajectoryError(f"origin agent id not found in {source_file}: {origin_agent_id}")
+            states = translate_states(states, origin=origin)
+        states = filter_states_by_agent(states, ignore_agent_ids=ignore_agent_ids)
         states = filter_states_by_range(states, x_range=x_range, y_range=y_range)
         if not states:
             continue
@@ -84,6 +108,9 @@ def visualize_trajectories(
                 max_speed=max(speeds),
                 params=run_info.params,
                 result=run_info.result,
+                origin_agent_id=origin_agent_id,
+                origin_x=origin[0] if origin is not None else None,
+                origin_y=origin[1] if origin is not None else None,
             )
         )
 
@@ -98,6 +125,8 @@ def visualize_trajectories(
         x_range=x_range,
         y_range=y_range,
         equal_scale=equal_scale,
+        ignore_agent_ids=ignore_agent_ids,
+        origin_agent_id=origin_agent_id,
     )
     return TrajectoryBatchResult(output_dir=output_dir, manifest_path=manifest_path, results=results)
 
@@ -139,4 +168,3 @@ def _output_stem_for_source(source_file: Path, input_path: Path) -> str:
             return f"{slug(parts[-3] if len(parts) >= 3 else source_file.stem, fallback='trajectory')}_trajectory"
         return f"{slug('_'.join(parts[:-1]) or source_file.stem, fallback='trajectory')}_trajectory"
     return f"{slug(str(relative), fallback='trajectory')}_trajectory"
-

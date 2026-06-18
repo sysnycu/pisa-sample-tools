@@ -1,0 +1,19 @@
+agents:
+  0:
+    x: 5.0
+    y: -6.0
+    z: 0.0
+    yaw: 0.0
+    speed: 0.0
+    acceleration: 0.0
+    yaw_rate: 0.0
+    yaw_acceleration: 0.0
+  1:
+    x: 20.0
+    y: -2.0
+    z: 0.0
+    yaw: 6.283185
+    speed: 9.562452
+    acceleration: 0.0
+    yaw_rate: 0.0
+    yaw_acceleration: 0.0

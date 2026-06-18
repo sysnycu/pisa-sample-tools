@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 from pisa_sample_tools.common.formatting import format_number, panel_value, wrap_text
@@ -28,6 +29,28 @@ def filter_states_by_range(
             continue
         filtered.append(state)
     return filtered
+
+
+def filter_states_by_agent(
+    states: list[AgentState],
+    *,
+    ignore_agent_ids: set[str] | None = None,
+) -> list[AgentState]:
+    if not ignore_agent_ids:
+        return states
+    return [state for state in states if state.agent_id not in ignore_agent_ids]
+
+
+def origin_for_agent(states: list[AgentState], agent_id: str) -> tuple[float, float] | None:
+    for state in states:
+        if state.agent_id == agent_id:
+            return state.x, state.y
+    return None
+
+
+def translate_states(states: list[AgentState], *, origin: tuple[float, float]) -> list[AgentState]:
+    origin_x, origin_y = origin
+    return [replace(state, x=state.x - origin_x, y=state.y - origin_y) for state in states]
 
 
 def states_to_svg(
@@ -69,7 +92,7 @@ def states_to_svg(
     if available_width <= 0 or available_height <= 0:
         raise TrajectoryError("SVG dimensions leave no plot area")
     if equal_scale:
-        margin_left, margin_top, plot_width, plot_height = _equal_scale_plot_area(
+        margin_left, margin_top, plot_width, plot_height = equal_scale_plot_area(
             base_left=base_left,
             base_top=base_top,
             available_width=available_width,
@@ -187,7 +210,7 @@ def _validate_range(value: tuple[float, float] | None, *, label: str) -> None:
         raise TrajectoryError(f"{label} min must be smaller than max")
 
 
-def _equal_scale_plot_area(
+def equal_scale_plot_area(
     *,
     base_left: float,
     base_top: float,
@@ -204,6 +227,9 @@ def _equal_scale_plot_area(
     margin_left = base_left + (available_width - plot_width) / 2.0
     margin_top = base_top + (available_height - plot_height) / 2.0
     return margin_left, margin_top, plot_width, plot_height
+
+
+_equal_scale_plot_area = equal_scale_plot_area
 
 
 def _speed_opacity(speed: float, min_speed: float, max_speed: float) -> float:
@@ -276,4 +302,3 @@ def _format_panel_value(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=True)
     return panel_value(value)
-
