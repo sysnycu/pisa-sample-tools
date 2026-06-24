@@ -31,7 +31,9 @@ The current runner already provides most required information:
 iteration_*/monitor/result.csv
 iteration_*/monitor/frame_metrics.csv
 iteration_*/monitor/agent_states.csv
+iteration_*/monitor/agent_geometry.csv
 iteration_*/monitor/collision_events.csv
+iteration_*/monitor/scenario_events.csv
 ```
 
 `result.csv` should keep these stable fields:
@@ -414,10 +416,19 @@ logging:
       name: agent_states
       output: agent_states.csv
 
+    - type: agent_geometry
+      name: agent_geometry
+      output: agent_geometry.csv
+      once: true
+
     - type: collision_events
       name: collision_events
       output: collision_events.csv
       actor_id_a: 0
+
+    - type: scenario_events
+      name: scenario_events
+      output: scenario_events.csv
 
     - type: control_commands
       name: control_commands
@@ -458,7 +469,66 @@ logging:
 ```
 
 The runner owns accurate recording and metric calculation. The analyzer owns which of these
-fields are bound to concepts such as `min_ttc`:
+fields become official figures, tables, comparisons, and representative cases.
+
+### Agent geometry
+
+`agent_geometry.csv` should record static geometry once per concrete run unless an actor
+shape can change during execution. The analyzer expects these columns when available:
+
+```text
+step_index
+sim_time_ms
+agent_id
+shape_type
+length_m
+width_m
+height_m
+reference_point
+footprint_json
+source
+```
+
+Use `source` to distinguish simulator runtime geometry from defaults or spec-provided
+geometry. Keep per-frame pose in `agent_states.csv`; do not repeat static dimensions on
+every frame unless they actually change.
+
+### Collision event position
+
+`collision_events.csv` should keep the existing collision pair and timing fields and may
+include an estimated contact position:
+
+```text
+step_index
+sim_time_ms
+actor_a
+actor_b
+x
+y
+z
+position_source
+contact_region_json
+```
+
+`position_source` should make the provenance explicit:
+
+```text
+collision                 # simulator/proto provided a direct position
+derived_bbox_overlap      # bbox overlap centroid
+derived_bbox_closest      # bbox closest-point fallback
+actor_midpoint            # actor center midpoint fallback
+unavailable
+```
+
+When bbox overlap exists, `contact_region_json` should contain the overlap polygon
+vertices. `scenario_events.csv` collision rows should carry the same
+`contact_region_json` when available so event timelines can preserve the contact region.
+
+The analyzer copies `agent_geometry.csv`, `collision_events.csv`, and
+`scenario_events.csv` into normalized summary tables while retaining
+`position_source` and `contact_region_json`.
+
+Metric fields are bound to analysis concepts such as `min_ttc` in the analysis spec:
 
 ```yaml
 metrics:

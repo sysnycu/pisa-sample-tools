@@ -4,10 +4,12 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from pisa_sample_tools.evidence import build_evidence, load_analysis_spec
 from pisa_sample_tools.evidence.cli import main
+from pisa_sample_tools.evidence.models import EvidenceError
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -78,6 +80,35 @@ def _write_run(
         ],
     )
     _write_csv(
+        monitor / "agent_geometry.csv",
+        [
+            {
+                "step_index": 0,
+                "sim_time_ms": 0,
+                "agent_id": 0,
+                "shape_type": "BOUNDING_BOX",
+                "length_m": 4.5,
+                "width_m": 1.8,
+                "height_m": 1.5,
+                "reference_point": "center",
+                "footprint_json": "",
+                "source": "simulator_runtime_shape",
+            },
+            {
+                "step_index": 0,
+                "sim_time_ms": 0,
+                "agent_id": 1,
+                "shape_type": "BOUNDING_BOX",
+                "length_m": 4.5,
+                "width_m": 1.8,
+                "height_m": 1.5,
+                "reference_point": "center",
+                "footprint_json": "",
+                "source": "simulator_runtime_shape",
+            },
+        ],
+    )
+    _write_csv(
         monitor / "control_commands.csv",
         [
             {
@@ -99,9 +130,53 @@ def _write_run(
         ],
     )
     if "collision" in stop_condition:
+        contact_region = json.dumps([[3.8, -0.8], [4.1, -0.8], [4.1, 0.8], [3.8, 0.8]])
         _write_csv(
             monitor / "collision_events.csv",
-            [{"step_index": 1, "sim_time_ms": 50, "actor_id_a": 0, "actor_id_b": 1}],
+            [
+                {
+                    "step_index": 1,
+                    "sim_time_ms": 50,
+                    "actor_a": 0,
+                    "actor_b": 1,
+                    "x": 3.95,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "position_source": "derived_bbox_overlap",
+                    "contact_region_json": contact_region,
+                }
+            ],
+        )
+        _write_csv(
+            monitor / "scenario_events.csv",
+            [
+                {
+                    "step_index": 0,
+                    "sim_time_ms": 0,
+                    "event_type": "scenario_start",
+                    "actor_id": "",
+                    "actor_id_b": "",
+                    "x": "",
+                    "y": "",
+                    "z": "",
+                    "source": "runner",
+                    "details_json": "{}",
+                    "contact_region_json": "",
+                },
+                {
+                    "step_index": 1,
+                    "sim_time_ms": 50,
+                    "event_type": "collision",
+                    "actor_id": 0,
+                    "actor_id_b": 1,
+                    "x": 3.95,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "source": "derived_bbox_overlap",
+                    "details_json": "{}",
+                    "contact_region_json": contact_region,
+                },
+            ],
         )
 
 
@@ -173,6 +248,54 @@ def _write_spec(path: Path) -> None:
     )
 
 
+def _write_v2_spec(path: Path, *, map_av_quit: bool = True) -> None:
+    termination = {"goal": "success", "collision_guard": "failure"}
+    if map_av_quit:
+        termination["av_should_quit"] = "unclassified"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "validation": {"mode": "strict"},
+                "parameters": {
+                    "mode": "all_pairwise",
+                    "include": ["x", "y", "relative"],
+                    "derived": {
+                        "relative": {
+                            "operation": "subtract",
+                            "left": "x",
+                            "right": "y",
+                        }
+                    },
+                },
+                "metrics": {
+                    "min_ttc": {"summary": "pair.min_ttc_s", "series": "pair.ttc_s"},
+                    "min_distance": {
+                        "summary": "pair.min_distance_m",
+                        "series": "pair.distance_m",
+                    },
+                    "max_deceleration": {
+                        "summary": "ego.max_deceleration",
+                        "series": "ego.acceleration",
+                    },
+                },
+                "outcomes": {
+                    "success": ["success"],
+                    "failure": ["fail", "test_fail"],
+                    "invalid": ["invalid"],
+                    "termination": termination,
+                },
+                "thresholds": {"near_critical_ttc_s": 1.5},
+                "heatmap": {"bins": 4, "min_bin_count": 1},
+                "comparison": {"bootstrap_samples": 20, "bootstrap_seed": 0},
+                "output": {"formats": ["svg"]},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_load_analysis_spec_reads_metric_bindings(tmp_path: Path) -> None:
     spec_path = tmp_path / "analysis.yaml"
     _write_spec(spec_path)
@@ -208,6 +331,9 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert (output / "representative_cases" / "selected_cases.csv").exists()
     assert (output / "representative_cases" / "safe_trajectory.svg").exists()
     assert (output / "representative_cases" / "failure_controls.png").exists()
+    assert (output / "summary" / "agent_geometry.csv").exists()
+    assert (output / "summary" / "collision_events.csv").exists()
+    assert (output / "summary" / "scenario_events.csv").exists()
     assert (output / "report" / "analysis_report.html").exists()
     assert (output / "report" / "paper_ready_summary.tex").exists()
     assert (output / "provenance" / "analysis_spec.yaml").exists()
@@ -220,6 +346,18 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert "Advanced run explorer" in report
     assert "Download YAML spec" in report
     assert 'id="run-select"' in report
+    geometry = (output / "summary" / "agent_geometry.csv").read_text(encoding="utf-8")
+    assert "simulator_runtime_shape" in geometry
+    collision_events = (output / "summary" / "collision_events.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "derived_bbox_overlap" in collision_events
+    assert "contact_region_json" in collision_events
+    timeline = (
+        output / "representative_cases" / "failure_event_timeline.csv"
+    ).read_text(encoding="utf-8")
+    assert "collision (derived_bbox_overlap)" in timeline
+    assert "contact_region_json" in timeline
 
 
 def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
@@ -278,6 +416,9 @@ def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
     assert "Autoware" in comparison
     assert (output / "comparison" / "av_name_outcome_comparison.svg").exists()
     assert (output / "comparison" / "repeated_run_stability.csv").exists()
+    pairing = (output / "comparison" / "pairing_summary.csv").read_text(encoding="utf-8")
+    assert ",2,0,0" in pairing
+    assert (output / "comparison" / "outcome_transition.csv").exists()
 
 
 def test_unified_cli_builds_evidence(tmp_path: Path, capsys) -> None:
@@ -329,3 +470,80 @@ def test_unified_cli_emits_progress_logs(tmp_path: Path, capsys) -> None:
     assert "loading analysis spec" in captured.err
     assert "rendering core figures" in captured.err
     assert "analysis complete" in captured.err
+
+
+def test_v2_builds_all_pairwise_views_and_keeps_unknown_unclassified(tmp_path: Path) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis-v2.yaml"
+    output = tmp_path / "evidence"
+    _write_experiment(results)
+    _write_run(
+        results,
+        3,
+        x=8,
+        y=7,
+        outcome="unknown",
+        stop_condition="av_should_quit",
+        min_ttc=4.0,
+    )
+    _write_v2_spec(spec_path)
+
+    build_evidence(results_paths=[results], output_dir=output, spec_path=spec_path)
+
+    pair_root = output / "figures" / "parameter_space"
+    assert sorted(path.name for path in pair_root.iterdir()) == [
+        "x__relative",
+        "x__y",
+        "y__relative",
+    ]
+    outcomes = (output / "summary" / "outcomes.csv").read_text(encoding="utf-8")
+    assert "unclassified,1" in outcomes
+    cases = (output / "representative_cases" / "selected_cases.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "near_critical" not in cases
+    assert (output / "provenance" / "source_execution_manifests" / "experiment.yaml").exists()
+    assert (output / "report" / "runs.json").exists()
+
+
+def test_v2_strict_rejects_unmapped_outcome(tmp_path: Path) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis-v2.yaml"
+    output = tmp_path / "evidence"
+    _write_experiment(results)
+    _write_run(
+        results,
+        3,
+        x=8,
+        y=7,
+        outcome="unknown",
+        stop_condition="av_should_quit",
+        min_ttc=4.0,
+    )
+    _write_v2_spec(spec_path, map_av_quit=False)
+
+    with pytest.raises(EvidenceError, match="strict validation failed"):
+        build_evidence(results_paths=[results], output_dir=output, spec_path=spec_path)
+
+
+def test_validate_command_reports_trace_quality(tmp_path: Path, capsys) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis-v2.yaml"
+    _write_experiment(results)
+    _write_v2_spec(spec_path)
+
+    assert (
+        main(
+            [
+                "validate",
+                "--results",
+                str(results),
+                "--spec",
+                str(spec_path),
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "errors: 0" in captured.out
+    assert "runs: 2" in captured.out

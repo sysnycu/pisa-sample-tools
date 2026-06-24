@@ -11,7 +11,7 @@ from pisa_sample_tools.trajectory.cli import main as trajectory_main
 from pisa_sample_tools.trajectory_compare.cli import main as trajectory_compare_main
 
 from .models import EvidenceError
-from .service import build_evidence
+from .service import build_evidence, validate_evidence_inputs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build reproducible validation evidence from PISA runner results.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("build", "report", "compare"):
+    for name in ("build", "report", "compare", "validate"):
         command = subparsers.add_parser(name)
         source = command.add_mutually_exclusive_group(required=True)
         source.add_argument(
@@ -35,8 +35,19 @@ def build_parser() -> argparse.ArgumentParser:
             help="Analysis-side campaign YAML containing result roots and comparison labels.",
         )
         command.add_argument("--spec", type=Path, help="Versioned analysis_spec.yaml.")
-        command.add_argument("--output", type=Path, required=True)
-        command.add_argument("--overwrite", action="store_true")
+        command.add_argument(
+            "--validation", choices=("strict", "permissive"), help="Override spec validation mode."
+        )
+        if name == "validate":
+            command.add_argument(
+                "--summary-only", action="store_true", help="Skip expensive trace alignment checks."
+            )
+        else:
+            command.add_argument("--output", type=Path, required=True)
+            command.add_argument("--overwrite", action="store_true")
+            command.add_argument(
+                "--profile", action="store_true", help="Write stage timings (enabled for all builds)."
+            )
     subparsers.add_parser("trajectory", add_help=False)
     subparsers.add_parser("trajectory-compare", add_help=False)
     subparsers.add_parser("outcome-eval", add_help=False)
@@ -61,6 +72,27 @@ def main(argv: list[str] | None = None) -> int:
         return sample_export_main(argv[2:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "validate":
+        try:
+            run_count, findings = validate_evidence_inputs(
+                results_paths=args.results,
+                campaign_path=args.campaign,
+                spec_path=args.spec,
+                validation_mode=args.validation,
+                deep=not args.summary_only,
+                progress=lambda message: print(message, file=sys.stderr),
+            )
+        except EvidenceError as exc:
+            parser.error(str(exc))
+        for finding in findings:
+            location = f" [{finding.run_id}]" if finding.run_id else ""
+            print(f"{finding.severity.upper()} {finding.code}{location}: {finding.message}")
+        errors = sum(item.severity == "error" for item in findings)
+        warnings = sum(item.severity == "warning" for item in findings)
+        print(f"runs: {run_count}")
+        print(f"errors: {errors}")
+        print(f"warnings: {warnings}")
+        return 1 if errors else 0
     try:
         result = build_evidence(
             results_paths=args.results,
@@ -69,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             spec_path=args.spec,
             overwrite=args.overwrite,
             progress=lambda message: print(message, file=sys.stderr),
+            validation_mode=args.validation,
         )
     except EvidenceError as exc:
         parser.error(str(exc))

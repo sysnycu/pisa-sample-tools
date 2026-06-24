@@ -22,15 +22,31 @@ class MetricBinding:
     series: str | None = None
     label: str | None = None
     unit: str | None = None
+    missing: str = "unavailable"
+
+
+@dataclass(frozen=True)
+class DerivedParameter:
+    operation: str
+    left: str
+    right: str
+    label: str | None = None
+    unit: str | None = None
 
 
 @dataclass(frozen=True)
 class AnalysisSpec:
     version: int = 1
+    validation_mode: str = "permissive"
     metadata: dict[str, Any] = field(default_factory=dict)
+    parameter_mode: str = "single"
+    parameter_include: tuple[str, ...] = ()
+    parameter_exclude: frozenset[str] = frozenset()
     x_param: str | None = None
     y_param: str | None = None
     parameter_units: dict[str, str] = field(default_factory=dict)
+    parameter_labels: dict[str, str] = field(default_factory=dict)
+    derived_parameters: dict[str, DerivedParameter] = field(default_factory=dict)
     metrics: dict[str, MetricBinding] = field(default_factory=dict)
     success_outcomes: frozenset[str] = frozenset({"success"})
     failure_outcomes: frozenset[str] = frozenset(
@@ -38,8 +54,14 @@ class AnalysisSpec:
     )
     invalid_outcomes: frozenset[str] = frozenset({"invalid"})
     collision_reasons: frozenset[str] = frozenset({"collision", "collision_guard"})
+    termination_outcomes: dict[str, str] = field(default_factory=dict)
     near_critical_ttc_s: float = 2.0
     heatmap_bins: int = 30
+    heatmap_min_bin_count: int = 1
+    pairing_mode: str = "sample_id_then_parameters"
+    pairing_parameter_tolerance: float = 1e-9
+    bootstrap_samples: int = 2000
+    bootstrap_seed: int = 0
     output_formats: tuple[str, ...] = ("svg", "png")
 
 
@@ -47,6 +69,7 @@ class AnalysisSpec:
 class RunRecord:
     experiment_id: str
     scenario_id: str
+    sample_id: str | None
     logical_scenario_name: str
     params: dict[str, Any]
     metadata: dict[str, Any]
@@ -58,7 +81,9 @@ class RunRecord:
     result_path: Path
     frame_metrics_path: Path | None = None
     agent_states_path: Path | None = None
+    agent_geometry_path: Path | None = None
     collision_events_path: Path | None = None
+    scenario_events_path: Path | None = None
     control_commands_path: Path | None = None
 
     @property

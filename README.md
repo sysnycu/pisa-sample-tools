@@ -39,13 +39,17 @@ This repo provides these commands:
 ```bash
 uv run pisa-analysis build \
   --results /path/to/runner/results \
-  --spec examples/analysis_spec.yaml \
+  --spec examples/analysis_spec_v2.yaml \
   --output analysis/cutin
 ```
 
 This produces normalized summary tables, parameter-space safety maps, metric distributions,
 representative trajectories and traces, component/repeated-run comparisons, an offline
 evidence dashboard, Markdown/LaTeX report artifacts, and complete provenance.
+
+Use `pisa-analysis validate` before large builds. V2 specs provide strict validation,
+all-pairwise parameter views, derived parameters, explicit termination mapping, and paired
+component statistics; V1 specs remain supported.
 
 ## Sampler Preview
 

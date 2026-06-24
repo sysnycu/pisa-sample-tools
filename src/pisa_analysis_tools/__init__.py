@@ -3,6 +3,7 @@
 from pisa_sample_tools.evidence import (
     AnalysisSpec,
     DatasetSpec,
+    DerivedParameter,
     EvidenceError,
     EvidenceResult,
     MetricBinding,
@@ -10,11 +11,13 @@ from pisa_sample_tools.evidence import (
     SelectedCase,
     build_evidence,
     load_analysis_spec,
+    validate_evidence_inputs,
 )
 
 __all__ = [
     "AnalysisSpec",
     "DatasetSpec",
+    "DerivedParameter",
     "EvidenceError",
     "EvidenceResult",
     "MetricBinding",
@@ -22,4 +25,5 @@ __all__ = [
     "SelectedCase",
     "build_evidence",
     "load_analysis_spec",
+    "validate_evidence_inputs",
 ]

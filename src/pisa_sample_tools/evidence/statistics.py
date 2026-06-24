@@ -3,7 +3,11 @@ from __future__ import annotations
 import math
 import statistics
 from collections import Counter, defaultdict
+from dataclasses import replace
 from typing import Any
+
+import numpy as np
+from scipy.spatial import cKDTree
 
 from .ingest import read_trace_rows
 from .models import AnalysisSpec, RunRecord, SelectedCase
@@ -22,13 +26,15 @@ def normalized_outcome(run: RunRecord, spec: AnalysisSpec) -> str:
     reason = (run.termination_reason or "").lower()
     if value in spec.invalid_outcomes:
         return "invalid"
-    if value in spec.failure_outcomes or any(token in reason for token in spec.collision_reasons):
+    if value in spec.failure_outcomes or reason in spec.collision_reasons:
         return "failure"
     if value in spec.success_outcomes:
         return "success"
+    if reason in spec.termination_outcomes:
+        return spec.termination_outcomes[reason]
     if run.status and run.status.lower() not in {"finished", "success", "completed"}:
         return "execution_error"
-    return value
+    return "unclassified"
 
 
 def safety_region(run: RunRecord, spec: AnalysisSpec) -> str:
@@ -37,6 +43,8 @@ def safety_region(run: RunRecord, spec: AnalysisSpec) -> str:
         return "invalid"
     if outcome in {"failure", "execution_error"}:
         return "failure"
+    if outcome == "unclassified":
+        return "unclassified"
     ttc = metric_value(run, spec, "min_ttc")
     if ttc is not None and ttc < spec.near_critical_ttc_s:
         return "near_critical"
@@ -95,16 +103,16 @@ def select_representative_cases(
     successful = [run for run in runs if normalized_outcome(run, spec) == "success"]
     failures = [run for run in runs if normalized_outcome(run, spec) == "failure"]
     invalid = [run for run in runs if normalized_outcome(run, spec) == "invalid"]
-    non_collision = [
-        run
-        for run in runs
-        if normalized_outcome(run, spec) not in {"failure", "execution_error", "invalid"}
-    ]
-
     safe = _max_metric(successful, spec, "min_ttc", secondary="min_distance")
+    if safe is None:
+        safe = _max_metric(successful, spec, "min_distance")
     if safe:
         selected.append(SelectedCase("safe", safe, "highest min TTC among successful runs"))
-    critical = _min_metric(non_collision, spec, "min_ttc")
+    critical = _min_metric(
+        [run for run in runs if safety_region(run, spec) == "near_critical"],
+        spec,
+        "min_ttc",
+    )
     if critical and (safe is None or critical.run_id != safe.run_id):
         selected.append(
             SelectedCase("near_critical", critical, "lowest min TTC without failure")
@@ -112,12 +120,27 @@ def select_representative_cases(
     failure = _earliest_failure(failures)
     if failure:
         selected.append(SelectedCase("failure", failure, "earliest recorded failure"))
-    boundary = _boundary_case(runs, spec, x_param, y_param)
+    boundary = _boundary_cases(runs, spec, x_param, y_param)
     selected_ids = {item.run.run_id for item in selected}
-    if boundary and boundary.run_id not in selected_ids:
-        selected.append(
-            SelectedCase("boundary", boundary, "nearest opposite-class parameter neighbor")
-        )
+    if boundary:
+        boundary_safe, boundary_failure = boundary
+        if boundary_safe.run_id not in selected_ids:
+            selected.append(
+                SelectedCase(
+                    "boundary_safe",
+                    boundary_safe,
+                    "nearest classified nonfailure neighbor to failure",
+                )
+            )
+        selected_ids = {item.run.run_id for item in selected}
+        if boundary_failure.run_id not in selected_ids:
+            selected.append(
+                SelectedCase(
+                    "boundary_failure",
+                    boundary_failure,
+                    "nearest failure neighbor to classified nonfailure",
+                )
+            )
     timeout = _representative_reason(runs, "timeout")
     selected_ids = {item.run.run_id for item in selected}
     if timeout and timeout.run_id not in selected_ids:
@@ -232,38 +255,79 @@ def _earliest_failure(runs: list[RunRecord]) -> RunRecord | None:
     return min(runs, key=time_key)
 
 
-def _boundary_case(
+def _boundary_cases(
     runs: list[RunRecord],
     spec: AnalysisSpec,
     x_param: str | None,
     y_param: str | None,
-) -> RunRecord | None:
+) -> tuple[RunRecord, RunRecord] | None:
     if not x_param or not y_param:
         return None
-    points = [
-        (run, as_float(run.params.get(x_param)), as_float(run.params.get(y_param)))
-        for run in runs
-    ]
-    points = [(run, x, y) for run, x, y in points if x is not None and y is not None]
-    if len(points) < 2:
+    points = []
+    for run in runs:
+        x = as_float(run.params.get(x_param))
+        y = as_float(run.params.get(y_param))
+        region = safety_region(run, spec)
+        if x is not None and y is not None and region in {"safe", "near_critical", "failure"}:
+            points.append((run, x, y, region))
+    nonfailure = sorted(
+        [item for item in points if item[3] in {"safe", "near_critical"}],
+        key=lambda item: item[0].run_id,
+    )
+    failures = sorted(
+        [item for item in points if item[3] == "failure"],
+        key=lambda item: item[0].run_id,
+    )
+    if not nonfailure or not failures:
         return None
     xs = [item[1] for item in points]
     ys = [item[2] for item in points]
     x_span = max(xs) - min(xs) or 1.0
     y_span = max(ys) - min(ys) or 1.0
-    best: tuple[float, str, RunRecord] | None = None
-    for run, x, y in points:
-        region = safety_region(run, spec)
-        if region in {"invalid", "execution_error"}:
-            continue
-        for other, ox, oy in points:
-            if run is other or safety_region(other, spec) == region:
+    failure_coordinates = np.array(
+        [[item[1] / x_span, item[2] / y_span] for item in failures], dtype=float
+    )
+    nonfailure_coordinates = np.array(
+        [[item[1] / x_span, item[2] / y_span] for item in nonfailure], dtype=float
+    )
+    tree = cKDTree(failure_coordinates)
+    distances, indexes = tree.query(nonfailure_coordinates, k=1)
+    candidates = [
+        (float(distance), nonfailure[index][0].run_id, index, int(failure_index))
+        for index, (distance, failure_index) in enumerate(zip(distances, indexes, strict=True))
+    ]
+    distance, _, nonfailure_index, failure_index = min(candidates)
+    tied_failure_indexes = tree.query_ball_point(
+        nonfailure_coordinates[nonfailure_index], r=distance + 1e-12
+    )
+    failure_index = min(tied_failure_indexes, key=lambda index: failures[index][0].run_id)
+    return nonfailure[nonfailure_index][0], failures[failure_index][0]
+
+
+def apply_derived_parameters(runs: list[RunRecord], spec: AnalysisSpec) -> list[RunRecord]:
+    if not spec.derived_parameters:
+        return runs
+    updated = []
+    for run in runs:
+        params = dict(run.params)
+        for name, definition in spec.derived_parameters.items():
+            left = as_float(params.get(definition.left))
+            right = as_float(params.get(definition.right))
+            if left is None or right is None:
                 continue
-            distance = math.hypot((x - ox) / x_span, (y - oy) / y_span)
-            candidate = (distance, run.run_id, run)
-            if best is None or candidate[:2] < best[:2]:
-                best = candidate
-    return best[2] if best else None
+            if definition.operation == "add":
+                value = left + right
+            elif definition.operation == "subtract":
+                value = left - right
+            elif definition.operation == "multiply":
+                value = left * right
+            elif right != 0:
+                value = left / right
+            else:
+                continue
+            params[name] = value
+        updated.append(replace(run, params=params))
+    return updated
 
 
 def _representative_reason(runs: list[RunRecord], token: str) -> RunRecord | None:
@@ -288,7 +352,7 @@ def _representative_group(runs: list[RunRecord]) -> RunRecord | None:
 def _final_position(run: RunRecord) -> tuple[float, float] | None:
     rows = read_trace_rows(run.agent_states_path)
     candidates = []
-    ego_id = str(run.metadata.get("ego_agent_id", "0"))
+    ego_id = str(run.metadata.get("ego_agent_id") or "0")
     for row in rows:
         if str(row.get("agent_id")) != ego_id:
             continue

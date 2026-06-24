@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +55,7 @@ def load_experiment(
     root = dataset.results_path.expanduser().resolve()
     if not root.is_dir():
         raise EvidenceError(f"results path does not exist or is not a directory: {root}")
-    manifest_path = next((root / name for name in MANIFEST_NAMES if (root / name).exists()), None)
-    manifest = _load_manifest(manifest_path) if manifest_path is not None else {}
+    manifest_path, manifest = read_execution_manifest(root)
     experiment_id = dataset.dataset_id
     base_metadata = dict(spec.metadata)
     base_metadata.update(_execution_metadata(manifest))
@@ -94,6 +94,8 @@ def load_experiment(
             "run.stop_condition",
             "run.stop_reason",
             "run.params",
+            "run.sample_id",
+            "run.concrete_scenario_id",
         }
         metrics = {
             key: coerce_scalar(value)
@@ -112,6 +114,9 @@ def load_experiment(
             RunRecord(
                 experiment_id=experiment_id,
                 scenario_id=scenario_id,
+                sample_id=none_if_empty(
+                    row.get("run.sample_id") or row.get("run.concrete_scenario_id")
+                ),
                 logical_scenario_name=str(
                     metadata.get("logical_scenario_name")
                     or manifest.get("scenario_name")
@@ -128,7 +133,9 @@ def load_experiment(
                 frame_metrics_path=_existing(monitor / "frame_metrics.csv"),
                 agent_states_path=_existing(monitor / "agent_states.csv")
                 or _existing(monitor / "agent_state.csv"),
+                agent_geometry_path=_existing(monitor / "agent_geometry.csv"),
                 collision_events_path=_existing(monitor / "collision_events.csv"),
+                scenario_events_path=_existing(monitor / "scenario_events.csv"),
                 control_commands_path=_existing(monitor / "control_commands.csv"),
             )
         )
@@ -140,7 +147,26 @@ def load_experiment(
 
 
 def read_trace_rows(path: Path | None) -> list[dict[str, str]]:
-    return read_csv_dicts(path) if path is not None and path.exists() else []
+    if path is None or not path.exists():
+        return []
+    stat = path.stat()
+    return list(_read_trace_rows_cached(str(path), stat.st_mtime_ns, stat.st_size))
+
+
+@lru_cache(maxsize=256)
+def _read_trace_rows_cached(
+    path: str, _mtime_ns: int, _size: int
+) -> tuple[dict[str, str], ...]:
+    return tuple(read_csv_dicts(Path(path)))
+
+
+def clear_trace_cache() -> None:
+    _read_trace_rows_cached.cache_clear()
+
+
+def read_execution_manifest(root: Path) -> tuple[Path | None, dict[str, Any]]:
+    path = next((root / name for name in MANIFEST_NAMES if (root / name).exists()), None)
+    return path, _load_manifest(path) if path is not None else {}
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
@@ -177,6 +203,7 @@ def _execution_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
         "created_at",
         "completed_at",
         "runner_spec_sha256",
+        "runner_git_sha",
         "scenario_name",
     ):
         if manifest.get(key) not in {None, ""}:

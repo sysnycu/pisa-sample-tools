@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,13 @@ import yaml
 from pisa_sample_tools.common.yaml import write_yaml
 
 from .campaign import load_campaign
-from .ingest import load_experiments, read_trace_rows
+from .comparison import build_paired_comparisons, wilson_interval
+from .ingest import (
+    clear_trace_cache,
+    load_experiments,
+    read_execution_manifest,
+    read_trace_rows,
+)
 from .models import AnalysisSpec, DatasetSpec, EvidenceError, EvidenceResult, RunRecord
 from .plots import (
     render_component_figures,
@@ -25,6 +32,7 @@ from .plots import (
 )
 from .spec import load_analysis_spec, spec_to_dict
 from .statistics import (
+    apply_derived_parameters,
     as_float,
     grouped_outcomes,
     metric_value,
@@ -34,6 +42,7 @@ from .statistics import (
     safety_region,
     select_representative_cases,
 )
+from .validation import DataQualityFinding, enforce_validation, validate_runs
 
 
 def build_evidence(
@@ -44,10 +53,17 @@ def build_evidence(
     spec_path: Path | None = None,
     overwrite: bool = False,
     progress: Callable[[str], None] | None = None,
+    validation_mode: str | None = None,
+    deep_validation: bool = False,
 ) -> EvidenceResult:
+    clear_trace_cache()
     reporter = _ProgressReporter(progress)
     reporter.step("loading analysis spec")
     spec = load_analysis_spec(spec_path)
+    if validation_mode is not None:
+        if validation_mode not in {"strict", "permissive"}:
+            raise EvidenceError("validation_mode must be 'strict' or 'permissive'")
+        spec = replace(spec, validation_mode=validation_mode)
     if campaign_path is not None and results_paths:
         raise EvidenceError("campaign_path and results_paths are mutually exclusive")
     if campaign_path is not None:
@@ -59,25 +75,30 @@ def build_evidence(
         ]
     else:
         raise EvidenceError("at least one results path or an analysis campaign is required")
-    reporter.step(f"preparing output directory {output_dir}")
-    _prepare_output_dir(output_dir, overwrite=overwrite)
     reporter.step(f"loading {len(datasets)} dataset(s)")
     runs, warnings = load_experiments(datasets, spec, progress=reporter.step)
+    reporter.step("applying derived parameters")
+    runs = apply_derived_parameters(runs, spec)
+    reporter.step("validating inputs")
+    findings = validate_runs(runs, spec, deep=deep_validation)
+    enforce_validation(findings, spec)
+    warnings.extend(
+        finding.message
+        for finding in findings
+        if finding.severity != "info" or finding.code == "metric_requires_derivation"
+    )
     reporter.step("deriving missing summary metrics")
     runs, derived_warnings = _derive_summary_metrics(runs, spec)
     warnings.extend(derived_warnings)
-    reporter.step("selecting parameter axes")
-    x_param, y_param = _select_axes(runs, spec)
-    if spec.x_param and x_param != spec.x_param:
-        warnings.append(
-            f"configured x parameter '{spec.x_param}' was not found; using '{x_param}'"
-        )
-    if spec.y_param and y_param != spec.y_param:
-        warnings.append(
-            f"configured y parameter '{spec.y_param}' was not found; using '{y_param}'"
-        )
+    reporter.step("selecting parameter pairs")
+    parameter_pairs, pair_warnings = _select_parameter_pairs(runs, spec)
+    warnings.extend(pair_warnings)
+    x_param, y_param = parameter_pairs[0] if parameter_pairs else (None, None)
     reporter.step("selecting representative cases")
     cases = select_representative_cases(runs, spec, x_param, y_param)
+
+    reporter.step(f"preparing output directory {output_dir}")
+    _prepare_output_dir(output_dir, overwrite=overwrite)
 
     summary_dir = output_dir / "summary"
     figures_dir = output_dir / "figures"
@@ -101,17 +122,40 @@ def build_evidence(
     metric_rows = _metric_rows(runs, spec)
     parameter_rows = _parameter_rows(runs)
     performance_rows = _performance_rows(runs)
+    agent_geometry_rows = _agent_geometry_rows(runs)
+    collision_event_rows = _collision_event_rows(runs)
+    scenario_event_rows = _scenario_event_rows(runs)
     _write_rows(summary_dir / "outcomes.csv", outcome_rows)
     _write_rows(summary_dir / "metrics.csv", metric_rows)
     _write_rows(summary_dir / "parameters.csv", parameter_rows)
     _write_rows(summary_dir / "execution_performance.csv", performance_rows)
+    _write_rows(summary_dir / "agent_geometry.csv", agent_geometry_rows)
+    _write_rows(summary_dir / "collision_events.csv", collision_event_rows)
+    _write_rows(summary_dir / "scenario_events.csv", scenario_event_rows)
     _write_rows(cases_dir / "selected_cases.csv", _selected_case_rows(cases, spec))
+    _write_rows(provenance_dir / "data_quality.csv", [item.as_row() for item in findings])
+    (provenance_dir / "data_quality.json").write_text(
+        json.dumps([item.as_row() for item in findings], indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
 
     reporter.step("writing comparison tables")
     component_rows = _component_rows(runs, spec)
     repeat_rows = repeated_run_rows(runs, spec)
     _write_rows(comparison_dir / "component_comparison.csv", component_rows)
     _write_rows(comparison_dir / "repeated_run_stability.csv", repeat_rows)
+    paired = build_paired_comparisons(runs, spec)
+    warnings.extend(paired.warnings)
+    for name, rows in (
+        ("pairing_summary", paired.pairing_summary),
+        ("matched_runs", paired.matched_runs),
+        ("unmatched_runs", paired.unmatched_runs),
+        ("outcome_transition", paired.outcome_transition),
+        ("metric_deltas", paired.metric_deltas),
+        ("failure_disagreement", paired.failure_disagreement),
+        ("paired_summary", paired.paired_summary),
+    ):
+        _write_rows(comparison_dir / f"{name}.csv", rows)
 
     reporter.step("rendering core figures")
     figure_paths = render_core_figures(
@@ -120,6 +164,8 @@ def build_evidence(
         figures_dir,
         x_param=x_param,
         y_param=y_param,
+        parameter_pairs=parameter_pairs,
+        progress=reporter.step,
     )
     reporter.step("rendering representative cases")
     case_paths, case_warnings = render_representative_cases(cases, spec, cases_dir)
@@ -131,7 +177,27 @@ def build_evidence(
     reporter.step("writing provenance")
     resolved_spec = spec_to_dict(spec)
     resolved_spec["parameters"]["axes"] = {"x": x_param, "y": y_param}
+    resolved_spec["parameters"]["resolved_pairs"] = [
+        {"x": left, "y": right} for left, right in parameter_pairs
+    ]
+    write_yaml(provenance_dir / "resolved_analysis_spec.yaml", resolved_spec)
     write_yaml(provenance_dir / "analysis_spec.yaml", resolved_spec)
+    _preserve_source_manifests(datasets, provenance_dir)
+    if campaign_path is not None:
+        write_yaml(
+            provenance_dir / "resolved_campaign.yaml",
+            {
+                "version": 1,
+                "datasets": [
+                    {
+                        "id": dataset.dataset_id,
+                        "results": str(dataset.results_path.expanduser().resolve()),
+                        "metadata": dataset.metadata,
+                    }
+                    for dataset in datasets
+                ],
+            },
+        )
     input_manifest = {
         "generated_at": datetime.now(UTC).isoformat(),
         "inputs": [str(dataset.results_path) for dataset in datasets],
@@ -150,7 +216,9 @@ def build_evidence(
             "result_csv": len(runs),
             "frame_metrics_csv": sum(run.frame_metrics_path is not None for run in runs),
             "agent_states_csv": sum(run.agent_states_path is not None for run in runs),
+            "agent_geometry_csv": sum(run.agent_geometry_path is not None for run in runs),
             "collision_events_csv": sum(run.collision_events_path is not None for run in runs),
+            "scenario_events_csv": sum(run.scenario_events_path is not None for run in runs),
             "control_commands_csv": sum(run.control_commands_path is not None for run in runs),
         },
     }
@@ -169,10 +237,13 @@ def build_evidence(
         spec=spec,
         x_param=x_param,
         y_param=y_param,
+        parameter_pairs=parameter_pairs,
         cases=cases,
         outcome_rows=outcome_rows,
         metric_rows=metric_rows,
         performance_rows=performance_rows,
+        pairing_rows=paired.pairing_summary,
+        paired_summary_rows=paired.paired_summary,
         figure_paths=figure_paths,
         warnings=warnings,
     )
@@ -181,6 +252,8 @@ def build_evidence(
         runs=runs,
         outcome_rows=outcome_rows,
         metric_rows=metric_rows,
+        parameter_rows=parameter_rows,
+        paired_summary_rows=paired.paired_summary,
         cases=cases,
         warnings=warnings,
     )
@@ -188,17 +261,23 @@ def build_evidence(
         report_dir / "paper_ready_summary.tex",
         outcome_rows=outcome_rows,
         metric_rows=metric_rows,
+        paired_summary_rows=paired.paired_summary,
     )
     _write_limitations(report_dir / "limitations.md", input_manifest, warnings)
+
+    reporter.step("writing stage timings")
+    (provenance_dir / "stage_timings.json").write_text(
+        json.dumps(reporter.timings, indent=2) + "\n", encoding="utf-8"
+    )
 
     manifest_path = output_dir / "manifest.yaml"
     manifest = {
         "tool": "pisa-analysis-tools",
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(UTC).isoformat(),
         "run_count": len(runs),
         "warning_count": len(warnings),
-        "analysis_spec": str(provenance_dir / "analysis_spec.yaml"),
+        "analysis_spec": str(provenance_dir / "resolved_analysis_spec.yaml"),
         "report": str(report_path),
         "figures": [str(path) for path in figure_paths],
         "outputs": [
@@ -209,6 +288,7 @@ def build_evidence(
     }
     write_yaml(manifest_path, manifest)
     reporter.step("analysis complete")
+    clear_trace_cache()
     return EvidenceResult(
         output_dir=output_dir,
         report_path=report_path,
@@ -219,20 +299,60 @@ def build_evidence(
     )
 
 
+def validate_evidence_inputs(
+    *,
+    results_paths: list[Path] | None = None,
+    campaign_path: Path | None = None,
+    spec_path: Path | None = None,
+    validation_mode: str | None = None,
+    deep: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[int, list[DataQualityFinding]]:
+    spec = load_analysis_spec(spec_path)
+    if validation_mode is not None:
+        if validation_mode not in {"strict", "permissive"}:
+            raise EvidenceError("validation_mode must be 'strict' or 'permissive'")
+        spec = replace(spec, validation_mode=validation_mode)
+    if campaign_path is not None and results_paths:
+        raise EvidenceError("campaign_path and results_paths are mutually exclusive")
+    if campaign_path is not None:
+        datasets = load_campaign(campaign_path)
+    elif results_paths:
+        datasets = [
+            DatasetSpec(dataset_id=path.expanduser().resolve().name, results_path=path)
+            for path in results_paths
+        ]
+    else:
+        raise EvidenceError("at least one results path or an analysis campaign is required")
+    clear_trace_cache()
+    runs, ingest_warnings = load_experiments(datasets, spec, progress=progress)
+    runs = apply_derived_parameters(runs, spec)
+    findings = validate_runs(runs, spec, deep=deep)
+    findings.extend(
+        DataQualityFinding("warning", "ingest_warning", warning)
+        for warning in ingest_warnings
+    )
+    clear_trace_cache()
+    return len(runs), findings
+
+
 class _ProgressReporter:
     def __init__(self, emit: Callable[[str], None] | None) -> None:
         self._emit = emit
         self._started = time.perf_counter()
         self._last = self._started
+        self.timings: list[dict[str, Any]] = []
 
     def step(self, message: str) -> None:
-        if self._emit is None:
-            return
         now = time.perf_counter()
         elapsed = now - self._started
         delta = now - self._last
         self._last = now
-        self._emit(f"[+{elapsed:6.1f}s | {delta:5.1f}s] {message}")
+        self.timings.append(
+            {"stage": message, "elapsed_seconds": elapsed, "delta_seconds": delta}
+        )
+        if self._emit is not None:
+            self._emit(f"[+{elapsed:6.1f}s | {delta:5.1f}s] {message}")
 
 
 def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
@@ -285,35 +405,85 @@ def _derive_summary_metrics(
                 derived = min(values)
             metrics[binding.summary] = derived
             derivation_counts[(binding.summary, binding.series)] += 1
-        collision_rows = read_trace_rows(run.collision_events_path)
-        if collision_rows and "collision_time_ms" not in metrics:
-            times = [
-                value
-                for row in collision_rows
-                if (value := as_float(row.get("sim_time_ms"))) is not None
-            ]
-            if times:
-                metrics["collision_time_ms"] = min(times)
+        if "collision_time_ms" not in metrics and "collision" in (
+            run.termination_reason or ""
+        ).lower():
+            final_time = as_float(metrics.get("run.final_sim_time_ms"))
+            if final_time is not None:
+                metrics["collision_time_ms"] = final_time
+            else:
+                times = [
+                    value
+                    for row in read_trace_rows(run.collision_events_path)
+                    if (value := as_float(row.get("sim_time_ms"))) is not None
+                ]
+                if times:
+                    metrics["collision_time_ms"] = min(times)
         updated.append(replace(run, metrics=metrics))
     warnings = [
         f"derived {summary} from {series} time series for {count} run(s)"
         for (summary, series), count in sorted(derivation_counts.items())
     ]
+    for name, binding in spec.metrics.items():
+        if binding.summary is None:
+            continue
+        missing = sum(binding.summary not in run.metrics for run in updated)
+        if missing:
+            warnings.append(
+                f"metric '{name}' remains unavailable for {missing} run(s) after derivation"
+            )
     return updated, warnings
 
 
-def _select_axes(runs: list[RunRecord], spec: AnalysisSpec) -> tuple[str | None, str | None]:
+def _select_parameter_pairs(
+    runs: list[RunRecord], spec: AnalysisSpec
+) -> tuple[list[tuple[str, str]], list[str]]:
     names = sorted({name for run in runs for name in run.params})
     numeric = [
         name
         for name in names
         if any(as_float(run.params.get(name)) is not None for run in runs)
     ]
-    x_param = spec.x_param if spec.x_param in names else (numeric[0] if numeric else None)
-    y_param = spec.y_param if spec.y_param in names else (
-        numeric[1] if len(numeric) > 1 else None
-    )
-    return x_param, y_param
+    selected = list(spec.parameter_include) if spec.parameter_include else numeric
+    selected = [
+        name for name in selected if name in numeric and name not in spec.parameter_exclude
+    ]
+    if spec.parameter_mode == "all_pairwise":
+        return list(combinations(dict.fromkeys(selected), 2)), []
+
+    warnings: list[str] = []
+    x_param = spec.x_param if spec.x_param in numeric else None
+    if x_param is None and numeric:
+        x_param = numeric[0]
+        if spec.x_param:
+            warnings.append(
+                f"configured x parameter '{spec.x_param}' was not found; using '{x_param}'"
+            )
+    y_param = spec.y_param if spec.y_param in numeric and spec.y_param != x_param else None
+    if y_param is None:
+        y_param = next((name for name in numeric if name != x_param), None)
+        if spec.y_param and y_param != spec.y_param:
+            warnings.append(
+                f"configured y parameter '{spec.y_param}' was unavailable or duplicated; "
+                f"using '{y_param}'"
+            )
+    return ([(x_param, y_param)] if x_param and y_param else []), warnings
+
+
+def _preserve_source_manifests(
+    datasets: list[DatasetSpec], provenance_dir: Path
+) -> None:
+    destination = provenance_dir / "source_execution_manifests"
+    destination.mkdir(parents=True, exist_ok=True)
+    for dataset in datasets:
+        manifest_path, _ = read_execution_manifest(dataset.results_path.expanduser().resolve())
+        if manifest_path is None:
+            continue
+        safe_id = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "_"
+            for character in dataset.dataset_id
+        )
+        shutil.copy2(manifest_path, destination / f"{safe_id}{manifest_path.suffix}")
 
 
 def _run_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, Any]]:
@@ -326,6 +496,7 @@ def _run_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, Any]]
             "run_id": run.run_id,
             "experiment_id": run.experiment_id,
             "scenario_id": run.scenario_id,
+            "sample_id": run.sample_id,
             "logical_scenario_name": run.logical_scenario_name,
             "status": run.status,
             "outcome": run.outcome,
@@ -406,6 +577,88 @@ def _performance_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
     return rows
 
 
+def _agent_geometry_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        for row in read_trace_rows(run.agent_geometry_path):
+            rows.append(
+                {
+                    "run_id": run.run_id,
+                    "experiment_id": run.experiment_id,
+                    "scenario_id": run.scenario_id,
+                    "sample_id": run.sample_id,
+                    "result_path": run.result_path,
+                    "step_index": row.get("step_index"),
+                    "sim_time_ms": row.get("sim_time_ms"),
+                    "agent_id": row.get("agent_id") or row.get("actor_id"),
+                    "shape_type": row.get("shape_type"),
+                    "length_m": row.get("length_m"),
+                    "width_m": row.get("width_m"),
+                    "height_m": row.get("height_m"),
+                    "reference_point": row.get("reference_point"),
+                    "footprint_json": row.get("footprint_json"),
+                    "source": row.get("source"),
+                }
+            )
+    return rows
+
+
+def _collision_event_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        for row in read_trace_rows(run.collision_events_path):
+            rows.append(
+                {
+                    "run_id": run.run_id,
+                    "experiment_id": run.experiment_id,
+                    "scenario_id": run.scenario_id,
+                    "sample_id": run.sample_id,
+                    "result_path": run.result_path,
+                    "step_index": row.get("step_index"),
+                    "sim_time_ms": row.get("sim_time_ms"),
+                    "actor_a": row.get("actor_a") or row.get("actor_id_a"),
+                    "actor_b": row.get("actor_b") or row.get("actor_id_b"),
+                    "x": row.get("x"),
+                    "y": row.get("y"),
+                    "z": row.get("z"),
+                    "position_source": row.get("position_source"),
+                    "contact_region_json": row.get("contact_region_json"),
+                }
+            )
+    return rows
+
+
+def _scenario_event_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        for row in read_trace_rows(run.scenario_events_path):
+            rows.append(
+                {
+                    "run_id": run.run_id,
+                    "experiment_id": run.experiment_id,
+                    "scenario_id": run.scenario_id,
+                    "sample_id": run.sample_id,
+                    "result_path": run.result_path,
+                    "step_index": row.get("step_index"),
+                    "sim_time_ms": row.get("sim_time_ms"),
+                    "event_type": row.get("event_type")
+                    or row.get("event")
+                    or row.get("name")
+                    or row.get("type"),
+                    "actor_id": row.get("actor_id"),
+                    "actor_id_b": row.get("actor_id_b"),
+                    "x": row.get("x"),
+                    "y": row.get("y"),
+                    "z": row.get("z"),
+                    "source": row.get("source"),
+                    "position_source": row.get("position_source"),
+                    "contact_region_json": row.get("contact_region_json"),
+                    "details_json": row.get("details_json"),
+                }
+            )
+    return rows
+
+
 def _selected_case_rows(cases, spec: AnalysisSpec) -> list[dict[str, Any]]:
     return [
         {
@@ -433,6 +686,7 @@ def _component_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str,
                 groups[str(run.metadata[field])].append(run)
         for value, members in sorted(groups.items()):
             counts = grouped_outcomes(members, spec)
+            ci_low, ci_high = wilson_interval(counts["failure"], len(members))
             ttc_values = [
                 item
                 for run in members
@@ -446,6 +700,8 @@ def _component_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str,
                     "valid_count": len(members) - counts["invalid"],
                     "failure_count": counts["failure"],
                     "failure_rate": counts["failure"] / len(members),
+                    "failure_rate_ci_low": ci_low,
+                    "failure_rate_ci_high": ci_high,
                     "min_ttc_min": min(ttc_values) if ttc_values else None,
                     "min_ttc_mean": numeric_summary(ttc_values)["mean"],
                 }
@@ -469,10 +725,13 @@ def _write_html_report(
     spec: AnalysisSpec,
     x_param: str | None,
     y_param: str | None,
+    parameter_pairs: list[tuple[str, str]],
     cases,
     outcome_rows,
     metric_rows,
     performance_rows,
+    pairing_rows,
+    paired_summary_rows,
     figure_paths: list[Path],
     warnings: list[str],
 ) -> None:
@@ -482,7 +741,8 @@ def _write_html_report(
         if figure_path.suffix == ".svg"
     ]
     sections = "\n".join(
-        f'<article class="figure"><h3>{_escape(image.stem.replace("_", " ").title())}</h3>'
+        f'<article class="figure" data-pair="{_escape(_figure_pair(image))}">'
+        f'<h3>{_escape(image.stem.replace("_", " ").title())}</h3>'
         f'<a href="../{_escape(str(image.relative_to(output_dir)))}">'
         f'<img loading="lazy" src="../{_escape(str(image.relative_to(output_dir)))}"></a></article>'
         for image in images
@@ -490,27 +750,31 @@ def _write_html_report(
     outcome_table = _html_table(outcome_rows)
     metric_table = _html_table(metric_rows)
     performance_table = _html_table(performance_rows)
+    pairing_table = _html_table(pairing_rows)
+    paired_summary_table = _html_table(paired_summary_rows)
     case_table = _html_table(_selected_case_rows(cases, spec))
     warning_html = "".join(f"<li>{_escape(value)}</li>" for value in warnings)
-    payload = json.dumps(
-        [
-            {
-                "run_id": run.run_id,
-                "params": run.params,
-                "metrics": run.metrics,
-                "metadata": run.metadata,
-                "outcome": normalized_outcome(run, spec),
-                "termination_reason": run.termination_reason,
-                "result_path": str(run.result_path),
-            }
-            for run in runs
-        ],
-        ensure_ascii=True,
-    ).replace("</", "<\\/")
-    run_options = "".join(
-        f'<option value="{index}">{_escape(run.run_id)} - '
-        f'{_escape(normalized_outcome(run, spec))}</option>'
-        for index, run in enumerate(runs)
+    run_payload = [
+        {
+            "run_id": run.run_id,
+            "sample_id": run.sample_id,
+            "params": run.params,
+            "metrics": run.metrics,
+            "metadata": run.metadata,
+            "outcome": normalized_outcome(run, spec),
+            "termination_reason": run.termination_reason,
+            "result_path": str(run.result_path),
+        }
+        for run in runs
+    ]
+    payload_json = json.dumps(run_payload, ensure_ascii=True).replace("</", "<\\/")
+    (path.parent / "runs.json").write_text(payload_json + "\n", encoding="utf-8")
+    (path.parent / "runs.js").write_text(
+        f"window.PISA_RUNS={payload_json};\n", encoding="utf-8"
+    )
+    pair_options = '<option value="all">All parameter pairs</option>' + "".join(
+        f'<option value="{_escape(_pair_key(left, right))}">{_escape(left)} vs {_escape(right)}</option>'
+        for left, right in parameter_pairs
     )
     path.write_text(
         f"""<!doctype html>
@@ -562,12 +826,19 @@ def _write_html_report(
     <h3>Safety metrics</h3>{metric_table}
     <h3>Execution performance</h3>{performance_table}
   </section>
-  <section id="maps"><h2>Evidence figures</h2><div class="figures">{sections}</div></section>
+  <section id="maps"><h2>Evidence figures</h2>
+    <label>Parameter pair<select id="pair-select">{pair_options}</select></label>
+    <div class="figures">{sections}</div></section>
   <section id="cases"><h2>Representative cases</h2>{case_table}</section>
+  <section id="comparison"><h2>Paired component comparison</h2>
+    <h3>Pairing coverage</h3>{pairing_table}
+    <h3>Paired statistics</h3>{paired_summary_table}
+    <p class="muted">Component comparisons demonstrate integration under a common workflow; they are not automatically a fair capability ranking.</p>
+  </section>
   <section><h2>Data quality and limitations</h2><ul>{warning_html or "<li>No warnings.</li>"}</ul></section>
   <section id="advanced"><h2>Advanced run explorer</h2>
     <p class="muted">The evidence dashboard is primary. Select a run or search the canonical record without changing official evidence.</p>
-    <label>Run<select id="run-select">{run_options}</select></label>
+    <label>Run<select id="run-select"></select></label>
     <input id="search" placeholder="Filter by run id, parameter, component, outcome, or reason">
     <pre id="detail"></pre>
     <h3>Analysis spec draft</h3>
@@ -580,10 +851,17 @@ def _write_html_report(
     </div>
   </section>
 </main>
-<script id="run-data" type="application/json">{payload}</script>
+<script src="runs.js"></script>
 <script>
-const runs=JSON.parse(document.getElementById('run-data').textContent);
+const runs=window.PISA_RUNS || [];
 const search=document.getElementById('search'), detail=document.getElementById('detail'), runSelect=document.getElementById('run-select');
+runs.forEach((run,index)=>{{const option=document.createElement('option');option.value=index;option.textContent=`${{run.run_id}} - ${{run.outcome}}`;runSelect.appendChild(option);}});
+document.getElementById('pair-select').addEventListener('change',event=>{{
+  const selected=event.target.value;
+  document.querySelectorAll('.figure').forEach(item=>{{
+    item.hidden=selected!=='all' && item.dataset.pair!=='global' && item.dataset.pair!==selected;
+  }});
+}});
 function render() {{
   const q=search.value.toLowerCase();
   if (!q) {{
@@ -596,8 +874,11 @@ search.addEventListener('input',render); runSelect.addEventListener('change',()=
 document.getElementById('draft-download').addEventListener('click',()=>{{
   const x=document.getElementById('draft-x').value, y=document.getElementById('draft-y').value;
   const ttc=document.getElementById('draft-ttc').value;
-  const yaml=`version: 1
+  const yaml=`version: 2
+validation:
+  mode: strict
 parameters:
+  mode: single
   axes:
     x: ${{x}}
     y: ${{y}}
@@ -624,6 +905,8 @@ def _write_markdown_report(
     runs: list[RunRecord],
     outcome_rows,
     metric_rows,
+    parameter_rows,
+    paired_summary_rows,
     cases,
     warnings,
 ) -> None:
@@ -640,6 +923,14 @@ def _write_markdown_report(
         "## Metrics",
         "",
         _markdown_table(metric_rows),
+        "",
+        "## Parameter Coverage",
+        "",
+        _markdown_table(parameter_rows),
+        "",
+        "## Paired Comparison",
+        "",
+        _markdown_table(paired_summary_rows),
         "",
         "## Representative Cases",
         "",
@@ -662,7 +953,7 @@ def _write_markdown_report(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _write_latex_summary(path: Path, *, outcome_rows, metric_rows) -> None:
+def _write_latex_summary(path: Path, *, outcome_rows, metric_rows, paired_summary_rows) -> None:
     lines = [
         "% Generated by pisa-analysis-tools",
         "\\begin{tabular}{lrr}",
@@ -683,6 +974,21 @@ def _write_latex_summary(path: Path, *, outcome_rows, metric_rows) -> None:
             f"{_number(row['min'])} & {_number(row['max'])} \\\\"
         )
     lines.extend(["\\hline", "\\end{tabular}", ""])
+    if paired_summary_rows:
+        lines.extend(
+            [
+                "\\begin{tabular}{llrr}",
+                "\\hline",
+                "Comparison & Metric & Matched & Mean delta \\\\",
+                "\\hline",
+            ]
+        )
+        for row in paired_summary_rows:
+            lines.append(
+                f"{_latex(row.get('comparison'))} & {_latex(row.get('metric'))} & "
+                f"{row.get('matched', '')} & {_number(row.get('mean_delta'))} \\\\"
+            )
+        lines.extend(["\\hline", "\\end{tabular}", ""])
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -694,7 +1000,9 @@ def _write_limitations(path: Path, manifest: dict[str, Any], warnings: list[str]
         f"- Result summaries: {sources['result_csv']} / {manifest['run_count']}",
         f"- Frame metric traces: {sources['frame_metrics_csv']} / {manifest['run_count']}",
         f"- Agent-state traces: {sources['agent_states_csv']} / {manifest['run_count']}",
+        f"- Agent geometry streams: {sources['agent_geometry_csv']} / {manifest['run_count']}",
         f"- Collision event streams: {sources['collision_events_csv']} / {manifest['run_count']}",
+        f"- Scenario event streams: {sources['scenario_events_csv']} / {manifest['run_count']}",
         f"- Control command streams: {sources['control_commands_csv']} / {manifest['run_count']}",
         "",
         "## Findings",
@@ -707,6 +1015,18 @@ def _write_limitations(path: Path, manifest: dict[str, Any], warnings: list[str]
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _figure_pair(path: Path) -> str:
+    return path.parent.name if path.parent.parent.name == "parameter_space" else "global"
+
+
+def _pair_key(left: str, right: str) -> str:
+    return f"{_slug(left)}__{_slug(right)}"
+
+
+def _slug(value: str) -> str:
+    return "".join(character if character.isalnum() else "_" for character in value.lower()).strip("_")
 
 
 def _html_table(rows: list[dict[str, Any]]) -> str:

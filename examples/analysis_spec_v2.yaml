@@ -1,0 +1,73 @@
+version: 2
+
+validation:
+  mode: strict
+
+metadata:
+  logical_scenario_name: cutin-opt
+
+parameters:
+  mode: all_pairwise
+  include: [Relative_Distance, Ego_Speed, Agent_Speed, Relative_Speed]
+  units:
+    Relative_Distance: m
+    Ego_Speed: m/s
+    Agent_Speed: m/s
+    Relative_Speed: m/s
+  labels:
+    Relative_Distance: Initial relative distance
+    Ego_Speed: Initial ego speed
+    Agent_Speed: Initial cut-in vehicle speed
+    Relative_Speed: Initial relative speed
+  derived:
+    Relative_Speed:
+      operation: subtract
+      left: Ego_Speed
+      right: Agent_Speed
+      label: Initial relative speed
+      unit: m/s
+
+metrics:
+  min_ttc:
+    summary: ego_to_agent_1.min_ttc_s
+    series: ego_to_agent_1.ttc_s
+    label: Minimum TTC
+    unit: s
+    missing: unavailable
+  min_distance:
+    summary: ego_to_agent_1_distance.min
+    series: ego_to_agent_1.distance_m
+    label: Minimum ego-agent center distance
+    unit: m
+    missing: unavailable
+  max_deceleration:
+    summary: ego_deceleration.max
+    series: ego.acceleration
+    label: Maximum ego deceleration
+    unit: m/s^2
+
+outcomes:
+  success: [success]
+  failure: [fail, failure, failed, test_fail]
+  invalid: [invalid]
+  collision_reasons: [collision, collision_guard]
+  termination:
+    collision_guard: failure
+    ego_reaches_goal: success
+    av_should_quit: unclassified
+
+thresholds:
+  near_critical_ttc_s: 2.0
+
+comparison:
+  pairing: sample_id_then_parameters
+  parameter_tolerance: 1.0e-9
+  bootstrap_samples: 2000
+  bootstrap_seed: 0
+
+heatmap:
+  bins: 30
+  min_bin_count: 1
+
+output:
+  formats: [svg, png]

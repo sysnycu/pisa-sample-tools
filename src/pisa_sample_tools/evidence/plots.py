@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import math
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ OUTCOME_COLORS = {
     "failure": "#dc2626",
     "invalid": "#2563eb",
     "execution_error": "#7f1d1d",
+    "unclassified": "#6b7280",
     "unknown": "#6b7280",
 }
 REGION_COLORS = {
@@ -26,6 +27,7 @@ REGION_COLORS = {
     "near_critical": "#f59e0b",
     "failure": "#dc2626",
     "invalid": "#2563eb",
+    "unclassified": "#6b7280",
 }
 
 
@@ -36,19 +38,33 @@ def render_core_figures(
     *,
     x_param: str | None,
     y_param: str | None,
+    parameter_pairs: list[tuple[str, str]] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     paths.extend(_outcome_counts(runs, spec, output_dir))
-    if x_param and y_param:
-        paths.extend(_parameter_scatter(runs, spec, output_dir, x_param, y_param))
+    pairs = parameter_pairs or ([(x_param, y_param)] if x_param and y_param else [])
+    for pair_index, (pair_x, pair_y) in enumerate(pairs, start=1):
+        if progress:
+            progress(f"rendering parameter pair {pair_index}/{len(pairs)}: {pair_x} vs {pair_y}")
+        pair_dir = (
+            output_dir
+            if len(pairs) == 1 and spec.parameter_mode == "single"
+            else output_dir / "parameter_space" / f"{_slug(pair_x)}__{_slug(pair_y)}"
+        )
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        hidden = sorted(
+            set(name for run in runs for name in run.params) - {pair_x, pair_y}
+        )
+        paths.extend(_parameter_scatter(runs, spec, pair_dir, pair_x, pair_y, hidden))
         paths.extend(
             _binned_heatmap(
                 runs,
                 spec,
-                output_dir,
-                x_param,
-                y_param,
+                pair_dir,
+                pair_x,
+                pair_y,
                 name="failure_rate_heatmap",
                 value=lambda run: 1.0 if normalized_outcome(run, spec) == "failure" else 0.0,
                 label="Failure rate",
@@ -66,9 +82,9 @@ def render_core_figures(
                     _binned_heatmap(
                         runs,
                         spec,
-                        output_dir,
-                        x_param,
-                        y_param,
+                        pair_dir,
+                        pair_x,
+                        pair_y,
                         name=file_name,
                         value=lambda run, metric_name=metric_name: metric_value(
                             run, spec, metric_name
@@ -77,13 +93,18 @@ def render_core_figures(
                         cmap=cmap,
                     )
                 )
-        paths.extend(_categorical_map(runs, output_dir, x_param, y_param, "termination_reason"))
+        paths.extend(
+            _categorical_map(
+                runs, spec, pair_dir, pair_x, pair_y, "termination_reason"
+            )
+        )
         paths.extend(
             _categorical_map(
                 runs,
-                output_dir,
-                x_param,
-                y_param,
+                spec,
+                pair_dir,
+                pair_x,
+                pair_y,
                 "safety_region",
                 categories=[safety_region(run, spec) for run in runs],
                 colors=REGION_COLORS,
@@ -146,7 +167,7 @@ def render_component_figures(
             continue
         rows: list[dict[str, Any]] = []
         labels = sorted(groups)
-        outcomes = ["success", "failure", "invalid", "execution_error", "unknown"]
+        outcomes = ["success", "failure", "invalid", "execution_error", "unclassified"]
         data = np.zeros((len(labels), len(outcomes)))
         for index, label in enumerate(labels):
             counts = Counter(normalized_outcome(run, spec) for run in groups[label])
@@ -251,6 +272,7 @@ def _parameter_scatter(
     output_dir: Path,
     x_param: str,
     y_param: str,
+    hidden_parameters: list[str],
 ) -> list[Path]:
     rows = []
     fig, ax = plt.subplots(figsize=(8.5, 6.5))
@@ -271,6 +293,7 @@ def _parameter_scatter(
                     y_param: y,
                     "outcome": outcome,
                     "termination_reason": run.termination_reason,
+                    "hidden_parameters": ",".join(hidden_parameters),
                 }
             )
         if points:
@@ -281,10 +304,14 @@ def _parameter_scatter(
                 alpha=0.8,
                 label=outcome,
                 color=OUTCOME_COLORS.get(outcome, "#6b7280"),
+                rasterized=len(runs) > 5000,
             )
     ax.set_xlabel(_axis_label(x_param, spec))
     ax.set_ylabel(_axis_label(y_param, spec))
-    ax.set_title("Outcome in parameter space")
+    title = "Outcome in parameter space"
+    if hidden_parameters:
+        title += f" (projected; hidden: {', '.join(hidden_parameters)})"
+    ax.set_title(title)
     ax.legend()
     return _save_figure(fig, output_dir / "outcome_scatter", spec, rows)
 
@@ -319,7 +346,12 @@ def _binned_heatmap(
     y_edges = _bin_edges(y_values, spec.heatmap_bins)
     sums, _, _ = np.histogram2d(y_values, x_values, bins=(y_edges, x_edges), weights=metric_values)
     counts, _, _ = np.histogram2d(y_values, x_values, bins=(y_edges, x_edges))
-    grid = np.divide(sums, counts, out=np.full_like(sums, np.nan), where=counts > 0)
+    grid = np.divide(
+        sums,
+        counts,
+        out=np.full_like(sums, np.nan),
+        where=counts >= spec.heatmap_min_bin_count,
+    )
     fig, ax = plt.subplots(figsize=(8.5, 6.5))
     image = ax.pcolormesh(
         x_edges,
@@ -354,6 +386,7 @@ def _binned_heatmap(
 
 def _categorical_map(
     runs: list[RunRecord],
+    spec: AnalysisSpec,
     output_dir: Path,
     x_param: str,
     y_param: str,
@@ -396,11 +429,11 @@ def _categorical_map(
                 s=28,
                 alpha=0.8,
             )
-    ax.set_xlabel(x_param)
-    ax.set_ylabel(y_param)
+    ax.set_xlabel(_axis_label(x_param, spec))
+    ax.set_ylabel(_axis_label(y_param, spec))
     ax.set_title(name.replace("_", " ").title())
     ax.legend(fontsize=8, loc="best")
-    return _save_figure(fig, output_dir / name, AnalysisSpec(), rows, formats=("svg", "png"))
+    return _save_figure(fig, output_dir / name, spec, rows)
 
 
 def _metric_distribution(
@@ -490,10 +523,24 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
         ax.scatter([points[0][0]], [points[0][1]], marker="o", s=35)
         ax.scatter([points[-1][0]], [points[-1][1]], marker="x", s=45)
     collision_rows = read_trace_rows(run.collision_events_path)
+    collision_output_rows = []
     for collision in collision_rows:
         x, y = as_float(collision.get("x")), as_float(collision.get("y"))
         if x is not None and y is not None:
             ax.scatter([x], [y], marker="X", color="#dc2626", s=80, label="collision")
+            collision_output_rows.append(
+                {
+                    "step_index": collision.get("step_index"),
+                    "sim_time_ms": collision.get("sim_time_ms"),
+                    "agent_id": "collision",
+                    "x": x,
+                    "y": y,
+                    "actor_a": collision.get("actor_a") or collision.get("actor_id_a"),
+                    "actor_b": collision.get("actor_b") or collision.get("actor_id_b"),
+                    "position_source": collision.get("position_source"),
+                    "contact_region_json": collision.get("contact_region_json"),
+                }
+            )
     ax.set_aspect("equal", adjustable="datalim")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
@@ -503,7 +550,7 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
         fig,
         output_dir / f"{prefix}_trajectory",
         AnalysisSpec(),
-        output_rows,
+        output_rows + collision_output_rows,
         formats=("svg", "png"),
     )
 
@@ -590,31 +637,79 @@ def _control_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path]:
 
 
 def _event_timeline(run: RunRecord, output_dir: Path, prefix: str) -> list[Path]:
-    events = []
+    events: list[dict[str, Any]] = []
+    for row in read_trace_rows(run.scenario_events_path):
+        time = as_float(row.get("sim_time_ms"))
+        label = (
+            row.get("event_type")
+            or row.get("event")
+            or row.get("name")
+            or row.get("type")
+            or "scenario event"
+        )
+        if time is not None:
+            events.append(
+                {
+                    "time_s": time / 1000.0,
+                    "event": str(label),
+                    "source": row.get("source") or "scenario_events",
+                    "x": row.get("x"),
+                    "y": row.get("y"),
+                    "z": row.get("z"),
+                    "position_source": row.get("position_source"),
+                    "contact_region_json": row.get("contact_region_json"),
+                    "details_json": row.get("details_json"),
+                }
+            )
     for row in read_trace_rows(run.collision_events_path):
         time = as_float(row.get("sim_time_ms"))
         if time is not None:
-            events.append((time / 1000.0, "collision"))
+            position_source = row.get("position_source")
+            label = "collision"
+            if position_source:
+                label = f"collision ({position_source})"
+            events.append(
+                {
+                    "time_s": time / 1000.0,
+                    "event": label,
+                    "source": "collision_events",
+                    "actor_a": row.get("actor_a") or row.get("actor_id_a"),
+                    "actor_b": row.get("actor_b") or row.get("actor_id_b"),
+                    "x": row.get("x"),
+                    "y": row.get("y"),
+                    "z": row.get("z"),
+                    "position_source": position_source,
+                    "contact_region_json": row.get("contact_region_json"),
+                }
+            )
     final_time = as_float(run.metrics.get("run.final_sim_time_ms"))
     if final_time is not None:
-        events.append((final_time / 1000.0, run.termination_reason or "run end"))
+        events.append(
+            {
+                "time_s": final_time / 1000.0,
+                "event": run.termination_reason or "run end",
+                "source": "result",
+            }
+        )
     if not events:
         return []
     fig, ax = plt.subplots(figsize=(9, 2.8))
-    ax.hlines(0, 0, max(time for time, _ in events) or 1, color="#64748b")
-    for index, (time, label) in enumerate(sorted(events)):
+    sorted_events = sorted(events, key=lambda item: (item["time_s"], item["event"]))
+    ax.hlines(0, 0, max(item["time_s"] for item in sorted_events) or 1, color="#64748b")
+    for index, event in enumerate(sorted_events):
+        time = event["time_s"]
+        label = event["event"]
         ax.vlines(time, -0.15, 0.15, color="#dc2626" if "collision" in label else "#2563eb")
         ax.text(time, 0.2 + (index % 2) * 0.14, label, rotation=30, ha="left")
     ax.set_ylim(-0.4, 0.65)
     ax.set_yticks([])
     ax.set_xlabel("Simulation time (s)")
     ax.set_title(f"{prefix.replace('_', ' ').title()} event timeline: {run.run_id}")
-    rows = [{"time_s": time, "event": label} for time, label in sorted(events)]
     return _save_figure(
         fig,
         output_dir / f"{prefix}_event_timeline",
         AnalysisSpec(),
-        rows,
+        sorted_events,
         formats=("svg", "png"),
     )
 
@@ -664,8 +759,9 @@ def _bin_edges(values: np.ndarray, requested_bins: int) -> np.ndarray:
 
 
 def _axis_label(name: str, spec: AnalysisSpec) -> str:
+    label = spec.parameter_labels.get(name, name)
     unit = spec.parameter_units.get(name)
-    return f"{name} ({unit})" if unit else name
+    return f"{label} ({unit})" if unit else label
 
 
 def _slug(value: str) -> str:
