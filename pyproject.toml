@@ -31,7 +31,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-simcore = { path = "/home/hcis-s05/ysws/PISA/runner", editable = true }
+simcore = { git = "https://github.com/pisa-hut/simulation-core.git" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
