@@ -335,6 +335,10 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert (output / "summary" / "collision_events.csv").exists()
     assert (output / "summary" / "scenario_events.csv").exists()
     assert (output / "report" / "analysis_report.html").exists()
+    assert (output / "report" / "analysis_data.json").exists()
+    assert (output / "report" / "analysis_data.js").exists()
+    assert (output / "report" / "cases" / "safe.json").exists()
+    assert (output / "report" / "cases" / "failure.json").exists()
     assert (output / "report" / "paper_ready_summary.tex").exists()
     assert (output / "provenance" / "analysis_spec.yaml").exists()
     assert (output / "manifest.yaml").exists()
@@ -343,9 +347,18 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert ",3.0," in metrics
     report = (output / "report" / "analysis_report.html").read_text(encoding="utf-8")
     assert "PISA Validation Evidence" in report
-    assert "Advanced run explorer" in report
+    assert "Parameter Space Explorer" in report
+    assert "Boundary Explorer" in report
+    assert "Advanced run explorer and Spec Lab" in report
     assert "Download YAML spec" in report
     assert 'id="run-select"' in report
+    data = json.loads((output / "report" / "analysis_data.json").read_text(encoding="utf-8"))
+    assert data["schema_version"] == 1
+    assert data["summary"]["run_count"] == 2
+    assert data["runs"][0]["normalized_outcome"] == "success"
+    assert data["boundary"]["pairs"]["x__y"]["available"] is True
+    assert data["representative_cases"][0]["case_json"]
+    assert data["insights"]
     geometry = (output / "summary" / "agent_geometry.csv").read_text(encoding="utf-8")
     assert "simulator_runtime_shape" in geometry
     collision_events = (output / "summary" / "collision_events.csv").read_text(
@@ -504,6 +517,7 @@ def test_v2_builds_all_pairwise_views_and_keeps_unknown_unclassified(tmp_path: P
     assert "near_critical" not in cases
     assert (output / "provenance" / "source_execution_manifests" / "experiment.yaml").exists()
     assert (output / "report" / "runs.json").exists()
+    assert (output / "report" / "analysis_data.json").exists()
 
 
 def test_v2_strict_rejects_unmapped_outcome(tmp_path: Path) -> None:

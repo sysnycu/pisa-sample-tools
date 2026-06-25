@@ -59,6 +59,14 @@ report/                  offline HTML, Markdown, LaTeX summary, and limitations
 manifest.yaml            complete evidence bundle index
 ```
 
+The HTML report defaults to an offline interactive dashboard. It reads
+`report/analysis_data.js`, with the canonical JSON also written to
+`report/analysis_data.json`. The dashboard supports parameter-axis exploration,
+outcome/status/safety filters, boundary overlays, representative-case links,
+component comparison tables, data-quality review, and draft spec export. Use
+`--report-mode static` when a compact, table-first HTML report is preferred for
+very large bundles or review workflows.
+
 ## Reproducibility
 
 Safety semantics are defined in a versioned `analysis_spec.yaml`. The resolved spec is copied

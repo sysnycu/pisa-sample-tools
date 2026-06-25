@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--profile", action="store_true", help="Write stage timings (enabled for all builds)."
             )
+            command.add_argument(
+                "--report-mode",
+                choices=("interactive", "static"),
+                default="interactive",
+                help="HTML report mode. Interactive is the default offline dashboard.",
+            )
     subparsers.add_parser("trajectory", add_help=False)
     subparsers.add_parser("trajectory-compare", add_help=False)
     subparsers.add_parser("outcome-eval", add_help=False)
@@ -102,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             progress=lambda message: print(message, file=sys.stderr),
             validation_mode=args.validation,
+            report_mode=args.report_mode,
         )
     except EvidenceError as exc:
         parser.error(str(exc))
