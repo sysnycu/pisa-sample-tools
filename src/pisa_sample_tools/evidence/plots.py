@@ -10,6 +10,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .axes import axis_rule_for, resolve_axis_limits, series_presentation
 from .ingest import read_trace_rows
 from .models import AnalysisSpec, RunRecord, SelectedCase
 from .statistics import as_float, metric_value, normalized_outcome, safety_region
@@ -29,6 +30,7 @@ REGION_COLORS = {
     "invalid": "#2563eb",
     "unclassified": "#6b7280",
 }
+CONTROL_EXCLUDED_FIELDS = {"step_index", "sim_time_ms", "control_type", "payload_json"}
 
 
 def render_core_figures(
@@ -125,25 +127,131 @@ def render_representative_cases(
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     warnings: list[str] = []
+    shared_values = collect_representative_axis_values(cases, spec)
     for case in cases:
         prefix = _slug(case.case_type)
+        series = representative_case_series(case.run, spec, shared_values)
         trajectory_paths = _trajectory_plot(case.run, output_dir, prefix)
         if trajectory_paths:
             paths.extend(trajectory_paths)
         else:
             warnings.append(f"{case.run.run_id}: no agent_states.csv for trajectory plot")
-        series_paths = _timeseries_plot(case.run, spec, output_dir, prefix)
+        series_paths = _timeseries_plot(case.run, spec, output_dir, prefix, series)
         if series_paths:
             paths.extend(series_paths)
         else:
             warnings.append(f"{case.run.run_id}: no frame_metrics.csv for time-series plot")
-        control_paths = _control_plot(case.run, output_dir, prefix)
+        control_paths = _control_plot(case.run, output_dir, prefix, series)
         if control_paths:
             paths.extend(control_paths)
         elif case.run.control_commands_path is None:
             warnings.append(f"{case.run.run_id}: no control_commands.csv; control timeline omitted")
         paths.extend(_event_timeline(case.run, output_dir, prefix))
     return paths, warnings
+
+
+def collect_representative_axis_values(
+    cases: list[SelectedCase], spec: AnalysisSpec
+) -> dict[str, list[float]]:
+    values: dict[str, list[float]] = defaultdict(list)
+    for case in cases:
+        for item in _raw_case_series(case.run, spec):
+            values[item["field"]].extend(point[1] for point in item["points"])
+    return dict(values)
+
+
+def representative_case_series(
+    run: RunRecord,
+    spec: AnalysisSpec,
+    shared_values: dict[str, list[float]],
+) -> list[dict[str, Any]]:
+    series = []
+    for item in _raw_case_series(run, spec):
+        field = item["field"]
+        rule = axis_rule_for(spec, field, item.get("semantic_name"))
+        own_values = [point[1] for point in item["points"]]
+        semantic_values = shared_values.get(field, own_values) if rule.shared_across_cases else own_values
+        series.append(
+            {
+                **item,
+                "semantic_limits": resolve_axis_limits(semantic_values, rule).as_dict(),
+                "detail_limits": resolve_axis_limits(own_values, rule, detail=True).as_dict(),
+                "shared_semantic_scale": rule.shared_across_cases,
+            }
+        )
+    return series
+
+
+def _raw_case_series(run: RunRecord, spec: AnalysisSpec) -> list[dict[str, Any]]:
+    series: list[dict[str, Any]] = []
+    frame_rows = read_trace_rows(run.frame_metrics_path)
+    frame_definitions: list[tuple[str, str, str | None, str | None]] = []
+    for metric_name in ("min_ttc", "min_distance"):
+        binding = spec.metrics.get(metric_name)
+        if binding and binding.series:
+            frame_definitions.append(
+                (metric_name, binding.series, binding.label, binding.unit)
+            )
+    frame_definitions.extend(
+        [
+            ("ego.speed", "ego.speed", None, None),
+            ("ego.acceleration", "ego.acceleration", None, None),
+        ]
+    )
+    for semantic_name, field, configured_label, configured_unit in frame_definitions:
+        points = _series_points(frame_rows, field)
+        if not points:
+            continue
+        label, unit = series_presentation(
+            field,
+            semantic_name=semantic_name,
+            configured_label=configured_label,
+            configured_unit=configured_unit,
+        )
+        series.append(
+            {
+                "source": "timeseries",
+                "semantic_name": semantic_name,
+                "field": field,
+                "label": label,
+                "unit": unit,
+                "points": points,
+            }
+        )
+    control_rows = read_trace_rows(run.control_commands_path)
+    if control_rows:
+        fields = [
+            field
+            for field in control_rows[0]
+            if field not in CONTROL_EXCLUDED_FIELDS
+            and any(as_float(row.get(field)) is not None for row in control_rows)
+        ]
+        for field in fields:
+            points = _series_points(control_rows, field)
+            if not points:
+                continue
+            label, unit = series_presentation(field)
+            series.append(
+                {
+                    "source": "controls",
+                    "semantic_name": field,
+                    "field": field,
+                    "label": label,
+                    "unit": unit,
+                    "points": points,
+                }
+            )
+    return series
+
+
+def _series_points(rows: list[dict[str, str]], field: str) -> list[tuple[float, float]]:
+    points = []
+    for row in rows:
+        time = as_float(row.get("sim_time_ms"))
+        value = as_float(row.get(field))
+        if time is not None and value is not None:
+            points.append((time / 1000.0, value))
+    return points
 
 
 def render_component_figures(
@@ -556,35 +664,31 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
 
 
 def _timeseries_plot(
-    run: RunRecord, spec: AnalysisSpec, output_dir: Path, prefix: str
+    run: RunRecord,
+    spec: AnalysisSpec,
+    output_dir: Path,
+    prefix: str,
+    all_series: list[dict[str, Any]],
 ) -> list[Path]:
-    rows = read_trace_rows(run.frame_metrics_path)
-    if not rows:
-        return []
-    series = []
-    for metric_name in ("min_ttc", "min_distance"):
-        binding = spec.metrics.get(metric_name)
-        if binding and binding.series and any(row.get(binding.series) not in {None, ""} for row in rows):
-            series.append((metric_name, binding.series, binding.label or metric_name))
-    for field, label in (("ego.speed", "Ego speed"), ("ego.acceleration", "Ego acceleration")):
-        if any(row.get(field) not in {None, ""} for row in rows):
-            series.append((field.replace(".", "_"), field, label))
+    series = [item for item in all_series if item["source"] == "timeseries"]
     if not series:
         return []
     fig, axes = plt.subplots(len(series), 1, figsize=(9, 2.8 * len(series)), sharex=True)
     axes_array = np.atleast_1d(axes)
     output_rows = []
-    time_values = [as_float(row.get("sim_time_ms")) for row in rows]
-    for axis, (_, field, label) in zip(axes_array, series, strict=True):
-        values = [as_float(row.get(field)) for row in rows]
-        points = [
-            (time / 1000.0, value)
-            for time, value in zip(time_values, values, strict=True)
-            if time is not None and value is not None
-        ]
-        if points:
-            axis.plot([point[0] for point in points], [point[1] for point in points])
-        axis.set_ylabel(label)
+    for axis, item in zip(axes_array, series, strict=True):
+        field = item["field"]
+        points = item["points"]
+        axis.plot([point[0] for point in points], [point[1] for point in points])
+        _apply_axis_style(axis, item)
+        if item["semantic_name"] == "min_ttc":
+            axis.axhline(
+                spec.near_critical_ttc_s,
+                color="#f59e0b",
+                linestyle=":",
+                linewidth=1.0,
+                label="near-critical threshold",
+            )
         for time, value in points:
             output_rows.append({"time_s": time, "series": field, "value": value})
     axes_array[-1].set_xlabel("Simulation time (s)")
@@ -599,31 +703,27 @@ def _timeseries_plot(
     )
 
 
-def _control_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path]:
-    rows = read_trace_rows(run.control_commands_path)
-    if not rows:
+def _control_plot(
+    run: RunRecord,
+    output_dir: Path,
+    prefix: str,
+    all_series: list[dict[str, Any]],
+) -> list[Path]:
+    series = [item for item in all_series if item["source"] == "controls"]
+    if not series:
         return []
-    excluded = {"step_index", "sim_time_ms", "control_type"}
-    fields = [
-        field
-        for field in rows[0]
-        if field not in excluded and any(as_float(row.get(field)) is not None for row in rows)
-    ]
-    if not fields:
-        return []
-    fig, axes = plt.subplots(len(fields), 1, figsize=(9, 2.5 * len(fields)), sharex=True)
+    fig, axes = plt.subplots(len(series), 1, figsize=(9, 2.5 * len(series)), sharex=True)
     axes_array = np.atleast_1d(axes)
     output_rows = []
-    for axis, field in zip(axes_array, fields, strict=True):
-        points = []
-        for row in rows:
-            time = as_float(row.get("sim_time_ms"))
-            value = as_float(row.get(field))
-            if time is not None and value is not None:
-                points.append((time / 1000.0, value))
-                output_rows.append({"time_s": time / 1000.0, "series": field, "value": value})
+    for axis, item in zip(axes_array, series, strict=True):
+        field = item["field"]
+        points = item["points"]
         axis.plot([item[0] for item in points], [item[1] for item in points])
-        axis.set_ylabel(field)
+        _apply_axis_style(axis, item)
+        output_rows.extend(
+            {"time_s": time, "series": field, "value": value}
+            for time, value in points
+        )
     axes_array[-1].set_xlabel("Simulation time (s)")
     fig.suptitle(f"{prefix.replace('_', ' ').title()} controls: {run.run_id}")
     fig.tight_layout()
@@ -634,6 +734,35 @@ def _control_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path]:
         output_rows,
         formats=("svg", "png"),
     )
+
+
+def _apply_axis_style(axis, item: dict[str, Any]) -> None:
+    limits = item["semantic_limits"]
+    axis.set_ylim(float(limits["lower"]), float(limits["upper"]))
+    label = item["label"]
+    if item.get("unit"):
+        label = f"{label} ({item['unit']})"
+    axis.set_ylabel(label)
+    axis.grid(axis="y", color="#d9e1ea", linewidth=0.7)
+    lower, upper = float(limits["lower"]), float(limits["upper"])
+    if lower <= 0 <= upper:
+        axis.axhline(0, color="#475569", linewidth=1.0, alpha=0.8)
+    if limits.get("out_of_range"):
+        for nominal in (limits.get("nominal_lower"), limits.get("nominal_upper")):
+            if nominal is not None and lower < float(nominal) < upper:
+                axis.axhline(
+                    float(nominal), color="#dc2626", linestyle="--", linewidth=0.9
+                )
+        axis.text(
+            0.99,
+            0.92,
+            "outside nominal range",
+            transform=axis.transAxes,
+            ha="right",
+            va="top",
+            color="#b91c1c",
+            fontsize=8,
+        )
 
 
 def _event_timeline(run: RunRecord, output_dir: Path, prefix: str) -> list[Path]:

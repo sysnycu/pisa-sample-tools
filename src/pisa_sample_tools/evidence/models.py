@@ -35,6 +35,37 @@ class DerivedParameter:
 
 
 @dataclass(frozen=True)
+class AxisRule:
+    policy: str = "auto"
+    detail_policy: str = "auto"
+    lower: float | None = None
+    upper: float | None = None
+    padding_fraction: float = 0.08
+    minimum_span: float | None = None
+    shared_across_cases: bool = False
+
+
+def _default_comparison_tolerances() -> dict[str, float]:
+    return {
+        "steer": 0.02,
+        "throttle": 0.05,
+        "brake": 0.05,
+        "speed": 0.5,
+        "acceleration": 0.5,
+        "min_ttc": 0.2,
+        "min_distance": 0.5,
+    }
+
+
+@dataclass(frozen=True)
+class ComparisonDetailSpec:
+    enabled: bool = True
+    max_points_per_series: int = 2000
+    trajectory_divergence_m: float = 0.5
+    tolerances: dict[str, float] = field(default_factory=_default_comparison_tolerances)
+
+
+@dataclass(frozen=True)
 class AnalysisSpec:
     version: int = 1
     validation_mode: str = "permissive"
@@ -63,6 +94,8 @@ class AnalysisSpec:
     bootstrap_samples: int = 2000
     bootstrap_seed: int = 0
     output_formats: tuple[str, ...] = ("svg", "png")
+    visualization_axes: dict[str, AxisRule] = field(default_factory=dict)
+    comparison_detail: ComparisonDetailSpec = field(default_factory=ComparisonDetailSpec)
 
 
 @dataclass(frozen=True)
@@ -89,6 +122,16 @@ class RunRecord:
     @property
     def run_id(self) -> str:
         return f"{self.experiment_id}:{self.scenario_id}"
+
+
+@dataclass(frozen=True)
+class ConcreteComparisonGroup:
+    group_id: str
+    logical_scenario_name: str
+    parameter_key: str
+    params: dict[str, Any]
+    pairing_method: str
+    runs: tuple[RunRecord, ...]
 
 
 @dataclass(frozen=True)

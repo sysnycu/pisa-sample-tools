@@ -64,8 +64,10 @@ def build_paired_comparisons(
                 {
                     "comparison": pair_name,
                     "side": side,
+                    "experiment_id": run.experiment_id,
                     "run_id": run.run_id,
                     "sample_id": run.sample_id,
+                    "outcome": normalized_outcome(run, spec),
                     "parameters": json.dumps(run.params, sort_keys=True),
                 }
             )
@@ -89,6 +91,8 @@ def build_paired_comparisons(
                     "comparison": pair_name,
                     "match_key": match_key,
                     "pairing_method": method,
+                    "left_experiment": left_id,
+                    "right_experiment": right_id,
                     "left_run_id": left_run.run_id,
                     "right_run_id": right_run.run_id,
                     "left_outcome": left_outcome,
@@ -101,6 +105,8 @@ def build_paired_comparisons(
                     {
                         "comparison": pair_name,
                         "match_key": match_key,
+                        "left_experiment": left_id,
+                        "right_experiment": right_id,
                         "left_run_id": left_run.run_id,
                         "right_run_id": right_run.run_id,
                         "left_failure": left_failure,

@@ -337,6 +337,8 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert (output / "report" / "analysis_report.html").exists()
     assert (output / "report" / "analysis_data.json").exists()
     assert (output / "report" / "analysis_data.js").exists()
+    assert (output / "report" / "case_data.json").exists()
+    assert (output / "report" / "case_data.js").exists()
     assert (output / "report" / "cases" / "safe.json").exists()
     assert (output / "report" / "cases" / "failure.json").exists()
     assert (output / "report" / "paper_ready_summary.tex").exists()
@@ -349,16 +351,48 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert "PISA Validation Evidence" in report
     assert "Parameter Space Explorer" in report
     assert "Boundary Explorer" in report
+    assert "Semantic" in report
+    assert "Detail" in report
+    assert 'id="case-canvas"' in report
     assert "Advanced run explorer and Spec Lab" in report
     assert "Download YAML spec" in report
     assert 'id="run-select"' in report
     data = json.loads((output / "report" / "analysis_data.json").read_text(encoding="utf-8"))
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 3
+    assert data["report_mode"] == "single"
     assert data["summary"]["run_count"] == 2
     assert data["runs"][0]["normalized_outcome"] == "success"
     assert data["boundary"]["pairs"]["x__y"]["available"] is True
     assert data["representative_cases"][0]["case_json"]
     assert data["insights"]
+    case_data = json.loads((output / "report" / "case_data.json").read_text(encoding="utf-8"))
+    safe_case = next(item for item in case_data["cases"] if item["case_type"] == "safe")
+    failure_case = next(
+        item for item in case_data["cases"] if item["case_type"] == "failure"
+    )
+    steer = next(item for item in safe_case["series"] if item["field"] == "steer")
+    speed = next(item for item in safe_case["series"] if item["field"] == "ego.speed")
+    acceleration = next(
+        item for item in safe_case["series"] if item["field"] == "ego.acceleration"
+    )
+    assert steer["semantic_limits"]["lower"] == -1.0
+    assert steer["semantic_limits"]["upper"] == 1.0
+    assert speed["semantic_limits"]["lower"] == 0.0
+    assert acceleration["semantic_limits"]["lower"] == -acceleration["semantic_limits"][
+        "upper"
+    ]
+    failure_speed = next(
+        item for item in failure_case["series"] if item["field"] == "ego.speed"
+    )
+    failure_acceleration = next(
+        item for item in failure_case["series"] if item["field"] == "ego.acceleration"
+    )
+    assert failure_speed["semantic_limits"] == speed["semantic_limits"]
+    assert failure_acceleration["semantic_limits"] == acceleration["semantic_limits"]
+    controls_csv = (
+        output / "representative_cases" / "failure_controls.csv"
+    ).read_text(encoding="utf-8")
+    assert controls_csv.splitlines()[0] == "time_s,series,value"
     geometry = (output / "summary" / "agent_geometry.csv").read_text(encoding="utf-8")
     assert "simulator_runtime_shape" in geometry
     collision_events = (output / "summary" / "collision_events.csv").read_text(
@@ -380,6 +414,15 @@ def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
     output = tmp_path / "comparison"
     _write_experiment(left)
     _write_experiment(right)
+    _write_run(
+        right,
+        1,
+        x=10,
+        y=5,
+        outcome="test_fail",
+        stop_condition="collision_guard",
+        min_ttc=0.25,
+    )
     _write_spec(spec_path)
     campaign_path = tmp_path / "campaign.yaml"
     campaign_path.write_text(
@@ -432,6 +475,153 @@ def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
     pairing = (output / "comparison" / "pairing_summary.csv").read_text(encoding="utf-8")
     assert ",2,0,0" in pairing
     assert (output / "comparison" / "outcome_transition.csv").exists()
+    assert (output / "comparison" / "concrete_scenarios.csv").exists()
+    assert (output / "report" / "comparison.html").exists()
+    assert (output / "report" / "comparison_index.json").exists()
+    comparison_index = json.loads(
+        (output / "report" / "comparison_index.json").read_text(encoding="utf-8")
+    )
+    assert len(comparison_index["groups"]) == 2
+    group_id = comparison_index["groups"][0]["group_id"]
+    assert (output / "report" / "comparison_data" / f"{group_id}.json").exists()
+    chunk = json.loads(
+        (output / "report" / "comparison_data" / f"{group_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(chunk["configs"]) == 2
+    assert chunk["pairwise_trajectory"]
+    report_data = json.loads(
+        (output / "report" / "analysis_data.json").read_text(encoding="utf-8")
+    )
+    assert report_data["report_mode"] == "compare"
+    assert [item["id"] for item in report_data["experiments"]] == [
+        "behavior-r1",
+        "autoware-r1",
+    ]
+    assert len(report_data["experiment_summaries"]["outcomes"]) == 2
+    assert report_data["boundary"]["pairs"] == {}
+    assert set(report_data["boundary"]["by_experiment"]) == {
+        "behavior-r1",
+        "autoware-r1",
+    }
+    points = report_data["comparison"]["parameter_points"]
+    assert any(point.get("transition") == "failure__success" for point in points)
+    assert all(point.get("comparison_group_id") for point in points if point["matched"])
+    parameter_groups = report_data["comparison"]["parameter_groups"]
+    assert len(parameter_groups) == 2
+    assert all(group["complete"] for group in parameter_groups)
+    assert all(len(group["experiments"]) == 2 for group in parameter_groups)
+    experiment_figures = [
+        figure for figure in report_data["figures"] if figure["scope"] == "experiment"
+    ]
+    assert all(
+        {"figure_key", "category", "tags", "available_formats"} <= figure.keys()
+        for figure in experiment_figures
+    )
+    assert {figure["experiment_id"] for figure in experiment_figures} == {
+        "behavior_r1",
+        "autoware_r1",
+    }
+    assert not (output / "figures" / "outcome_scatter.svg").exists()
+    assert (
+        output
+        / "figures"
+        / "experiments"
+        / "behavior_r1"
+        / "outcome_scatter.svg"
+    ).exists()
+    assert all(run["comparison_group_id"] for run in report_data["runs"])
+    report_html = (output / "report" / "analysis_report.html").read_text(encoding="utf-8")
+    assert "Compare configs" in report_html
+    assert "Compare outcomes" in report_html
+    assert "Compare metric delta" in report_html
+    assert "Open comparison" in report_html
+    assert "Reference experiment" in report_html
+    assert "figure-category" in report_html
+    assert "group-inspector" in report_html
+    assert "ctx.rect" not in report_html
+    comparison_html = (output / "report" / "comparison.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="play"' in comparison_html
+    assert 'id="metric-canvas"' in comparison_html
+    assert 'id="control-canvas"' in comparison_html
+    assert "Step ${state.timeIndex+1}" in comparison_html
+
+
+def test_build_evidence_overwrite_recovers_partial_output(tmp_path: Path) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis.yaml"
+    output = tmp_path / "evidence"
+    _write_experiment(results)
+    _write_spec(spec_path)
+    output.mkdir()
+    (output / ".pisa-analysis-in-progress.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "tool": "pisa-analysis-tools",
+                "schema_version": 1,
+                "state": "in_progress",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output / "stale.txt").write_text("partial output", encoding="utf-8")
+
+    build_evidence(
+        results_paths=[results],
+        output_dir=output,
+        spec_path=spec_path,
+        overwrite=True,
+    )
+
+    assert not (output / "stale.txt").exists()
+    assert not (output / ".pisa-analysis-in-progress.yaml").exists()
+    manifest = yaml.safe_load((output / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["tool"] == "pisa-analysis-tools"
+    assert not any(
+        ".pisa-analysis-in-progress.yaml" in path for path in manifest["outputs"]
+    )
+
+
+def test_build_evidence_overwrite_rejects_unowned_output(tmp_path: Path) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis.yaml"
+    output = tmp_path / "evidence"
+    _write_experiment(results)
+    _write_spec(spec_path)
+    output.mkdir()
+    (output / "user-data.txt").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(EvidenceError, match="neither manifest.yaml nor a PISA partial"):
+        build_evidence(
+            results_paths=[results],
+            output_dir=output,
+            spec_path=spec_path,
+            overwrite=True,
+        )
+
+    assert (output / "user-data.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_build_evidence_overwrite_accepts_empty_output_directory(tmp_path: Path) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis.yaml"
+    output = tmp_path / "evidence"
+    _write_experiment(results)
+    _write_spec(spec_path)
+    output.mkdir()
+
+    result = build_evidence(
+        results_paths=[results],
+        output_dir=output,
+        spec_path=spec_path,
+        overwrite=True,
+    )
+
+    assert result.manifest_path.exists()
+    assert not (output / ".pisa-analysis-in-progress.yaml").exists()
 
 
 def test_unified_cli_builds_evidence(tmp_path: Path, capsys) -> None:

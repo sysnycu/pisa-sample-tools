@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from pisa_sample_tools.evidence.comparison import build_paired_comparisons
+from pisa_sample_tools.evidence.concrete_compare import build_concrete_comparison_groups
 from pisa_sample_tools.evidence.models import AnalysisSpec, MetricBinding, RunRecord
 from pisa_sample_tools.evidence.statistics import select_representative_cases
 
@@ -30,10 +31,13 @@ def test_boundary_and_pairing_handle_twenty_thousand_runs() -> None:
     started = time.perf_counter()
     cases = select_representative_cases(runs, spec, "x", "y")
     comparison = build_paired_comparisons(runs, spec)
+    concrete_groups, warnings = build_concrete_comparison_groups(runs, spec)
     elapsed = time.perf_counter() - started
 
     assert len(cases) >= 3
     assert len(comparison.matched_runs) == 10_000
+    assert len(concrete_groups) == 10_000
+    assert warnings == []
     assert elapsed < 5.0
 
 

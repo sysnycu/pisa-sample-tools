@@ -5,7 +5,15 @@ from typing import Any
 
 from pisa_sample_tools.common.yaml import load_mapping_file
 
-from .models import AnalysisSpec, DerivedParameter, EvidenceError, MetricBinding
+from .axes import AXIS_POLICIES, default_axis_rules
+from .models import (
+    AnalysisSpec,
+    AxisRule,
+    ComparisonDetailSpec,
+    DerivedParameter,
+    EvidenceError,
+    MetricBinding,
+)
 
 DEFAULT_METRICS = {
     "min_ttc": MetricBinding(
@@ -34,7 +42,10 @@ DERIVED_OPERATIONS = {"add", "subtract", "multiply", "divide"}
 
 def load_analysis_spec(path: Path | None) -> AnalysisSpec:
     if path is None:
-        return AnalysisSpec(metrics=dict(DEFAULT_METRICS))
+        return AnalysisSpec(
+            metrics=dict(DEFAULT_METRICS),
+            visualization_axes=default_axis_rules(),
+        )
     raw = load_mapping_file(path, label="analysis spec", error_type=EvidenceError)
     version = int(raw.get("version", 1))
     if version not in {1, 2}:
@@ -112,6 +123,8 @@ def load_analysis_spec(path: Path | None) -> AnalysisSpec:
     bootstrap_samples = int(comparison.get("bootstrap_samples", 2000))
     if tolerance < 0 or bootstrap_samples < 0:
         raise EvidenceError("comparison tolerance and bootstrap_samples cannot be negative")
+    visualization_axes = _load_visualization_axes(raw.get("visualization"))
+    comparison_detail = _load_comparison_detail(comparison.get("detail"))
 
     return AnalysisSpec(
         version=version,
@@ -144,6 +157,8 @@ def load_analysis_spec(path: Path | None) -> AnalysisSpec:
         bootstrap_samples=bootstrap_samples,
         bootstrap_seed=int(comparison.get("bootstrap_seed", 0)),
         output_formats=formats,
+        visualization_axes=visualization_axes,
+        comparison_detail=comparison_detail,
     )
 
 
@@ -197,9 +212,101 @@ def spec_to_dict(spec: AnalysisSpec) -> dict[str, Any]:
             "parameter_tolerance": spec.pairing_parameter_tolerance,
             "bootstrap_samples": spec.bootstrap_samples,
             "bootstrap_seed": spec.bootstrap_seed,
+            "detail": {
+                "enabled": spec.comparison_detail.enabled,
+                "max_points_per_series": spec.comparison_detail.max_points_per_series,
+                "trajectory_divergence_m": spec.comparison_detail.trajectory_divergence_m,
+                "tolerances": dict(sorted(spec.comparison_detail.tolerances.items())),
+            },
         },
         "output": {"formats": list(spec.output_formats)},
+        "visualization": {
+            "axes": {
+                "fields": {
+                    name: {
+                        "policy": rule.policy,
+                        "detail_policy": rule.detail_policy,
+                        "min": rule.lower,
+                        "max": rule.upper,
+                        "padding_fraction": rule.padding_fraction,
+                        "minimum_span": rule.minimum_span,
+                        "shared_across_cases": rule.shared_across_cases,
+                    }
+                    for name, rule in sorted(spec.visualization_axes.items())
+                }
+            }
+        },
     }
+
+
+def _load_comparison_detail(value: Any) -> ComparisonDetailSpec:
+    config = _mapping(value)
+    defaults = ComparisonDetailSpec()
+    max_points = int(config.get("max_points_per_series", defaults.max_points_per_series))
+    divergence = float(config.get("trajectory_divergence_m", defaults.trajectory_divergence_m))
+    if max_points < 10:
+        raise EvidenceError("comparison.detail.max_points_per_series must be at least 10")
+    if divergence <= 0:
+        raise EvidenceError("comparison.detail.trajectory_divergence_m must be positive")
+    tolerances = dict(defaults.tolerances)
+    for name, raw_tolerance in _mapping(config.get("tolerances")).items():
+        tolerance = float(raw_tolerance)
+        if tolerance < 0:
+            raise EvidenceError(f"comparison.detail.tolerances.{name} cannot be negative")
+        tolerances[str(name)] = tolerance
+    return ComparisonDetailSpec(
+        enabled=bool(config.get("enabled", defaults.enabled)),
+        max_points_per_series=max_points,
+        trajectory_divergence_m=divergence,
+        tolerances=tolerances,
+    )
+
+
+def _load_visualization_axes(value: Any) -> dict[str, AxisRule]:
+    visualization = _mapping(value)
+    axes = _mapping(visualization.get("axes"))
+    padding = float(axes.get("padding_fraction", 0.08))
+    if not 0 <= padding <= 1:
+        raise EvidenceError("visualization.axes.padding_fraction must be between 0 and 1")
+    rules = default_axis_rules(padding)
+    for name, raw_rule in _mapping(axes.get("fields")).items():
+        config = _mapping(raw_rule)
+        base = rules.get(str(name), AxisRule(padding_fraction=padding))
+        policy = str(config.get("policy", base.policy)).lower()
+        detail_policy = str(config.get("detail_policy", base.detail_policy)).lower()
+        if policy not in AXIS_POLICIES or detail_policy not in AXIS_POLICIES:
+            raise EvidenceError(
+                f"visualization axis '{name}' policy must be one of "
+                + ", ".join(sorted(AXIS_POLICIES))
+            )
+        lower = _optional_float(config.get("min"), base.lower)
+        upper = _optional_float(config.get("max"), base.upper)
+        field_padding = float(config.get("padding_fraction", base.padding_fraction))
+        minimum_span = _optional_float(config.get("minimum_span"), base.minimum_span)
+        if not 0 <= field_padding <= 1:
+            raise EvidenceError(
+                f"visualization axis '{name}' padding_fraction must be between 0 and 1"
+            )
+        if minimum_span is not None and minimum_span <= 0:
+            raise EvidenceError(f"visualization axis '{name}' minimum_span must be positive")
+        if policy == "fixed" and (
+            lower is None or upper is None or lower >= upper
+        ):
+            raise EvidenceError(
+                f"visualization axis '{name}' fixed policy requires min < max"
+            )
+        rules[str(name)] = AxisRule(
+            policy=policy,
+            detail_policy=detail_policy,
+            lower=lower,
+            upper=upper,
+            padding_fraction=field_padding,
+            minimum_span=minimum_span,
+            shared_across_cases=bool(
+                config.get("shared_across_cases", base.shared_across_cases)
+            ),
+        )
+    return rules
 
 
 def _load_derived_parameters(value: Any) -> dict[str, DerivedParameter]:
@@ -238,6 +345,12 @@ def _optional_str(value: Any) -> str | None:
     if value in {None, ""}:
         return None
     return str(value)
+
+
+def _optional_float(value: Any, default: float | None = None) -> float | None:
+    if value in {None, ""}:
+        return default
+    return float(value)
 
 
 def _string_set(value: Any, default: set[str]) -> frozenset[str]:
