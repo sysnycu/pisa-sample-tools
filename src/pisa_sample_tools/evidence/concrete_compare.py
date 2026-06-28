@@ -49,7 +49,7 @@ def build_concrete_comparison_groups(
             for experiment_id, experiment_runs in sorted(by_experiment.items())
             if experiment_id not in ambiguous
         ]
-        if len(selected) < 2:
+        if not selected:
             continue
         sample_ids = {str(run.sample_id) for run in selected if run.sample_id is not None}
         pairing_method = (

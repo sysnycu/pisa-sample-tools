@@ -12,7 +12,7 @@ _HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PISA Concrete Scenario Comparison</title>
+  <title>PISA Concrete Scenario Analysis</title>
   <style>
     :root { --navy:#102033; --ink:#17202a; --muted:#64748b; --line:#d9e1ea; --bg:#f4f7fa; --paper:#fff; --red:#dc2626; --orange:#f59e0b; }
     * { box-sizing:border-box; } body { margin:0; font-family:Inter,system-ui,sans-serif; color:var(--ink); background:var(--bg); }
@@ -46,7 +46,7 @@ _HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-<header><a href="analysis_report.html">Back to report</a><h1>Concrete Scenario Comparison</h1></header>
+<header><a href="analysis_report.html">Back to report</a><h1 id="viewer-title">Concrete Scenario Analysis</h1></header>
 <main>
   <div class="toolbar">
     <label>Search concrete scenario<input id="group-search" placeholder="sample id, parameter, outcome, config"></label>
@@ -65,7 +65,7 @@ _HTML = r"""<!doctype html>
       <section><h2>Trajectory Overlay</h2><canvas id="trajectory-canvas"></canvas><div class="muted">Equal XY scale. Config is encoded by color; actor is encoded by line pattern.</div></section>
       <div class="series-grid"><section><h2>Metrics</h2><div class="inline"><label>Field<select id="metric-field"></select></label><label>Scale<select id="metric-scale"><option value="semantic">Semantic</option><option value="detail">Detail</option></select></label></div><canvas id="metric-canvas"></canvas><div id="metric-info" class="muted"></div></section><section><h2>Controls</h2><div class="inline"><label>Field<select id="control-field"></select></label><label>Scale<select id="control-scale"><option value="semantic">Semantic</option><option value="detail">Detail</option></select></label></div><canvas id="control-canvas"></canvas><div id="control-info" class="muted"></div></section></div>
     </div>
-    <div class="results"><div class="results-grid"><section><h2>Config Results</h2><div id="config-table"></div></section><section><h2>Trajectory Differences</h2><div id="trajectory-table"></div></section><section><h2>Metric Differences</h2><div id="metric-table"></div></section><section><h2>Control Differences</h2><div id="control-table"></div></section><section><h2>Difference Timeline</h2><div id="timeline-table"></div></section><section><h2>Data Quality</h2><div id="warnings"></div></section></div></div>
+    <div class="results"><div class="results-grid"><section><h2>Config Results</h2><div id="config-table"></div></section><section class="comparison-only"><h2>Trajectory Differences</h2><div id="trajectory-table"></div></section><section class="comparison-only"><h2>Metric Differences</h2><div id="metric-table"></div></section><section class="comparison-only"><h2>Control Differences</h2><div id="control-table"></div></section><section><h2>Event and Difference Timeline</h2><div id="timeline-table"></div></section><section><h2>Data Quality</h2><div id="warnings"></div></section></div></div>
   </div>
 </main>
 <script src="comparison_index.js"></script>
@@ -80,11 +80,11 @@ _HTML = r"""<!doctype html>
   const fmt = value => Number.isFinite(Number(value)) ? Number(Number(value).toPrecision(4)).toString() : String(value ?? '');
   function color(id) { let hash=0; for(const ch of id) hash=(hash*31+ch.charCodeAt(0))>>>0; return palette[hash%palette.length]; }
   function table(rows) { if(!rows.length) return '<p class="muted">No comparable data.</p>'; const cols=[...new Set(rows.flatMap(r=>Object.keys(r)))]; return '<table><thead><tr>'+cols.map(c=>`<th>${esc(c)}</th>`).join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>`<td>${esc(typeof r[c]==='number'?fmt(r[c]):r[c])}</td>`).join('')+'</tr>').join('')+'</tbody></table>'; }
-  function initIndex() { el('group-select').textContent=''; index.forEach(item=>el('group-select').appendChild(new Option(`${item.logical_scenario_name} | ${JSON.stringify(item.params)} | ${item.configs.length} configs`,item.group_id))); const requested=new URLSearchParams(location.search).get('group'); if(requested && index.some(item=>item.group_id===requested)) el('group-select').value=requested; filterGroups(); loadSelected(); }
+  function initIndex() { el('group-select').textContent=''; index.forEach(item=>el('group-select').appendChild(new Option(`${item.logical_scenario_name} | ${JSON.stringify(item.params)} | ${item.configs.length} ${item.configs.length===1?'config':'configs'}`,item.group_id))); const requested=new URLSearchParams(location.search).get('group'); if(requested && index.some(item=>item.group_id===requested)) el('group-select').value=requested; filterGroups(); loadSelected(); }
   function filterGroups() { const q=el('group-search').value.toLowerCase(); [...el('group-select').options].forEach((option,i)=>option.hidden=!!q && !index[i].search_text.includes(q)); }
   function loadSelected() { const id=el('group-select').value, entry=index.find(item=>item.group_id===id); if(!entry) return; history.replaceState(null,'',`?group=${encodeURIComponent(id)}`); if(chunks[id]) return useChunk(chunks[id]); const script=document.createElement('script'); script.src=entry.chunk; script.onload=()=>useChunk(chunks[id]); script.onerror=()=>showError(`Could not load ${entry.chunk}`); document.head.appendChild(script); }
   function showError(message) { el('load-error').style.display='block'; el('load-error').textContent=message; }
-  function useChunk(chunk) { pause();el('load-error').style.display='none'; state.group=chunk; state.baseline=chunk.configs[0]?.config_id || null; adaptiveSelection(); populateBaseline(); populateActors(); populateFields('metrics');populateFields('controls'); renderAll(); }
+  function useChunk(chunk) { pause();el('load-error').style.display='none'; state.group=chunk; state.baseline=chunk.configs[0]?.config_id || null;const comparing=chunk.configs.length>1;el('viewer-title').textContent=comparing?'Concrete Scenario Comparison':'Concrete Scenario Analysis';el('disagreements').hidden=!comparing;document.querySelectorAll('.comparison-only').forEach(item=>item.hidden=!comparing);adaptiveSelection(); populateBaseline(); populateActors(); populateFields('metrics');populateFields('controls'); renderAll(); }
   function adaptiveSelection() { const configs=state.group.configs, baseline=configs[0]; state.selected=new Set(); if(configs.length<=6) configs.forEach(c=>state.selected.add(c.config_id)); else { state.selected.add(baseline.config_id); configs.filter(c=>c.outcome!==baseline.outcome).forEach(c=>state.selected.add(c.config_id)); if(state.selected.size===1) configs.slice(1,5).forEach(c=>state.selected.add(c.config_id)); } renderConfigChecks(); }
   function selectAll() { pause();state.group.configs.forEach(c=>state.selected.add(c.config_id));renderConfigChecks();populateActors();populateFields('metrics');populateFields('controls');renderAll(); }
   function selectDisagreements() { pause();const base=state.group.configs.find(c=>c.config_id===state.baseline);state.selected=new Set([state.baseline]);state.group.configs.filter(c=>c.outcome!==base.outcome).forEach(c=>state.selected.add(c.config_id));renderConfigChecks();populateActors();populateFields('metrics');populateFields('controls');renderAll(); }

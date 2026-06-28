@@ -106,7 +106,21 @@ def test_grouping_does_not_mix_logical_scenarios(tmp_path: Path) -> None:
 
     groups, _ = build_concrete_comparison_groups(runs, _spec())
 
-    assert groups == []
+    assert len(groups) == 2
+    assert {group.logical_scenario_name for group in groups} == {"cutin", "crossing"}
+    assert all(len(group.runs) == 1 for group in groups)
+
+
+def test_single_config_chunk_contains_trajectory_and_series(tmp_path: Path) -> None:
+    groups, _ = build_concrete_comparison_groups([_run(tmp_path, "a")], _spec())
+
+    chunk = build_comparison_chunk(groups[0], _spec())
+
+    assert len(chunk["configs"]) == 1
+    assert chunk["configs"][0]["trajectory"]
+    assert chunk["configs"][0]["series"]
+    assert chunk["pairwise_trajectory"] == []
+    assert chunk["pairwise_series"] == []
 
 
 def test_duplicate_dataset_parameter_group_is_rejected_in_strict_mode(tmp_path: Path) -> None:

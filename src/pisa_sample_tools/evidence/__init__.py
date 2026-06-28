@@ -16,6 +16,7 @@ from .models import (
     MetricBinding,
     RunRecord,
     SelectedCase,
+    SensitivitySpec,
 )
 from .service import build_evidence, validate_evidence_inputs
 from .spec import load_analysis_spec
@@ -32,6 +33,7 @@ __all__ = [
     "MetricBinding",
     "RunRecord",
     "SelectedCase",
+    "SensitivitySpec",
     "build_evidence",
     "align_numeric_series",
     "build_concrete_comparison_groups",

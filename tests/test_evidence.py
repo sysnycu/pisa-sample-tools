@@ -304,7 +304,37 @@ def test_load_analysis_spec_reads_metric_bindings(tmp_path: Path) -> None:
 
     assert spec.x_param == "x"
     assert spec.metrics["min_ttc"].summary == "pair.min_ttc_s"
+    assert spec.metrics["min_ttc"].risk_direction == "higher_is_safer"
+    assert spec.sensitivity.enabled is True
+    assert spec.sensitivity.outcome_targets == ("failure", "invalidity")
     assert spec.near_critical_ttc_s == 1.5
+
+
+def test_load_analysis_spec_accepts_flat_sensitivity_compatibility(
+    tmp_path: Path,
+) -> None:
+    spec_path = tmp_path / "analysis.yaml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "sensitivity": {
+                    "outcome_targets": ["failure"],
+                    "metric_targets": ["min_ttc"],
+                    "sobol_base_sizes": [64],
+                    "morris_trajectories": [12],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    spec = load_analysis_spec(spec_path)
+
+    assert spec.sensitivity.outcome_targets == ("failure",)
+    assert spec.sensitivity.metric_targets == ("min_ttc",)
+    assert spec.sensitivity.sobol_base_sizes == (64,)
+    assert spec.sensitivity.morris_trajectories == (12,)
 
 
 def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
@@ -324,6 +354,9 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert (output / "summary" / "runs.csv").exists()
     assert (output / "summary" / "outcomes.csv").exists()
     assert (output / "summary" / "metrics.csv").exists()
+    assert (output / "summary" / "parameter_sensitivity.csv").exists()
+    assert (output / "summary" / "sensitivity_model_quality.csv").exists()
+    assert (output / "summary" / "sensitivity_sampling_plan.csv").exists()
     assert (output / "figures" / "outcome_scatter.svg").exists()
     assert (output / "figures" / "outcome_scatter.png").exists()
     assert (output / "figures" / "failure_rate_heatmap.csv").exists()
@@ -350,6 +383,9 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     report = (output / "report" / "analysis_report.html").read_text(encoding="utf-8")
     assert "PISA Validation Evidence" in report
     assert "Parameter Space Explorer" in report
+    assert "Parameter Sensitivity" in report
+    assert 'id="sensitivity-cluster-table"' in report
+    assert 'id="sensitivity-compare-table"' in report
     assert "Boundary Explorer" in report
     assert "Semantic" in report
     assert "Detail" in report
@@ -358,13 +394,30 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert "Download YAML spec" in report
     assert 'id="run-select"' in report
     data = json.loads((output / "report" / "analysis_data.json").read_text(encoding="utf-8"))
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == 4
+    assert data["sensitivity"]["effects"]
+    assert data["sensitivity"]["model_quality"]
     assert data["report_mode"] == "single"
     assert data["summary"]["run_count"] == 2
     assert data["runs"][0]["normalized_outcome"] == "success"
+    assert all(run["comparison_group_id"] for run in data["runs"])
+    assert len(data["comparison"]["concrete_scenarios"]) == 2
+    single_group = data["comparison"]["concrete_scenarios"][0]
+    assert len(single_group["configs"]) == 1
+    single_chunk = json.loads(
+        (
+            output
+            / "report"
+            / "comparison_data"
+            / f"{single_group['group_id']}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert len(single_chunk["configs"]) == 1
+    assert single_chunk["configs"][0]["trajectory"]
     assert data["boundary"]["pairs"]["x__y"]["available"] is True
     assert data["representative_cases"][0]["case_json"]
     assert data["insights"]
+    assert "Analyze concrete run" in report
     case_data = json.loads((output / "report" / "case_data.json").read_text(encoding="utf-8"))
     safe_case = next(item for item in case_data["cases"] if item["case_type"] == "safe")
     failure_case = next(
@@ -495,6 +548,12 @@ def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
         (output / "report" / "analysis_data.json").read_text(encoding="utf-8")
     )
     assert report_data["report_mode"] == "compare"
+    sensitivity_targets = {
+        (row["experiment_id"], row["target"])
+        for row in report_data["sensitivity"]["model_quality"]
+    }
+    assert any(target == "outcome_disagreement" for _, target in sensitivity_targets)
+    assert any(target.startswith("delta:") for _, target in sensitivity_targets)
     assert [item["id"] for item in report_data["experiments"]] == [
         "behavior-r1",
         "autoware-r1",

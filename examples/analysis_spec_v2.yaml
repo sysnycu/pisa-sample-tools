@@ -34,17 +34,20 @@ metrics:
     label: Minimum TTC
     unit: s
     missing: unavailable
+    risk_direction: higher_is_safer
   min_distance:
     summary: ego_to_agent_1_distance.min
     series: ego_to_agent_1.distance_m
     label: Minimum ego-agent center distance
     unit: m
     missing: unavailable
+    risk_direction: higher_is_safer
   max_deceleration:
     summary: ego_deceleration.max
     series: ego.acceleration
     label: Maximum ego deceleration
     unit: m/s^2
+    risk_direction: lower_is_safer
 
 outcomes:
   success: [success]
@@ -68,6 +71,24 @@ comparison:
 heatmap:
   bins: 30
   min_bin_count: 1
+
+sensitivity:
+  enabled: true
+  targets:
+    outcomes: [failure, invalidity]
+    metrics: [min_ttc, min_distance, max_deceleration]
+  bins: 8
+  minimum_bin_count: 8
+  minimum_samples: 40
+  minimum_minority: 10
+  cv_folds: 5
+  permutation_repeats: 10
+  bootstrap_samples: 500
+  top_parameters: 8
+  random_seed: 0
+  sampling_plan:
+    sobol_base_sizes: [256, 512, 1024]
+    morris_trajectories: [10, 20, 40]
 
 output:
   formats: [svg, png]

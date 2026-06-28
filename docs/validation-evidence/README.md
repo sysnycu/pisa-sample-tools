@@ -136,14 +136,82 @@ category, parameter pair, metric, and tags. Compare mode pairs the same figure k
 from the selected Left and Right experiments and shows explicit unavailable states
 when only one side exists.
 
-## Concrete Scenario Comparison
+## Parameter Sensitivity
 
-Campaigns with at least two datasets also produce `report/comparison.html`. Open it
-directly or select a run in the main parameter-space explorer and click **Compare
+The interactive report analyzes each experiment independently for failure,
+invalidity, and configured numeric metrics. Compare reports additionally analyze
+outcome disagreement and `Right - Left` metric deltas at matched parameter settings.
+It does not pool experiments into one fitted model.
+
+Three complementary result types are provided:
+
+- empirical effects use rank-biserial correlation or Cramer's V for binary targets,
+  and Spearman correlation or Kruskal epsilon-squared for continuous targets;
+- response profiles show quantile-binned estimates with confidence intervals and
+  identify monotonic, threshold-like, nonlinear, and U-shaped behavior;
+- random-forest surrogate models use grouped held-out cross-validation and
+  permutation importance, ALE profiles, and approximate Friedman interaction
+  strength. Model quality and reliability are always shown with the result.
+
+The report exposes cross-experiment rank tables, correlated-parameter warnings and
+group permutation importance. These are especially important for LHS data where
+strongly correlated inputs can split or hide individual importance. The generated
+tables are:
+
+```text
+summary/parameter_sensitivity.csv
+summary/parameter_importance.csv
+summary/parameter_response_profiles.csv
+summary/parameter_interactions.csv
+summary/sensitivity_model_quality.csv
+summary/parameter_correlations.csv
+summary/sensitivity_sampling_plan.csv
+```
+
+Observed associations and surrogate importance are screening evidence, not causal
+effects and not formal Sobol indices. `sensitivity_sampling_plan.csv` reports the
+run budgets for future independent Sobol or Morris campaigns; those methods require
+their own structured sampling design. Configure analysis thresholds and target
+semantics in the spec:
+
+```yaml
+metrics:
+  min_ttc:
+    summary: ego_to_agent_1.min_ttc_s
+    risk_direction: higher_is_safer
+
+sensitivity:
+  enabled: true
+  targets:
+    outcomes: [failure, invalidity]
+    metrics: [min_ttc, min_distance]
+  minimum_samples: 40
+  minimum_minority: 10
+  cv_folds: 5
+  permutation_repeats: 10
+  bootstrap_samples: 500
+  top_parameters: 8
+```
+
+When sample size, minority outcome count, grouped folds, or predictive quality is
+insufficient, the report marks model-based conclusions unavailable or low
+reliability while retaining descriptive empirical tables.
+
+The CLI reports sensitivity progress by target and cross-validation fold. Long
+surrogate-model stages distinguish model fitting from permutation importance, ALE,
+and interaction analysis, and report each target's elapsed time and reliability.
+The output is line-oriented so it remains readable in terminals, CI logs, and files.
+
+## Concrete Scenario Analysis
+
+Single- and multi-experiment bundles produce `report/comparison.html`. Open it
+directly or select a run in the main parameter-space explorer. Single experiments
+show **Analyze concrete run**; matched multi-experiment groups show **Compare
 configs**. Concrete scenarios are grouped by logical scenario name and the canonical
-parameter hash, with each campaign dataset kept as an independent config.
+parameter hash, with each campaign dataset kept as an independent config. Unmatched
+runs remain available as single-config concrete analyses.
 
-The comparison page provides:
+The concrete page provides:
 
 - selectable multi-config trajectory overlays with equal XY scale;
 - ego and common interacting-actor toggles;

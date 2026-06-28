@@ -13,6 +13,7 @@ from .models import (
     DerivedParameter,
     EvidenceError,
     MetricBinding,
+    SensitivitySpec,
 )
 
 DEFAULT_METRICS = {
@@ -21,18 +22,21 @@ DEFAULT_METRICS = {
         series="ego_to_agent_1.ttc_s",
         label="Minimum TTC",
         unit="s",
+        risk_direction="higher_is_safer",
     ),
     "min_distance": MetricBinding(
         summary="ego_to_agent_1.min_distance_m",
         series="ego_to_agent_1.distance_m",
         label="Minimum distance",
         unit="m",
+        risk_direction="higher_is_safer",
     ),
     "max_deceleration": MetricBinding(
         summary="ego_deceleration.max",
         series="ego.acceleration",
         label="Maximum deceleration",
         unit="m/s^2",
+        risk_direction="lower_is_safer",
     ),
 }
 
@@ -76,8 +80,11 @@ def load_analysis_spec(path: Path | None) -> AnalysisSpec:
     metric_config = _mapping(raw.get("metrics"))
     metrics = dict(DEFAULT_METRICS)
     for name, value in metric_config.items():
+        existing = metrics.get(str(name), MetricBinding())
         if isinstance(value, str):
-            metrics[str(name)] = MetricBinding(summary=value)
+            metrics[str(name)] = MetricBinding(
+                summary=value, risk_direction=existing.risk_direction
+            )
             continue
         config = _mapping(value)
         missing = str(config.get("missing", "unavailable")).lower()
@@ -89,7 +96,19 @@ def load_analysis_spec(path: Path | None) -> AnalysisSpec:
             label=_optional_str(config.get("label")),
             unit=_optional_str(config.get("unit")),
             missing=missing,
+            risk_direction=str(
+                config.get("risk_direction", existing.risk_direction)
+            ),
         )
+        if metrics[str(name)].risk_direction not in {
+            "higher_is_safer",
+            "lower_is_safer",
+            "neutral",
+        }:
+            raise EvidenceError(
+                f"metrics.{name}.risk_direction must be higher_is_safer, "
+                "lower_is_safer, or neutral"
+            )
 
     outcomes = _mapping(raw.get("outcomes"))
     termination_outcomes = {
@@ -125,6 +144,7 @@ def load_analysis_spec(path: Path | None) -> AnalysisSpec:
         raise EvidenceError("comparison tolerance and bootstrap_samples cannot be negative")
     visualization_axes = _load_visualization_axes(raw.get("visualization"))
     comparison_detail = _load_comparison_detail(comparison.get("detail"))
+    sensitivity = _load_sensitivity(raw.get("sensitivity"))
 
     return AnalysisSpec(
         version=version,
@@ -159,6 +179,7 @@ def load_analysis_spec(path: Path | None) -> AnalysisSpec:
         output_formats=formats,
         visualization_axes=visualization_axes,
         comparison_detail=comparison_detail,
+        sensitivity=sensitivity,
     )
 
 
@@ -192,6 +213,7 @@ def spec_to_dict(spec: AnalysisSpec) -> dict[str, Any]:
                 "label": binding.label,
                 "unit": binding.unit,
                 "missing": binding.missing,
+                "risk_direction": binding.risk_direction,
             }
             for name, binding in spec.metrics.items()
         },
@@ -219,6 +241,26 @@ def spec_to_dict(spec: AnalysisSpec) -> dict[str, Any]:
                 "tolerances": dict(sorted(spec.comparison_detail.tolerances.items())),
             },
         },
+        "sensitivity": {
+            "enabled": spec.sensitivity.enabled,
+            "targets": {
+                "outcomes": list(spec.sensitivity.outcome_targets),
+                "metrics": list(spec.sensitivity.metric_targets),
+            },
+            "bins": spec.sensitivity.bins,
+            "minimum_bin_count": spec.sensitivity.minimum_bin_count,
+            "minimum_samples": spec.sensitivity.minimum_samples,
+            "minimum_minority": spec.sensitivity.minimum_minority,
+            "cv_folds": spec.sensitivity.cv_folds,
+            "permutation_repeats": spec.sensitivity.permutation_repeats,
+            "bootstrap_samples": spec.sensitivity.bootstrap_samples,
+            "top_parameters": spec.sensitivity.top_parameters,
+            "random_seed": spec.sensitivity.random_seed,
+            "sampling_plan": {
+                "sobol_base_sizes": list(spec.sensitivity.sobol_base_sizes),
+                "morris_trajectories": list(spec.sensitivity.morris_trajectories),
+            },
+        },
         "output": {"formats": list(spec.output_formats)},
         "visualization": {
             "axes": {
@@ -237,6 +279,71 @@ def spec_to_dict(spec: AnalysisSpec) -> dict[str, Any]:
             }
         },
     }
+
+
+def _load_sensitivity(value: Any) -> SensitivitySpec:
+    config = _mapping(value)
+    defaults = SensitivitySpec()
+    targets = _mapping(config.get("targets"))
+    sampling = _mapping(config.get("sampling_plan"))
+    outcome_targets = targets.get(
+        "outcomes",
+        config.get("outcome_targets", list(defaults.outcome_targets)),
+    )
+    metric_targets = targets.get(
+        "metrics",
+        config.get("metric_targets", list(defaults.metric_targets)),
+    )
+    sobol_base_sizes = sampling.get(
+        "sobol_base_sizes",
+        config.get("sobol_base_sizes", defaults.sobol_base_sizes),
+    )
+    morris_trajectories = sampling.get(
+        "morris_trajectories",
+        config.get("morris_trajectories", defaults.morris_trajectories),
+    )
+    spec = SensitivitySpec(
+        enabled=bool(config.get("enabled", defaults.enabled)),
+        outcome_targets=_string_tuple(outcome_targets),
+        metric_targets=_string_tuple(metric_targets),
+        bins=int(config.get("bins", defaults.bins)),
+        minimum_bin_count=int(
+            config.get("minimum_bin_count", defaults.minimum_bin_count)
+        ),
+        minimum_samples=int(config.get("minimum_samples", defaults.minimum_samples)),
+        minimum_minority=int(config.get("minimum_minority", defaults.minimum_minority)),
+        cv_folds=int(config.get("cv_folds", defaults.cv_folds)),
+        permutation_repeats=int(
+            config.get("permutation_repeats", defaults.permutation_repeats)
+        ),
+        bootstrap_samples=int(
+            config.get("bootstrap_samples", defaults.bootstrap_samples)
+        ),
+        top_parameters=int(config.get("top_parameters", defaults.top_parameters)),
+        random_seed=int(config.get("random_seed", defaults.random_seed)),
+        sobol_base_sizes=tuple(
+            int(item) for item in sobol_base_sizes
+        ),
+        morris_trajectories=tuple(
+            int(item) for item in morris_trajectories
+        ),
+    )
+    if set(spec.outcome_targets) - {"failure", "invalidity"}:
+        raise EvidenceError("sensitivity outcome targets support failure and invalidity")
+    positive = (
+        spec.bins,
+        spec.minimum_bin_count,
+        spec.minimum_samples,
+        spec.minimum_minority,
+        spec.cv_folds,
+        spec.permutation_repeats,
+        spec.top_parameters,
+    )
+    if any(value <= 0 for value in positive) or spec.bootstrap_samples < 0:
+        raise EvidenceError("sensitivity counts must be positive")
+    if any(value <= 0 for value in (*spec.sobol_base_sizes, *spec.morris_trajectories)):
+        raise EvidenceError("sensitivity sampling plan sizes must be positive")
+    return spec
 
 
 def _load_comparison_detail(value: Any) -> ComparisonDetailSpec:
@@ -360,6 +467,6 @@ def _string_set(value: Any, default: set[str]) -> frozenset[str]:
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, list):
+    if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)

@@ -23,6 +23,7 @@ class MetricBinding:
     label: str | None = None
     unit: str | None = None
     missing: str = "unavailable"
+    risk_direction: str = "neutral"
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,24 @@ class ComparisonDetailSpec:
 
 
 @dataclass(frozen=True)
+class SensitivitySpec:
+    enabled: bool = True
+    outcome_targets: tuple[str, ...] = ("failure", "invalidity")
+    metric_targets: tuple[str, ...] = ()
+    bins: int = 10
+    minimum_bin_count: int = 10
+    minimum_samples: int = 30
+    minimum_minority: int = 10
+    cv_folds: int = 5
+    permutation_repeats: int = 5
+    bootstrap_samples: int = 500
+    top_parameters: int = 8
+    random_seed: int = 0
+    sobol_base_sizes: tuple[int, ...] = (128, 256, 512)
+    morris_trajectories: tuple[int, ...] = (10, 20, 40)
+
+
+@dataclass(frozen=True)
 class AnalysisSpec:
     version: int = 1
     validation_mode: str = "permissive"
@@ -96,6 +115,7 @@ class AnalysisSpec:
     output_formats: tuple[str, ...] = ("svg", "png")
     visualization_axes: dict[str, AxisRule] = field(default_factory=dict)
     comparison_detail: ComparisonDetailSpec = field(default_factory=ComparisonDetailSpec)
+    sensitivity: SensitivitySpec = field(default_factory=SensitivitySpec)
 
 
 @dataclass(frozen=True)

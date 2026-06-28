@@ -39,6 +39,7 @@ from .plots import (
     render_representative_cases,
     representative_case_series,
 )
+from .sensitivity import analyze_sensitivity, render_sensitivity_figures
 from .spec import load_analysis_spec, spec_to_dict
 from .statistics import (
     apply_derived_parameters,
@@ -180,6 +181,24 @@ def build_evidence(
         ("paired_summary", paired.paired_summary),
     ):
         _write_rows(comparison_dir / f"{name}.csv", rows)
+    reporter.step("analyzing parameter sensitivity")
+    sensitivity_result = analyze_sensitivity(
+        runs,
+        spec,
+        matched_rows=paired.matched_runs,
+        delta_rows=paired.metric_deltas,
+        progress=reporter.step,
+    )
+    for name, rows in (
+        ("parameter_sensitivity", sensitivity_result.effects),
+        ("parameter_importance", sensitivity_result.importance),
+        ("parameter_response_profiles", sensitivity_result.profiles),
+        ("parameter_interactions", sensitivity_result.interactions),
+        ("sensitivity_model_quality", sensitivity_result.model_quality),
+        ("parameter_correlations", sensitivity_result.correlations),
+        ("sensitivity_sampling_plan", sensitivity_result.sampling_plan),
+    ):
+        _write_rows(summary_dir / f"{name}.csv", rows)
     reporter.step("writing concrete scenario comparison data")
     concrete_groups, concrete_warnings = build_concrete_comparison_groups(runs, spec)
     warnings.extend(concrete_warnings)
@@ -226,6 +245,10 @@ def build_evidence(
     figure_paths.extend(case_paths)
     reporter.step("rendering component comparisons")
     figure_paths.extend(render_component_figures(runs, spec, comparison_dir))
+    reporter.step("rendering sensitivity figures")
+    figure_paths.extend(
+        render_sensitivity_figures(sensitivity_result, figures_dir / "sensitivity")
+    )
 
     reporter.step("writing provenance")
     resolved_spec = spec_to_dict(spec)
@@ -313,6 +336,7 @@ def build_evidence(
         data_quality_rows=data_quality_rows,
         figure_paths=figure_paths,
         warnings=warnings,
+        sensitivity_payload=sensitivity_result.payload(),
     )
     _write_report_payload(report_dir, report_payload)
 
@@ -938,6 +962,7 @@ def _build_report_payload(
     data_quality_rows: list[dict[str, Any]],
     figure_paths: list[Path],
     warnings: list[str],
+    sensitivity_payload: dict[str, Any],
 ) -> dict[str, Any]:
     x_param, y_param = parameter_pairs[0] if parameter_pairs else (None, None)
     numeric_parameters = [
@@ -955,7 +980,7 @@ def _build_report_payload(
     experiment_ids = list(input_manifest.get("experiments") or _experiment_groups(runs))
     report_mode = "compare" if len(experiment_ids) > 1 else "single"
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "report_mode": report_mode,
         "experiments": _experiment_descriptors(input_manifest, runs),
         "experiment_summaries": {
@@ -1021,12 +1046,14 @@ def _build_report_payload(
             "resolved_spec": resolved_spec,
         },
         "boundary": _boundary_payload(runs, spec, parameter_pairs),
+        "sensitivity": sensitivity_payload,
     }
     payload["insights"] = (
         _comparison_insight_payload(payload)
         if report_mode == "compare"
         else _insight_payload(payload, runs, spec)
     )
+    payload["insights"].extend(_sensitivity_insights(sensitivity_payload))
     return _json_safe(payload)
 
 
@@ -1147,6 +1174,8 @@ def _figure_payloads(
 
 
 def _figure_category(path: Path, stem: str) -> str:
+    if "sensitivity" in path.parts:
+        return "Parameter Sensitivity"
     if path.parts and path.parts[0] == "representative_cases":
         return "Representative Case"
     if path.parts and path.parts[0] == "comparison":
@@ -1665,6 +1694,47 @@ def _comparison_insight_payload(payload: dict[str, Any]) -> list[dict[str, Any]]
     return insights
 
 
+def _sensitivity_insights(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    quality = {
+        (row.get("experiment_id"), row.get("target")): row
+        for row in payload.get("model_quality", [])
+    }
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in payload.get("importance", []):
+        if row.get("importance_type", "parameter") != "parameter":
+            continue
+        grouped[(str(row.get("experiment_id")), str(row.get("target")))].append(row)
+    insights = []
+    for key, rows in grouped.items():
+        model = quality.get(key, {})
+        if model.get("reliability") not in {"high", "medium"}:
+            continue
+        top = max(rows, key=lambda row: float(row.get("importance_mean") or 0.0))
+        if float(top.get("importance_mean") or 0.0) <= 0:
+            continue
+        insights.append(
+            _insight(
+                f"sensitivity-{_slug(key[0])}-{_slug(key[1])}",
+                "medium",
+                f"{top['parameter']} is the strongest modeled driver of {key[1]}",
+                f"Held-out permutation importance ranks {top['parameter']} first for "
+                f"{key[0]} with {model.get('reliability')} model reliability.",
+                {
+                    "experiment_id": key[0],
+                    "target": key[1],
+                    "parameter": top["parameter"],
+                    "importance": top.get("importance_mean"),
+                    "importance_ci": [
+                        top.get("importance_ci_low"),
+                        top.get("importance_ci_high"),
+                    ],
+                    "model_quality": model,
+                },
+            )
+        )
+    return insights
+
+
 def _insight(
     insight_id: str,
     severity: str,
@@ -1819,6 +1889,8 @@ def _write_html_report(
     .figure-viewer { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     .figure-viewer.single { grid-template-columns:minmax(0,1fr); }
     .figure-empty { min-height:260px; display:grid; place-items:center; border:1px dashed #94a3b8; color:var(--muted); }
+    .sensitivity-layout { display:grid; grid-template-columns:minmax(0,1fr) 380px; gap:14px; align-items:start; }
+    #sensitivity-canvas { min-height:430px; height:430px; background:white; }
     .compare-only[hidden] { display:none; }
     .legend { display:flex; flex-wrap:wrap; gap:8px 14px; padding:10px 0; font-size:12px; }
     .legend-group { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
@@ -1827,7 +1899,7 @@ def _write_html_report(
     .experiment-actions { display:inline-flex; gap:6px; }
     .experiment-actions button { min-height:28px; padding:3px 8px; font-size:12px; }
     .table-link { color:#0f5f99; font-weight:700; }
-    @media (max-width: 1000px) { .shell { grid-template-columns:1fr; } nav { position:relative; height:auto; } .layout,.figure-browser,.figure-viewer { grid-template-columns:1fr; } .figure-controls { position:relative; top:auto; } }
+    @media (max-width: 1000px) { .shell { grid-template-columns:1fr; } nav { position:relative; height:auto; } .layout,.figure-browser,.figure-viewer,.sensitivity-layout { grid-template-columns:1fr; } .figure-controls { position:relative; top:auto; } }
   </style>
 </head>
 <body>
@@ -1839,6 +1911,7 @@ def _write_html_report(
 <nav>
   <a href="#overview">Overview</a>
   <a href="#explorer">Parameter Space</a>
+  <a href="#sensitivity">Parameter Sensitivity</a>
   <a href="#boundary">Boundary Explorer</a>
   <a href="#insights">Insights</a>
   <a href="#cases">Representative Cases</a>
@@ -1884,12 +1957,33 @@ def _write_html_report(
         <button id="download-filtered" type="button">Download Filtered CSV</button>
         <h3>Run Detail</h3>
         <label>Run<select id="run-select"></select></label>
-        <a id="compare-run" class="button-link" href="comparison.html" hidden>Compare configs</a>
+        <a id="compare-run" class="button-link" href="comparison.html" hidden>Analyze concrete run</a>
         <input id="search" placeholder="Filter by run id, parameter, component, outcome, or reason">
         <div id="group-inspector" hidden></div>
         <pre id="detail">Click a point or choose a run.</pre>
       </aside>
     </div>
+  </section>
+  <section id="sensitivity">
+    <h2>Parameter Sensitivity</h2>
+    <p class="muted">Observed associations and held-out surrogate-model sensitivity; these are not causal effects or formal Sobol indices.</p>
+    <div class="inline">
+      <label>Experiment<select id="sensitivity-experiment"></select></label>
+      <label>Target<select id="sensitivity-target"></select></label>
+      <label>View<select id="sensitivity-view"><option value="importance">Global importance</option><option value="response">Response profile</option><option value="interaction">Interactions</option></select></label>
+      <label>Parameter<select id="sensitivity-parameter"></select></label>
+    </div>
+    <div id="sensitivity-cards" class="cards"></div>
+    <div class="sensitivity-layout">
+      <canvas id="sensitivity-canvas"></canvas>
+      <aside class="panel"><h3>Empirical effects</h3><div id="sensitivity-effect-table"></div><h3>Model quality</h3><div id="sensitivity-quality-table"></div></aside>
+    </div>
+    <h3>Interactions</h3><div id="sensitivity-interaction-table"></div>
+    <h3>Correlated parameter groups</h3><div id="sensitivity-cluster-table"></div>
+    <h3>Cross-experiment ranking</h3><div id="sensitivity-compare-table"></div>
+    <h3>Parameter correlations</h3><div id="sensitivity-correlation-table"></div>
+    <h3>Formal design budget</h3><div id="sensitivity-sampling-table"></div>
+    <div id="sensitivity-warnings" class="notice"></div>
   </section>
   <section id="boundary">
     <h2>Boundary Explorer</h2>
@@ -1912,8 +2006,8 @@ def _write_html_report(
     <div id="case-table"></div>
   </section>
   <section id="comparison">
-    <h2>Comparison</h2>
-    <p><a class="button-link" href="comparison.html">Open concrete scenario comparison</a></p>
+    <h2>Concrete Scenario Analysis</h2>
+    <p><a class="button-link" href="comparison.html">Open concrete scenario viewer</a></p>
     <h3>Component comparison</h3><div id="component-table"></div>
     <h3>Outcome transition</h3><div id="transition-table"></div>
     <h3>Paired statistics</h3><div id="paired-table"></div>
@@ -1968,6 +2062,7 @@ def _write_html_report(
   const runs = payload.runs || [];
   const experiments = payload.experiments || [];
   const parameterGroups = payload.comparison?.parameter_groups || [];
+  const concreteScenarios = payload.comparison?.concrete_scenarios || [];
   const numericParams = payload.parameters.filter(item => item.numeric).map(item => item.parameter);
   const metricNames = payload.metrics.map(item => item.metric);
   const state = { projected: [], selectedIds: new Set(), draftRuns: null, comparePoints: [] };
@@ -1981,6 +2076,8 @@ def _write_html_report(
   };
   const ctx = els.canvas.getContext('2d');
   const figureEls = {category:document.getElementById('figure-category'),type:document.getElementById('figure-type'),pair:document.getElementById('figure-pair'),metric:document.getElementById('figure-metric'),search:document.getElementById('figure-search'),left:document.getElementById('figure-left'),right:document.getElementById('figure-right'),viewer:document.getElementById('figure-list')};
+  const sensitivityEls = {experiment:document.getElementById('sensitivity-experiment'),target:document.getElementById('sensitivity-target'),view:document.getElementById('sensitivity-view'),parameter:document.getElementById('sensitivity-parameter'),canvas:document.getElementById('sensitivity-canvas')};
+  const sensitivityCtx=sensitivityEls.canvas.getContext('2d');
   const caseEls = {
     caseSelect: document.getElementById('case-select'), seriesSelect: document.getElementById('case-series-select'),
     semantic: document.getElementById('case-semantic'), detail: document.getElementById('case-detail'),
@@ -2295,12 +2392,14 @@ def _write_html_report(
     const compare = document.getElementById('compare-run');
     compare.hidden = !run?.comparison_group_id;
     compare.href = run?.comparison_group_id ? `comparison.html?group=${encodeURIComponent(run.comparison_group_id)}` : 'comparison.html';
+    compare.textContent = concreteActionLabel(run?.comparison_group_id);
   }
   function showComparisonPoint(point) {
     const group=parameterGroups.find(item=>item.group_id===point?.comparison_group_id);if(group){showParameterGroup(group);return;}
     document.getElementById('group-inspector').hidden=true;els.detail.hidden=false;
     els.detail.textContent = JSON.stringify(point || {}, null, 2);
     const compare=document.getElementById('compare-run');compare.hidden=!point?.comparison_group_id;compare.href=point?.comparison_group_id?`comparison.html?group=${encodeURIComponent(point.comparison_group_id)}`:'comparison.html';
+    compare.textContent=concreteActionLabel(point?.comparison_group_id);
   }
   function showParameterGroup(group) {
     const inspector=document.getElementById('group-inspector');inspector.hidden=false;els.detail.hidden=true;
@@ -2308,8 +2407,9 @@ def _write_html_report(
     const metricSet=new Set(group.experiments.flatMap(item=>Object.keys(item.metrics||{})));
     const experimentRows=group.experiments.map(item=>({experiment:item.experiment_id,role:item.experiment_id===els.reference.value?'Reference':item.experiment_id===els.left.value?'Left':item.experiment_id===els.right.value?'Right':'',run_id:item.run_id,outcome:item.outcome,status:item.status,safety:item.safety_region,termination:item.termination_reason,...Object.fromEntries([...metricSet].map(metric=>[metric,item.metrics?.[metric]]))}));
     inspector.innerHTML=`<h3>Parameters</h3>${table(parameterRows)}<h3>Experiments</h3>${table(experimentRows)}${group.missing_experiments?.length?`<p class="warning">Missing: ${escapeHtml(group.missing_experiments.join(', '))}</p>`:''}`;
-    const compare=document.getElementById('compare-run');compare.hidden=!group.group_id;compare.href=group.comparison_url||`comparison.html?group=${encodeURIComponent(group.group_id)}`;
+    const compare=document.getElementById('compare-run');compare.hidden=!group.group_id;compare.href=group.comparison_url||`comparison.html?group=${encodeURIComponent(group.group_id)}`;compare.textContent=concreteActionLabel(group.group_id);
   }
+  function concreteActionLabel(groupId) {const item=concreteScenarios.find(group=>group.group_id===groupId);return (item?.configs?.length||0)>1?'Compare configs':'Analyze concrete run';}
   function drawSelectionSummary(rows) {
     if (rows.length&&rows[0].group_id) {
       const disagreements=rows.filter(group=>outcomeConsensus(group)==='disagreement'||outcomeConsensus(group)==='mixed_with_invalid').length;
@@ -2430,6 +2530,35 @@ def _write_html_report(
     return (items||[]).map(item => {const actions=(item.actions||[]).map(action=>action.type==='open_comparison'?`<a class="button-link" href="comparison.html?group=${encodeURIComponent(action.group_id)}">${escapeHtml(action.label)}</a>`:'').join('');return `<article class="insight ${item.severity}"><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.description)}</p><pre>${escapeHtml(JSON.stringify(item.evidence,null,2))}</pre>${actions}</article>`;}).join('') || '<p class="muted">No automatic insights.</p>';
   }
   function addFilterOptions(select,values,label='All') { select.textContent='';select.appendChild(new Option(label,''));[...new Set(values.filter(Boolean))].sort().forEach(value=>select.appendChild(new Option(value,value))); }
+  function populateSensitivity() {
+    const data=payload.sensitivity||{},ids=[...(data.model_quality||[]),...(data.effects||[])].map(row=>row.experiment_id);addOptions(sensitivityEls.experiment,unique(ids));updateSensitivityTargets();document.getElementById('sensitivity-sampling-table').innerHTML=table(data.sampling_plan||[]);document.getElementById('sensitivity-warnings').textContent=(data.warnings||[]).join('\\n')||'No sensitivity warnings.';
+  }
+  function updateSensitivityTargets() {const data=payload.sensitivity||{},targets=[...(data.model_quality||[]),...(data.effects||[])].filter(row=>row.experiment_id===sensitivityEls.experiment.value).map(row=>row.target);const previous=sensitivityEls.target.value;addOptions(sensitivityEls.target,unique(targets));if([...sensitivityEls.target.options].some(option=>option.value===previous))sensitivityEls.target.value=previous;updateSensitivityParameters();}
+  function updateSensitivityParameters() {const data=payload.sensitivity||{},parameters=(data.effects||[]).filter(row=>row.experiment_id===sensitivityEls.experiment.value&&row.target===sensitivityEls.target.value).map(row=>row.parameter);const previous=sensitivityEls.parameter.value;addOptions(sensitivityEls.parameter,unique(parameters));if([...sensitivityEls.parameter.options].some(option=>option.value===previous))sensitivityEls.parameter.value=previous;renderSensitivity();}
+  function renderSensitivity() {
+    const data=payload.sensitivity||{},experiment=sensitivityEls.experiment.value,target=sensitivityEls.target.value,parameter=sensitivityEls.parameter.value;
+    const quality=(data.model_quality||[]).find(row=>row.experiment_id===experiment&&row.target===target)||{};
+    const effects=(data.effects||[]).filter(row=>row.experiment_id===experiment&&row.target===target);
+    const allImportance=(data.importance||[]).filter(row=>row.experiment_id===experiment&&row.target===target);
+    const importance=allImportance.filter(row=>(row.importance_type||'parameter')==='parameter');
+    const clusters=allImportance.filter(row=>row.importance_type==='correlated_cluster');
+    const profiles=(data.profiles||[]).filter(row=>row.experiment_id===experiment&&row.target===target&&row.parameter===parameter);
+    const interactions=(data.interactions||[]).filter(row=>row.experiment_id===experiment&&row.target===target);
+    const correlations=(data.correlations||[]).filter(row=>row.experiment_id===experiment);
+    const top=[...importance].sort((a,b)=>(b.importance_mean||0)-(a.importance_mean||0))[0],topInteraction=[...interactions].sort((a,b)=>(b.h_statistic||0)-(a.h_statistic||0))[0];
+    const experimentIds=experiments.map(item=>item.id),rankingRows=new Map();
+    (data.importance||[]).filter(row=>row.target===target&&row.importance_type==='parameter'&&experimentIds.includes(row.experiment_id)).forEach(row=>{if(!rankingRows.has(row.parameter))rankingRows.set(row.parameter,{parameter:row.parameter});const item=rankingRows.get(row.parameter);item[`${row.experiment_id} rank`]=row.rank;item[`${row.experiment_id} importance`]=row.importance_mean;});
+    document.getElementById('sensitivity-cards').innerHTML=cards([{label:'Samples',value:quality.sample_count??0},{label:'Reliability',value:quality.reliability||'unavailable'},{label:'Top driver',value:top?.parameter||'unavailable'},{label:'Top interaction',value:topInteraction?`${topInteraction.left_parameter} × ${topInteraction.right_parameter}`:'unavailable'}]);
+    document.getElementById('sensitivity-effect-table').innerHTML=table(effects.map(row=>({parameter:row.parameter,effect:row.effect,effect_ci_low:row.effect_ci_low,effect_ci_high:row.effect_ci_high,q_value:row.q_value,characteristic:row.characteristic,n:row.sample_count})));
+    document.getElementById('sensitivity-quality-table').innerHTML=table(quality.experiment_id?[quality]:[]);
+    document.getElementById('sensitivity-interaction-table').innerHTML=table(interactions.map(row=>({left:row.left_parameter,right:row.right_parameter,H:row.h_statistic})));
+    document.getElementById('sensitivity-cluster-table').innerHTML=table(clusters.map(row=>({parameters:row.parameter,group_importance:row.importance_mean,ci_low:row.importance_ci_low,ci_high:row.importance_ci_high,reliability:row.reliability})));
+    document.getElementById('sensitivity-compare-table').innerHTML=experimentIds.length>1?table([...rankingRows.values()]):'<p class="muted">Available in compare reports.</p>';
+    document.getElementById('sensitivity-correlation-table').innerHTML=table(correlations);
+    drawSensitivity(importance,profiles,interactions);
+  }
+  function drawSensitivity(importance,profiles,interactions) {const canvas=sensitivityEls.canvas,rect=canvas.getBoundingClientRect();canvas.width=Math.max(720,Math.floor(rect.width))*devicePixelRatio;canvas.height=430*devicePixelRatio;const ctx=sensitivityCtx,w=canvas.width,h=canvas.height,m=58*devicePixelRatio;ctx.fillStyle='white';ctx.fillRect(0,0,w,h);ctx.font=`${12*devicePixelRatio}px system-ui`;const view=sensitivityEls.view.value;if(view==='importance'){const rows=[...importance].sort((a,b)=>(b.importance_mean||0)-(a.importance_mean||0)).slice(0,12),max=Math.max(...rows.map(row=>Math.max(0,row.importance_ci_high||row.importance_mean||0)),1e-9),barH=(h-2*m)/Math.max(1,rows.length);rows.forEach((row,index)=>{const value=Math.max(0,row.importance_mean||0),y=m+index*barH;ctx.fillStyle='#2563eb';ctx.fillRect(m,y,(w-2*m)*value/max,barH*.58);ctx.fillStyle='#17202a';ctx.textAlign='right';ctx.fillText(row.parameter,m-8*devicePixelRatio,y+barH*.45);ctx.textAlign='left';ctx.fillText(fmt(value),m+(w-2*m)*value/max+7*devicePixelRatio,y+barH*.45);});if(!rows.length)emptySensitivity('Model importance unavailable.');return;}if(view==='interaction'){const rows=[...interactions].sort((a,b)=>(b.h_statistic||0)-(a.h_statistic||0)).slice(0,10),max=Math.max(...rows.map(row=>row.h_statistic||0),1e-9),barH=(h-2*m)/Math.max(1,rows.length);rows.forEach((row,index)=>{const value=row.h_statistic||0,y=m+index*barH;ctx.fillStyle='#7c3aed';ctx.fillRect(m,y,(w-2*m)*value/max,barH*.58);ctx.fillStyle='#17202a';ctx.textAlign='right';ctx.fillText(`${row.left_parameter} × ${row.right_parameter}`,m-8*devicePixelRatio,y+barH*.45);});if(!rows.length)emptySensitivity('Interaction analysis unavailable.');return;}const empirical=profiles.filter(row=>row.method==='empirical'),numeric=empirical.every(row=>number(row.x)!==null);if(!empirical.length){emptySensitivity('Response profile unavailable.');return;}if(!numeric){const max=Math.max(...empirical.map(row=>Math.abs(row.estimate||0)),1e-9),barW=(w-2*m)/empirical.length;empirical.forEach((row,index)=>{const height=(h-2*m)*Math.abs(row.estimate||0)/max;ctx.fillStyle='#0891b2';ctx.fillRect(m+index*barW,h-m-height,barW*.7,height);ctx.fillStyle='#17202a';ctx.textAlign='center';ctx.fillText(text(row.x),m+index*barW+barW*.35,h-m+18*devicePixelRatio);});return;}const xs=empirical.map(row=>Number(row.x)),ys=empirical.map(row=>Number(row.estimate)),xRange=range(xs),yRange=range(ys),sx=x=>m+(x-xRange[0])/(xRange[1]-xRange[0])*(w-2*m),sy=y=>h-m-(y-yRange[0])/(yRange[1]-yRange[0])*(h-2*m);ctx.strokeStyle='#0891b2';ctx.lineWidth=2*devicePixelRatio;ctx.beginPath();empirical.forEach((row,index)=>index?ctx.lineTo(sx(Number(row.x)),sy(Number(row.estimate))):ctx.moveTo(sx(Number(row.x)),sy(Number(row.estimate))));ctx.stroke();empirical.forEach(row=>{ctx.fillStyle='#0891b2';ctx.beginPath();ctx.arc(sx(Number(row.x)),sy(Number(row.estimate)),4*devicePixelRatio,0,Math.PI*2);ctx.fill();});}
+  function emptySensitivity(message){sensitivityCtx.fillStyle='#64748b';sensitivityCtx.textAlign='left';sensitivityCtx.fillText(message,30*devicePixelRatio,45*devicePixelRatio);}
   function populateFigureBrowser() {
     const svgs=payload.figures.filter(item=>item.format==='svg');
     addFilterOptions(figureEls.category,svgs.map(item=>item.category));addFilterOptions(figureEls.pair,svgs.map(item=>item.parameter_pair));addFilterOptions(figureEls.metric,svgs.map(item=>item.metric));
@@ -2476,6 +2605,7 @@ def _write_html_report(
     const boundaryRows=payload.report_mode==='compare'?Object.entries(payload.boundary.by_experiment||{}).flatMap(([experiment,pairs])=>Object.entries(pairs).map(([key,value])=>({experiment_id:experiment,pair:key,available:value.available,recommendations:(value.recommended_resampling_cells||[]).length,nearest_pairs:(value.nearest_boundary_pairs||[]).length,reason:value.reason||''}))):Object.entries(payload.boundary.pairs||{}).map(([key,value])=>({pair:key,available:value.available,recommendations:(value.recommended_resampling_cells||[]).length,nearest_pairs:(value.nearest_boundary_pairs||[]).length,reason:value.reason||''}));
     document.getElementById('boundary-table').innerHTML=table(boundaryRows);
     document.getElementById('insight-list').innerHTML = renderInsights(payload.insights);
+    populateSensitivity();
     populateFigureBrowser();
   }
   function updateFigureVisibility() {
@@ -2562,6 +2692,7 @@ def _write_html_report(
   [figureEls.category,figureEls.pair,figureEls.metric].forEach(control=>control.addEventListener('change',refreshFigureTypes));
   figureEls.search.addEventListener('input',refreshFigureTypes);figureEls.type.addEventListener('change',renderFigure);
   [figureEls.left,figureEls.right].forEach(control=>control.addEventListener('change',()=>{if(figureEls.left.value===figureEls.right.value&&experiments.length>1){const other=experiments.find(item=>item.id!==control.value);(control===figureEls.left?figureEls.right:figureEls.left).value=other.id;}els.left.value=figureEls.left.value;els.right.value=figureEls.right.value;renderFigure();draw();}));
+  sensitivityEls.experiment.addEventListener('change',updateSensitivityTargets);sensitivityEls.target.addEventListener('change',updateSensitivityParameters);[sensitivityEls.view,sensitivityEls.parameter].forEach(control=>control.addEventListener('change',renderSensitivity));
   els.runSelect.addEventListener('change', () => showRun(activeRuns().find(run => run.run_id === els.runSelect.value)));
   els.search.addEventListener('input', () => { const q = els.search.value.toLowerCase(); if (!q) return; els.detail.textContent = JSON.stringify(activeRuns().filter(run => JSON.stringify(run).toLowerCase().includes(q)).slice(0, 100), null, 2); });
   els.canvas.addEventListener('click', event => selectNearest(event.clientX, event.clientY));
@@ -2579,7 +2710,7 @@ def _write_html_report(
   caseEls.detail.addEventListener('click', () => setCaseMode('detail'));
   caseEls.canvas.addEventListener('mousemove', hoverCaseSeries);
   caseEls.canvas.addEventListener('mouseleave', () => { caseState.hoverIndex = null; drawCaseSeries(); });
-  window.addEventListener('resize', () => { resize(); caseResize(); });
+  window.addEventListener('resize', () => { resize(); caseResize(); renderSensitivity(); });
   updateFigureVisibility();
 })();
 </script>
