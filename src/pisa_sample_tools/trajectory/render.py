@@ -10,7 +10,7 @@ from pisa_sample_tools.common.formatting import format_number, panel_value, wrap
 from pisa_sample_tools.common.sorting import natural_key
 from pisa_sample_tools.common.svg import escape, svg_header, svg_rect, svg_text
 
-from .models import AGENT_COLORS, AgentState, RunInfo, TrajectoryError
+from .models import AGENT_COLORS, AgentGeometry, AgentState, RunInfo, TrajectoryError
 
 
 def filter_states_by_range(
@@ -63,6 +63,7 @@ def states_to_svg(
     y_range: tuple[float, float] | None = None,
     equal_scale: bool = True,
     run_info: RunInfo | None = None,
+    geometries: list[AgentGeometry] | None = None,
 ) -> str:
     if width < 500 or height < 360:
         raise TrajectoryError("SVG width/height are too small")
@@ -77,8 +78,16 @@ def states_to_svg(
     min_speed = min(speeds)
     max_speed = max(speeds)
 
-    xs = [state.x for state in states]
-    ys = [state.y for state in states]
+    geometry_by_agent = _geometry_by_agent(geometries or [])
+    footprint_points = [
+        point
+        for state in states
+        for point in footprint_world(
+            state, _geometry_at(geometry_by_agent.get(state.agent_id, []), state)
+        )
+    ]
+    xs = [state.x for state in states] + [point[0] for point in footprint_points]
+    ys = [state.y for state in states] + [point[1] for point in footprint_points]
     min_x, max_x = x_range if x_range is not None else expanded_range(min(xs), max(xs))
     min_y, max_y = y_range if y_range is not None else expanded_range(min(ys), max(ys))
 
@@ -140,6 +149,18 @@ def states_to_svg(
             )
         start = agent_states[0]
         end = agent_states[-1]
+        geometry_start = _geometry_at(geometry_by_agent.get(agent_id, []), start)
+        geometry_end = _geometry_at(geometry_by_agent.get(agent_id, []), end)
+        for state, geometry, label in (
+            (start, geometry_start, "start"),
+            (end, geometry_end, "end"),
+        ):
+            polygon = footprint_world(state, geometry)
+            if polygon:
+                points = " ".join(f"{sx(px):.2f},{sy(py):.2f}" for px, py in polygon)
+                parts.append(
+                    f'<polygon points="{points}" fill="{color}" fill-opacity="0.14" stroke="{color}" stroke-width="1.6"><title>{escape(f"{_agent_label(state, geometry)} {label} bounding box")}</title></polygon>'
+                )
         parts.append(
             f'<circle cx="{sx(start.x):.2f}" cy="{sy(start.y):.2f}" r="3.4" '
             f'fill="#ffffff" stroke="{color}" stroke-width="2"><title>{escape(f"agent {agent_id} start")}</title></circle>'
@@ -157,6 +178,8 @@ def states_to_svg(
             min_speed=min_speed,
             max_speed=max_speed,
             run_info=run_info,
+            states_by_agent=by_agent,
+            geometry_by_agent=geometry_by_agent,
         )
     )
     parts.append("</svg>")
@@ -192,12 +215,28 @@ def axes(
         y = margin_top + plot_height - fraction * plot_height
         x_value = min_x + fraction * (max_x - min_x)
         y_value = min_y + fraction * (max_y - min_y)
-        parts.append(f'<line x1="{x:.2f}" y1="{margin_top}" x2="{x:.2f}" y2="{y0}" stroke="#e5e7eb"/>')
-        parts.append(f'<line x1="{x0}" y1="{y:.2f}" x2="{x0 + plot_width}" y2="{y:.2f}" stroke="#e5e7eb"/>')
+        parts.append(
+            f'<line x1="{x:.2f}" y1="{margin_top}" x2="{x:.2f}" y2="{y0}" stroke="#e5e7eb"/>'
+        )
+        parts.append(
+            f'<line x1="{x0}" y1="{y:.2f}" x2="{x0 + plot_width}" y2="{y:.2f}" stroke="#e5e7eb"/>'
+        )
         parts.append(svg_text(x, y0 + 24, format_number(x_value), size=11, anchor="middle"))
         parts.append(svg_text(x0 - 14, y + 4, format_number(y_value), size=11, anchor="end"))
-    parts.append(svg_text(margin_left + plot_width / 2, y0 + 50, "x", size=13, weight="700", anchor="middle"))
-    parts.append(svg_text(18, margin_top + plot_height / 2, "y", size=13, weight="700", anchor="middle", rotate=-90))
+    parts.append(
+        svg_text(margin_left + plot_width / 2, y0 + 50, "x", size=13, weight="700", anchor="middle")
+    )
+    parts.append(
+        svg_text(
+            18,
+            margin_top + plot_height / 2,
+            "y",
+            size=13,
+            weight="700",
+            anchor="middle",
+            rotate=-90,
+        )
+    )
     return parts
 
 
@@ -247,6 +286,8 @@ def _side_panel(
     min_speed: float,
     max_speed: float,
     run_info: RunInfo | None,
+    states_by_agent: dict[str, list[AgentState]],
+    geometry_by_agent: dict[str, list[AgentGeometry]],
 ) -> list[str]:
     parts = [
         f'<g transform="translate({x:.2f},{y:.2f})">',
@@ -255,15 +296,21 @@ def _side_panel(
     cursor_y = 24
     for index, agent_id in enumerate(agent_ids):
         color = AGENT_COLORS[index % len(AGENT_COLORS)]
-        parts.append(f'<line x1="0" y1="{cursor_y}" x2="32" y2="{cursor_y}" stroke="{color}" stroke-width="4" stroke-linecap="round"/>')
-        parts.append(svg_text(42, cursor_y + 4, f"agent {agent_id}", size=12))
+        parts.append(
+            f'<line x1="0" y1="{cursor_y}" x2="32" y2="{cursor_y}" stroke="{color}" stroke-width="4" stroke-linecap="round"/>'
+        )
+        state = states_by_agent[agent_id][0]
+        geometry = _geometry_at(geometry_by_agent.get(agent_id, []), state)
+        parts.append(svg_text(42, cursor_y + 4, _agent_label(state, geometry), size=12))
         cursor_y += 22
     cursor_y += 12
     parts.append(svg_text(0, cursor_y, "Speed opacity", size=15, weight="700"))
     cursor_y += 20
     for offset, opacity in enumerate((0.18, 0.48, 1.0)):
         y0 = cursor_y + offset * 18
-        parts.append(f'<line x1="0" y1="{y0}" x2="32" y2="{y0}" stroke="#111827" stroke-width="4" stroke-opacity="{opacity:.2f}" stroke-linecap="round"/>')
+        parts.append(
+            f'<line x1="0" y1="{y0}" x2="32" y2="{y0}" stroke="#111827" stroke-width="4" stroke-opacity="{opacity:.2f}" stroke-linecap="round"/>'
+        )
     parts.append(svg_text(42, cursor_y + 4, f"slow {format_number(min_speed)}", size=12))
     parts.append(svg_text(42, cursor_y + 22, "medium", size=12))
     parts.append(svg_text(42, cursor_y + 40, f"fast {format_number(max_speed)}", size=12))
@@ -302,3 +349,65 @@ def _format_panel_value(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=True)
     return panel_value(value)
+
+
+def footprint_world(state: AgentState, geometry: AgentGeometry | None) -> list[tuple[float, float]]:
+    if geometry is None:
+        return []
+    local = list(geometry.footprint)
+    if (
+        not local
+        and geometry.length_m
+        and geometry.width_m
+        and geometry.length_m > 0
+        and geometry.width_m > 0
+    ):
+        half_length, half_width = geometry.length_m / 2, geometry.width_m / 2
+        local = [
+            (-half_length, -half_width),
+            (half_length, -half_width),
+            (half_length, half_width),
+            (-half_length, half_width),
+        ]
+    if not local:
+        return []
+    pose_cos, pose_sin = math.cos(state.yaw), math.sin(state.yaw)
+    center_x = state.x + pose_cos * geometry.center_offset_x - pose_sin * geometry.center_offset_y
+    center_y = state.y + pose_sin * geometry.center_offset_x + pose_cos * geometry.center_offset_y
+    angle = state.yaw + geometry.yaw_offset
+    cos_yaw, sin_yaw = math.cos(angle), math.sin(angle)
+    return [
+        (center_x + cos_yaw * x - sin_yaw * y, center_y + sin_yaw * x + cos_yaw * y)
+        for x, y in local
+    ]
+
+
+def _geometry_by_agent(geometries: list[AgentGeometry]) -> dict[str, list[AgentGeometry]]:
+    output: dict[str, list[AgentGeometry]] = defaultdict(list)
+    for geometry in geometries:
+        output[geometry.agent_id].append(geometry)
+    return output
+
+
+def _geometry_at(geometries: list[AgentGeometry], state: AgentState) -> AgentGeometry | None:
+    eligible = [
+        item
+        for item in geometries
+        if (
+            item.sim_time_ms is None
+            or state.sim_time_ms is None
+            or item.sim_time_ms <= state.sim_time_ms
+        )
+        and (
+            item.step_index is None
+            or state.step_index is None
+            or item.step_index <= state.step_index
+        )
+    ]
+    return eligible[-1] if eligible else (geometries[0] if geometries else None)
+
+
+def _agent_label(state: AgentState, geometry: AgentGeometry | None) -> str:
+    name = state.entity_name or (geometry.entity_name if geometry else None)
+    is_ego = state.is_ego if state.is_ego is not None else (geometry.is_ego if geometry else False)
+    return f"{name or 'agent'} [{state.agent_id}]" + (" (ego)" if is_ego else "")

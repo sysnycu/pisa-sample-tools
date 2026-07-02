@@ -31,6 +31,7 @@ from .ingest import (
     read_execution_manifest,
     read_trace_rows,
 )
+from .metric_status import metric_coverage
 from .models import AnalysisSpec, DatasetSpec, EvidenceError, EvidenceResult, RunRecord
 from .plots import (
     collect_representative_axis_values,
@@ -246,9 +247,7 @@ def build_evidence(
     reporter.step("rendering component comparisons")
     figure_paths.extend(render_component_figures(runs, spec, comparison_dir))
     reporter.step("rendering sensitivity figures")
-    figure_paths.extend(
-        render_sensitivity_figures(sensitivity_result, figures_dir / "sensitivity")
-    )
+    figure_paths.extend(render_sensitivity_figures(sensitivity_result, figures_dir / "sensitivity"))
 
     reporter.step("writing provenance")
     resolved_spec = spec_to_dict(spec)
@@ -436,8 +435,7 @@ def validate_evidence_inputs(
     runs = apply_derived_parameters(runs, spec)
     findings = validate_runs(runs, spec, deep=deep)
     findings.extend(
-        DataQualityFinding("warning", "ingest_warning", warning)
-        for warning in ingest_warnings
+        DataQualityFinding("warning", "ingest_warning", warning) for warning in ingest_warnings
     )
     clear_trace_cache()
     return len(runs), findings
@@ -455,9 +453,7 @@ class _ProgressReporter:
         elapsed = now - self._started
         delta = now - self._last
         self._last = now
-        self.timings.append(
-            {"stage": message, "elapsed_seconds": elapsed, "delta_seconds": delta}
-        )
+        self.timings.append({"stage": message, "elapsed_seconds": elapsed, "delta_seconds": delta})
         if self._emit is not None:
             self._emit(f"[+{elapsed:6.1f}s | {delta:5.1f}s] {message}")
 
@@ -526,6 +522,7 @@ def _derive_summary_metrics(
 ) -> tuple[list[RunRecord], list[str]]:
     updated: list[RunRecord] = []
     derivation_counts: Counter[tuple[str, str]] = Counter()
+    not_applicable_counts: Counter[str] = Counter()
     for run in runs:
         metrics = dict(run.metrics)
         frame_rows: list[dict[str, str]] | None = None
@@ -540,6 +537,13 @@ def _derive_summary_metrics(
                 if (value := as_float(row.get(binding.series))) is not None
             ]
             if not values:
+                coverage = metric_coverage(frame_rows, binding.series)
+                if (
+                    coverage["not_applicable"]
+                    and not coverage["missing"]
+                    and not coverage["invalid"]
+                ):
+                    not_applicable_counts[name] += 1
                 continue
             if name == "max_deceleration":
                 derived = max(max(-value, 0.0) for value in values)
@@ -547,9 +551,10 @@ def _derive_summary_metrics(
                 derived = min(values)
             metrics[binding.summary] = derived
             derivation_counts[(binding.summary, binding.series)] += 1
-        if "collision_time_ms" not in metrics and "collision" in (
-            run.termination_reason or ""
-        ).lower():
+        if (
+            "collision_time_ms" not in metrics
+            and "collision" in (run.termination_reason or "").lower()
+        ):
             final_time = as_float(metrics.get("run.final_sim_time_ms"))
             if final_time is not None:
                 metrics["collision_time_ms"] = final_time
@@ -566,10 +571,16 @@ def _derive_summary_metrics(
         f"derived {summary} from {series} time series for {count} run(s)"
         for (summary, series), count in sorted(derivation_counts.items())
     ]
+    warnings.extend(
+        f"metric '{name}' is not applicable for {count} run(s), as explained by frame status"
+        for name, count in sorted(not_applicable_counts.items())
+    )
     for name, binding in spec.metrics.items():
         if binding.summary is None:
             continue
-        missing = sum(binding.summary not in run.metrics for run in updated)
+        missing = (
+            sum(binding.summary not in run.metrics for run in updated) - not_applicable_counts[name]
+        )
         if missing:
             warnings.append(
                 f"metric '{name}' remains unavailable for {missing} run(s) after derivation"
@@ -582,14 +593,10 @@ def _select_parameter_pairs(
 ) -> tuple[list[tuple[str, str]], list[str]]:
     names = sorted({name for run in runs for name in run.params})
     numeric = [
-        name
-        for name in names
-        if any(as_float(run.params.get(name)) is not None for run in runs)
+        name for name in names if any(as_float(run.params.get(name)) is not None for run in runs)
     ]
     selected = list(spec.parameter_include) if spec.parameter_include else numeric
-    selected = [
-        name for name in selected if name in numeric and name not in spec.parameter_exclude
-    ]
+    selected = [name for name in selected if name in numeric and name not in spec.parameter_exclude]
     if spec.parameter_mode == "all_pairwise":
         return list(combinations(dict.fromkeys(selected), 2)), []
 
@@ -612,9 +619,7 @@ def _select_parameter_pairs(
     return ([(x_param, y_param)] if x_param and y_param else []), warnings
 
 
-def _preserve_source_manifests(
-    datasets: list[DatasetSpec], provenance_dir: Path
-) -> None:
+def _preserve_source_manifests(datasets: list[DatasetSpec], provenance_dir: Path) -> None:
     destination = provenance_dir / "source_execution_manifests"
     destination.mkdir(parents=True, exist_ok=True)
     for dataset in datasets:
@@ -667,9 +672,7 @@ def _outcome_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, A
 def _metric_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, Any]]:
     rows = []
     for name, binding in spec.metrics.items():
-        values = [
-            value for run in runs if (value := metric_value(run, spec, name)) is not None
-        ]
+        values = [value for run in runs if (value := metric_value(run, spec, name)) is not None]
         summary = numeric_summary(values)
         rows.append(
             {
@@ -719,9 +722,7 @@ def _performance_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
     return rows
 
 
-def _experiment_outcome_rows(
-    runs: list[RunRecord], spec: AnalysisSpec
-) -> list[dict[str, Any]]:
+def _experiment_outcome_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for experiment_id, members in _experiment_groups(runs).items():
         counts = grouped_outcomes(members, spec)
@@ -753,9 +754,7 @@ def _experiment_outcome_rows(
     return rows
 
 
-def _experiment_metric_rows(
-    runs: list[RunRecord], spec: AnalysisSpec
-) -> list[dict[str, Any]]:
+def _experiment_metric_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for experiment_id, members in _experiment_groups(runs).items():
         for row in _metric_rows(members, spec):
@@ -792,11 +791,20 @@ def _agent_geometry_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
                     "step_index": row.get("step_index"),
                     "sim_time_ms": row.get("sim_time_ms"),
                     "agent_id": row.get("agent_id") or row.get("actor_id"),
+                    "sim_tracking_id": row.get("sim_tracking_id"),
+                    "entity_name": row.get("entity_name") or row.get("agent_name"),
+                    "is_ego": row.get("is_ego"),
                     "shape_type": row.get("shape_type"),
                     "length_m": row.get("length_m"),
                     "width_m": row.get("width_m"),
                     "height_m": row.get("height_m"),
                     "reference_point": row.get("reference_point"),
+                    "center_offset_x": row.get("center_offset_x"),
+                    "center_offset_y": row.get("center_offset_y"),
+                    "center_offset_z": row.get("center_offset_z"),
+                    "roll_offset": row.get("roll_offset"),
+                    "pitch_offset": row.get("pitch_offset"),
+                    "yaw_offset": row.get("yaw_offset"),
                     "footprint_json": row.get("footprint_json"),
                     "source": row.get("source"),
                 }
@@ -920,9 +928,7 @@ def _write_case_payloads(
             }
         )
     aggregate = {"schema_version": 1, "cases": case_data}
-    aggregate_json = json.dumps(_json_safe(aggregate), ensure_ascii=True).replace(
-        "</", "<\\/"
-    )
+    aggregate_json = json.dumps(_json_safe(aggregate), ensure_ascii=True).replace("</", "<\\/")
     report_dir = cases_dir.parent
     (report_dir / "case_data.json").write_text(aggregate_json + "\n", encoding="utf-8")
     (report_dir / "case_data.js").write_text(
@@ -966,14 +972,11 @@ def _build_report_payload(
 ) -> dict[str, Any]:
     x_param, y_param = parameter_pairs[0] if parameter_pairs else (None, None)
     numeric_parameters = [
-        row["parameter"]
-        for row in parameter_rows
-        if row.get("type") == "numeric"
+        row["parameter"] for row in parameter_rows if row.get("type") == "numeric"
     ]
     case_rows = _selected_case_rows(cases, spec)
     artifact_by_case = {
-        row["case_type"]: case_artifacts.get(row["case_type"], "")
-        for row in case_rows
+        row["case_type"]: case_artifacts.get(row["case_type"], "") for row in case_rows
     }
     for row in case_rows:
         row["case_json"] = artifact_by_case.get(row["case_type"], "")
@@ -1000,8 +1003,7 @@ def _build_report_payload(
             "performance": performance_rows,
         },
         "runs": [
-            _run_payload(run, spec, comparison_group_ids=comparison_group_ids)
-            for run in runs
+            _run_payload(run, spec, comparison_group_ids=comparison_group_ids) for run in runs
         ],
         "parameters": _parameter_payload(parameter_rows, spec, numeric_parameters),
         "metrics": metric_rows,
@@ -1094,9 +1096,13 @@ def _run_payload(
             "frame_metrics": str(run.frame_metrics_path) if run.frame_metrics_path else None,
             "agent_states": str(run.agent_states_path) if run.agent_states_path else None,
             "agent_geometry": str(run.agent_geometry_path) if run.agent_geometry_path else None,
-            "collision_events": str(run.collision_events_path) if run.collision_events_path else None,
+            "collision_events": str(run.collision_events_path)
+            if run.collision_events_path
+            else None,
             "scenario_events": str(run.scenario_events_path) if run.scenario_events_path else None,
-            "control_commands": str(run.control_commands_path) if run.control_commands_path else None,
+            "control_commands": str(run.control_commands_path)
+            if run.control_commands_path
+            else None,
         },
     }
 
@@ -1124,9 +1130,7 @@ def _figure_payloads(
     formats_by_artifact: dict[tuple[str, str], set[str]] = defaultdict(set)
     for path in paths:
         rel = path.relative_to(output_dir)
-        formats_by_artifact[(str(rel.parent), path.stem)].add(
-            path.suffix.removeprefix(".")
-        )
+        formats_by_artifact[(str(rel.parent), path.stem)].add(path.suffix.removeprefix("."))
     figures = []
     for path in paths:
         rel = path.relative_to(output_dir)
@@ -1142,9 +1146,7 @@ def _figure_payloads(
             comparison_id = parts[1] if len(parts) > 2 else "components"
         pair = _figure_pair(path)
         category = _figure_category(rel, path.stem)
-        metric = next(
-            (name for name in spec.metrics if path.stem.startswith(name)), None
-        )
+        metric = next((name for name in spec.metrics if path.stem.startswith(name)), None)
         tags = [category, path.stem]
         if pair != "global":
             tags.append(pair)
@@ -1165,9 +1167,7 @@ def _figure_payloads(
                 "tags": sorted(set(tags)),
                 "parameter_pair": None if pair == "global" else pair,
                 "metric": metric,
-                "available_formats": sorted(
-                    formats_by_artifact[(str(rel.parent), path.stem)]
-                ),
+                "available_formats": sorted(formats_by_artifact[(str(rel.parent), path.stem)]),
             }
         )
     return figures
@@ -1271,8 +1271,7 @@ def _comparison_parameter_points(
                 "comparison": row["comparison"],
                 "matched": False,
                 "side": row.get("side"),
-                "experiment_id": row.get("experiment_id")
-                or (run.experiment_id if run else None),
+                "experiment_id": row.get("experiment_id") or (run.experiment_id if run else None),
                 "run_id": run_id,
                 "outcome": row.get("outcome"),
                 "parameters": _json_mapping(row.get("parameters")),
@@ -1321,9 +1320,7 @@ def _comparison_parameter_groups(
                         "safety_region": safety_region(run, spec),
                         "status": run.status,
                         "termination_reason": run.termination_reason,
-                        "metrics": {
-                            name: metric_value(run, spec, name) for name in spec.metrics
-                        },
+                        "metrics": {name: metric_value(run, spec, name) for name in spec.metrics},
                         "metadata": run.metadata,
                     }
                     for run in members
@@ -1338,7 +1335,7 @@ def _json_mapping(value: Any) -> dict[str, Any]:
         return value
     try:
         parsed = json.loads(str(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except TypeError, ValueError, json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
@@ -1438,7 +1435,10 @@ def _boundary_for_pair(
             weights = [1.0 / (distance + 1e-6) for distance in distance_values]
             total_weight = sum(weights)
             probability = (
-                sum(labels[index] * weight for index, weight in zip(index_values, weights, strict=True))
+                sum(
+                    labels[index] * weight
+                    for index, weight in zip(index_values, weights, strict=True)
+                )
                 / total_weight
             )
             mean_distance = sum(distance_values) / len(distance_values)
@@ -1511,7 +1511,13 @@ def _nearest_boundary_pairs(
                 "failure_params": failure[0].params,
             }
         )
-    pairs.sort(key=lambda item: (float(item["distance"]), item["nonfailure_run_id"], item["failure_run_id"]))
+    pairs.sort(
+        key=lambda item: (
+            float(item["distance"]),
+            item["nonfailure_run_id"],
+            item["failure_run_id"],
+        )
+    )
     return pairs[:20]
 
 
@@ -1585,12 +1591,16 @@ def _insight_payload(
                     f"Nearest safe/failure boundary pair in {boundary['x_param']} vs {boundary['y_param']}",
                     f"{pair['nonfailure_run_id']} and {pair['failure_run_id']} are close in normalized parameter space.",
                     {"pair": key, **pair},
-                    [{"type": "select_runs", "label": "Inspect pair", "run_ids": [pair["nonfailure_run_id"], pair["failure_run_id"]]}],
+                    [
+                        {
+                            "type": "select_runs",
+                            "label": "Inspect pair",
+                            "run_ids": [pair["nonfailure_run_id"], pair["failure_run_id"]],
+                        }
+                    ],
                 )
             )
-    near_critical = [
-        run for run in payload["runs"] if run["safety_region"] == "near_critical"
-    ]
+    near_critical = [run for run in payload["runs"] if run["safety_region"] == "near_critical"]
     if near_critical:
         insights.append(
             _insight(
@@ -1619,9 +1629,7 @@ def _comparison_insight_payload(payload: dict[str, Any]) -> list[dict[str, Any]]
             key=lambda row: float(row.get("failure_rate") or 0.0),
         )
         low, high = rates[0], rates[-1]
-        difference = float(high.get("failure_rate") or 0.0) - float(
-            low.get("failure_rate") or 0.0
-        )
+        difference = float(high.get("failure_rate") or 0.0) - float(low.get("failure_rate") or 0.0)
         if difference > 0:
             insights.append(
                 _insight(
@@ -1637,16 +1645,10 @@ def _comparison_insight_payload(payload: dict[str, Any]) -> list[dict[str, Any]]
                     },
                 )
             )
-    points = [
-        point
-        for point in payload["comparison"]["parameter_points"]
-        if point.get("matched")
-    ]
+    points = [point for point in payload["comparison"]["parameter_points"] if point.get("matched")]
     transitions = Counter(point["transition"] for point in points)
     disagreements = [
-        point
-        for point in points
-        if point["left_outcome_family"] != point["right_outcome_family"]
+        point for point in points if point["left_outcome_family"] != point["right_outcome_family"]
     ]
     if disagreements:
         first = next(
@@ -1677,9 +1679,7 @@ def _comparison_insight_payload(payload: dict[str, Any]) -> list[dict[str, Any]]
             )
         )
     unmatched = [
-        point
-        for point in payload["comparison"]["parameter_points"]
-        if not point.get("matched")
+        point for point in payload["comparison"]["parameter_points"] if not point.get("matched")
     ]
     if unmatched:
         insights.append(
@@ -1791,9 +1791,7 @@ def _component_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str,
             counts = grouped_outcomes(members, spec)
             ci_low, ci_high = wilson_interval(counts["failure"], len(members))
             ttc_values = [
-                item
-                for run in members
-                if (item := metric_value(run, spec, "min_ttc")) is not None
+                item for run in members if (item := metric_value(run, spec, "min_ttc")) is not None
             ]
             rows.append(
                 {
@@ -1828,7 +1826,7 @@ def _write_html_report(
     mode: str,
 ) -> None:
     static_note = (
-        "<p class=\"notice\">Static report mode requested. Official tables and artifact links "
+        '<p class="notice">Static report mode requested. Official tables and artifact links '
         "are shown; interactive controls read the same frozen payload.</p>"
         if mode == "static"
         else ""
@@ -2804,9 +2802,7 @@ def _write_latex_summary(
         "\\hline",
     ]
     for row in outcome_rows:
-        lines.append(
-            f"{_latex(row['outcome'])} & {row['count']} & {row['percentage']:.2f}\\% \\\\"
-        )
+        lines.append(f"{_latex(row['outcome'])} & {row['count']} & {row['percentage']:.2f}\\% \\\\")
     lines.extend(["\\hline", "\\end{tabular}", "", "\\begin{tabular}{lrrrr}", "\\hline"])
     lines.append("Metric & Mean & Median & Min & Max \\\\")
     lines.append("\\hline")
@@ -2922,7 +2918,9 @@ def _pair_key(left: str, right: str) -> str:
 
 
 def _slug(value: str) -> str:
-    return "".join(character if character.isalnum() else "_" for character in value.lower()).strip("_")
+    return "".join(character if character.isalnum() else "_" for character in value.lower()).strip(
+        "_"
+    )
 
 
 def _html_table(rows: list[dict[str, Any]]) -> str:
@@ -2931,7 +2929,9 @@ def _html_table(rows: list[dict[str, Any]]) -> str:
     columns = list(rows[0])
     head = "".join(f"<th>{_escape(column)}</th>" for column in columns)
     body = "".join(
-        "<tr>" + "".join(f"<td>{_escape(_display(row.get(column)))}</td>" for column in columns) + "</tr>"
+        "<tr>"
+        + "".join(f"<td>{_escape(_display(row.get(column)))}</td>" for column in columns)
+        + "</tr>"
         for row in rows
     )
     return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"

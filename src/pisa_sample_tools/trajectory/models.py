@@ -34,6 +34,33 @@ class AgentState:
     x: float
     y: float
     speed: float
+    yaw: float = 0.0
+    entity_name: str | None = None
+    sim_tracking_id: str | None = None
+    is_ego: bool | None = None
+
+
+@dataclass(frozen=True)
+class AgentGeometry:
+    agent_id: str
+    step_index: int | None = None
+    sim_time_ms: float | None = None
+    entity_name: str | None = None
+    sim_tracking_id: str | None = None
+    is_ego: bool | None = None
+    shape_type: str | None = None
+    length_m: float | None = None
+    width_m: float | None = None
+    height_m: float | None = None
+    reference_point: str | None = None
+    center_offset_x: float = 0.0
+    center_offset_y: float = 0.0
+    center_offset_z: float = 0.0
+    roll_offset: float = 0.0
+    pitch_offset: float = 0.0
+    yaw_offset: float = 0.0
+    footprint: tuple[tuple[float, float], ...] = ()
+    source: str | None = None
 
 
 @dataclass(frozen=True)

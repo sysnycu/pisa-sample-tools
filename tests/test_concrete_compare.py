@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from pisa_sample_tools.evidence.comparison_page import _HTML
 from pisa_sample_tools.evidence.concrete_compare import (
     align_numeric_series,
     build_comparison_chunk,
@@ -43,24 +44,74 @@ def _run(
     _write_csv(
         monitor / "agent_states.csv",
         [
-            {"step_index": 0, "sim_time_ms": 0, "agent_id": 0, "x": 0 + offset, "y": 0, "z": 0, "speed": 10},
-            {"step_index": 1, "sim_time_ms": time_ms, "agent_id": 0, "x": 1 + offset, "y": 0, "z": 0, "speed": 10},
+            {
+                "step_index": 0,
+                "sim_time_ms": 0,
+                "agent_id": 0,
+                "x": 0 + offset,
+                "y": 0,
+                "z": 0,
+                "speed": 10,
+            },
+            {
+                "step_index": 1,
+                "sim_time_ms": time_ms,
+                "agent_id": 0,
+                "x": 1 + offset,
+                "y": 0,
+                "z": 0,
+                "speed": 10,
+            },
             {"step_index": 0, "sim_time_ms": 0, "agent_id": 1, "x": 5, "y": 1, "z": 0, "speed": 8},
-            {"step_index": 1, "sim_time_ms": time_ms, "agent_id": 1, "x": 6, "y": 1, "z": 0, "speed": 8},
+            {
+                "step_index": 1,
+                "sim_time_ms": time_ms,
+                "agent_id": 1,
+                "x": 6,
+                "y": 1,
+                "z": 0,
+                "speed": 8,
+            },
         ],
     )
     _write_csv(
         monitor / "frame_metrics.csv",
         [
-            {"step_index": 0, "sim_time_ms": 0, "pair.ttc": 3.0, "ego.speed": 10, "ego.acceleration": 0},
-            {"step_index": 1, "sim_time_ms": time_ms, "pair.ttc": 2.0 - offset, "ego.speed": 9, "ego.acceleration": -1},
+            {
+                "step_index": 0,
+                "sim_time_ms": 0,
+                "pair.ttc": 3.0,
+                "ego.speed": 10,
+                "ego.acceleration": 0,
+            },
+            {
+                "step_index": 1,
+                "sim_time_ms": time_ms,
+                "pair.ttc": 2.0 - offset,
+                "ego.speed": 9,
+                "ego.acceleration": -1,
+            },
         ],
     )
     _write_csv(
         monitor / "control_commands.csv",
         [
-            {"step_index": 0, "sim_time_ms": 0, "control_type": "vehicle", "throttle": 0.5, "brake": 0, "steer": 0},
-            {"step_index": 1, "sim_time_ms": time_ms, "control_type": "vehicle", "throttle": 0, "brake": 0.4 + offset, "steer": 0.1},
+            {
+                "step_index": 0,
+                "sim_time_ms": 0,
+                "control_type": "vehicle",
+                "throttle": 0.5,
+                "brake": 0,
+                "steer": 0,
+            },
+            {
+                "step_index": 1,
+                "sim_time_ms": time_ms,
+                "control_type": "vehicle",
+                "throttle": 0,
+                "brake": 0.4 + offset,
+                "steer": 0.1,
+            },
         ],
     )
     return RunRecord(
@@ -123,6 +174,13 @@ def test_single_config_chunk_contains_trajectory_and_series(tmp_path: Path) -> N
     assert chunk["pairwise_series"] == []
 
 
+def test_comparison_page_defaults_to_fixed_full_trajectory_viewport() -> None:
+    assert '<option value="full" selected>Full trajectory</option>' in _HTML
+    assert '<option value="follow">Follow cursor</option>' in _HTML
+    assert "follow?path.actor.points.filter" in _HTML
+    assert "equalAspectBounds(xmin,xmax,ymin,ymax,w-2*m,h-2*m,.06)" in _HTML
+
+
 def test_duplicate_dataset_parameter_group_is_rejected_in_strict_mode(tmp_path: Path) -> None:
     first = _run(tmp_path, "a", sample_id="one")
     second = _run(tmp_path, "a", sample_id="two")
@@ -156,7 +214,7 @@ def test_chunk_contains_overlay_data_and_pairwise_summaries(tmp_path: Path) -> N
 
     chunk = build_comparison_chunk(groups[0], spec)
 
-    assert chunk["schema_version"] == 2
+    assert chunk["schema_version"] == 3
     assert chunk["timeline_s"] == [0.0, 0.1, 0.15]
     assert len(chunk["configs"]) == 2
     assert chunk["configs"][0]["timeline_s"] == [0.0, 0.1]

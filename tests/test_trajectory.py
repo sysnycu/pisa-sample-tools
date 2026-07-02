@@ -12,6 +12,7 @@ from pisa_sample_tools.trajectory import (
     AgentState,
     TrajectoryError,
     discover_agent_state_files,
+    load_agent_geometry_for_state_file,
     load_agent_states,
     origin_for_agent,
     states_to_svg,
@@ -125,6 +126,48 @@ def test_load_agent_states_parses_and_sorts_rows(tmp_path: Path) -> None:
     assert states[0].step_index == 0
     assert states[1].sim_time_ms == 100
     assert states[1].speed == 10
+
+
+def test_load_geometry_and_render_named_oriented_bounding_box(tmp_path: Path) -> None:
+    csv_path = tmp_path / "monitor" / "agent_states.csv"
+    _write_agent_states(csv_path, _rows()[:2])
+    _write_csv_path = csv_path.parent / "agent_geometry.csv"
+    with _write_csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "step_index",
+                "sim_time_ms",
+                "agent_id",
+                "entity_name",
+                "is_ego",
+                "length_m",
+                "width_m",
+                "center_offset_x",
+                "center_offset_y",
+                "yaw_offset",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "step_index": 0,
+                "sim_time_ms": 0,
+                "agent_id": 0,
+                "entity_name": "Ego",
+                "is_ego": True,
+                "length_m": 4,
+                "width_m": 2,
+                "center_offset_x": 1,
+                "center_offset_y": 0,
+                "yaw_offset": 0,
+            }
+        )
+    geometries = load_agent_geometry_for_state_file(csv_path)
+    svg = states_to_svg(load_agent_states(csv_path), title="bbox", geometries=geometries)
+    assert geometries[0].entity_name == "Ego"
+    assert "<polygon points=" in svg
+    assert "Ego [0] (ego)" in svg
 
 
 def test_visualize_single_iteration_writes_svg_with_agent_legend_and_speed_opacity(
@@ -266,8 +309,12 @@ def test_translate_states_moves_origin_agent_first_position_to_zero() -> None:
 
     assert origin == pytest.approx((10.0, 5.0))
     translated = translate_states(states, origin=origin)
-    agent_1_start = next(state for state in translated if state.agent_id == "1" and state.step_index == 0)
-    agent_0_start = next(state for state in translated if state.agent_id == "0" and state.step_index == 0)
+    agent_1_start = next(
+        state for state in translated if state.agent_id == "1" and state.step_index == 0
+    )
+    agent_0_start = next(
+        state for state in translated if state.agent_id == "0" and state.step_index == 0
+    )
     assert agent_1_start.x == pytest.approx(0.0)
     assert agent_1_start.y == pytest.approx(0.0)
     assert agent_0_start.x == pytest.approx(0.0)
@@ -381,7 +428,9 @@ def test_visualize_overwrite_replaces_previous_tool_output(tmp_path: Path) -> No
     assert (output_dir / "iteration_2_trajectory.svg").exists()
 
 
-def test_cli_trajectory_writes_batch_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_trajectory_writes_batch_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     results_dir = tmp_path / "results"
     _write_agent_states(results_dir / "iteration_1" / "monitor" / "agent_states.csv", _rows())
     output_dir = tmp_path / "trajectories"
@@ -482,7 +531,9 @@ def test_cli_trajectory_accepts_ignored_agent_ids(tmp_path: Path) -> None:
 
 def test_cli_trajectory_accepts_origin_agent_id(tmp_path: Path) -> None:
     results_dir = tmp_path / "results"
-    _write_agent_states(results_dir / "iteration_1" / "monitor" / "agent_states.csv", _rows(offset=10))
+    _write_agent_states(
+        results_dir / "iteration_1" / "monitor" / "agent_states.csv", _rows(offset=10)
+    )
     output_dir = tmp_path / "trajectories"
 
     assert (

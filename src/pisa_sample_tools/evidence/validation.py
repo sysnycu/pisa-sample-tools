@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .ingest import read_trace_rows
+from .metric_status import metric_coverage
 from .models import AnalysisSpec, EvidenceError, RunRecord
 from .statistics import as_float, normalized_outcome
 
@@ -35,7 +36,9 @@ def validate_runs(
     for run_id, count in sorted(run_ids.items()):
         if count > 1:
             findings.append(
-                DataQualityFinding("error", "duplicate_run_id", f"run ID occurs {count} times", run_id)
+                DataQualityFinding(
+                    "error", "duplicate_run_id", f"run ID occurs {count} times", run_id
+                )
             )
 
     parameter_names = sorted({name for run in runs for name in run.params})
@@ -51,13 +54,19 @@ def validate_runs(
         if name not in parameter_names:
             findings.append(
                 DataQualityFinding(
-                    "error", "missing_parameter", f"configured parameter '{name}' was not found", field=name
+                    "error",
+                    "missing_parameter",
+                    f"configured parameter '{name}' was not found",
+                    field=name,
                 )
             )
         elif name not in numeric_parameters:
             findings.append(
                 DataQualityFinding(
-                    "error", "non_numeric_parameter", f"configured parameter '{name}' is not numeric", field=name
+                    "error",
+                    "non_numeric_parameter",
+                    f"configured parameter '{name}' is not numeric",
+                    field=name,
                 )
             )
         else:
@@ -74,7 +83,9 @@ def validate_runs(
                 )
     if spec.parameter_mode == "single" and spec.x_param and spec.x_param == spec.y_param:
         findings.append(
-            DataQualityFinding("error", "duplicate_axes", "configured x and y parameters are identical")
+            DataQualityFinding(
+                "error", "duplicate_axes", "configured x and y parameters are identical"
+            )
         )
     selected_numeric = requested or [
         name for name in numeric_parameters if name not in spec.parameter_exclude
@@ -92,7 +103,9 @@ def validate_runs(
         if binding.summary is None:
             findings.append(
                 DataQualityFinding(
-                    "error", "metric_without_summary", f"metric '{metric_name}' has no summary binding"
+                    "error",
+                    "metric_without_summary",
+                    f"metric '{metric_name}' has no summary binding",
                 )
             )
             continue
@@ -136,11 +149,7 @@ def validate_runs(
             )
         )
     missing_ego = sorted(
-        {
-            run.experiment_id
-            for run in runs
-            if run.metadata.get("ego_agent_id") in {None, ""}
-        }
+        {run.experiment_id for run in runs if run.metadata.get("ego_agent_id") in {None, ""}}
     )
     for experiment_id in missing_ego:
         findings.append(
@@ -167,6 +176,31 @@ def enforce_validation(findings: list[DataQualityFinding], spec: AnalysisSpec) -
 def _validate_trace_alignment(run: RunRecord) -> list[DataQualityFinding]:
     findings: list[DataQualityFinding] = []
     frames = read_trace_rows(run.frame_metrics_path)
+    if frames:
+        for field in frames[0]:
+            if not field.endswith(".ttc_s"):
+                continue
+            coverage = metric_coverage(frames, field)
+            if coverage["invalid"]:
+                findings.append(
+                    DataQualityFinding(
+                        "warning",
+                        "invalid_metric_status",
+                        f"{field} has {coverage['invalid']} row(s) with unknown or inconsistent status",
+                        run.run_id,
+                        field,
+                    )
+                )
+            if coverage["missing"]:
+                findings.append(
+                    DataQualityFinding(
+                        "warning",
+                        "missing_metric_value",
+                        f"{field} has {coverage['missing']} unexplained missing row(s)",
+                        run.run_id,
+                        field,
+                    )
+                )
     controls = read_trace_rows(run.control_commands_path)
     states = read_trace_rows(run.agent_states_path)
     collisions = read_trace_rows(run.collision_events_path)
@@ -174,7 +208,9 @@ def _validate_trace_alignment(run: RunRecord) -> list[DataQualityFinding]:
     control_steps = _integer_values(controls, "step_index")
     if frame_steps and frame_steps != sorted(frame_steps):
         findings.append(
-            DataQualityFinding("error", "non_monotonic_frames", "frame steps are not monotonic", run.run_id)
+            DataQualityFinding(
+                "error", "non_monotonic_frames", "frame steps are not monotonic", run.run_id
+            )
         )
     if frame_steps and control_steps and frame_steps != control_steps:
         findings.append(
@@ -190,20 +226,29 @@ def _validate_trace_alignment(run: RunRecord) -> list[DataQualityFinding]:
         if set(state_counts) != set(frame_steps):
             findings.append(
                 DataQualityFinding(
-                    "warning", "frame_state_mismatch", "frame and agent-state steps differ", run.run_id
+                    "warning",
+                    "frame_state_mismatch",
+                    "frame and agent-state steps differ",
+                    run.run_id,
                 )
             )
         elif len(set(state_counts.values())) > 1:
             findings.append(
                 DataQualityFinding(
-                    "warning", "agent_count_changed", "agent-state cardinality changes by frame", run.run_id
+                    "warning",
+                    "agent_count_changed",
+                    "agent-state cardinality changes by frame",
+                    run.run_id,
                 )
             )
     collision_reason = "collision" in (run.termination_reason or "").lower()
     if collision_reason and not collisions:
         findings.append(
             DataQualityFinding(
-                "warning", "missing_collision_event", "collision termination has no event row", run.run_id
+                "warning",
+                "missing_collision_event",
+                "collision termination has no event row",
+                run.run_id,
             )
         )
     if collisions and not collision_reason:
@@ -229,9 +274,9 @@ def _integer_values(rows: list[dict[str, str]], field: str) -> list[int]:
 
 def _deduplicate(findings: list[DataQualityFinding]) -> list[DataQualityFinding]:
     unique = {
-        (item.severity, item.code, item.message, item.run_id, item.field): item
-        for item in findings
+        (item.severity, item.code, item.message, item.run_id, item.field): item for item in findings
     }
     return sorted(
-        unique.values(), key=lambda item: (item.severity, item.code, item.run_id or "", item.message)
+        unique.values(),
+        key=lambda item: (item.severity, item.code, item.run_id or "", item.message),
     )

@@ -4,7 +4,12 @@ from pathlib import Path
 
 from pisa_sample_tools.common.formatting import slug
 
-from .io import discover_agent_state_files, load_agent_states, load_run_info_for_agent_state_file
+from .io import (
+    discover_agent_state_files,
+    load_agent_geometry_for_state_file,
+    load_agent_states,
+    load_run_info_for_agent_state_file,
+)
 from .models import TrajectoryBatchResult, TrajectoryError, TrajectorySvgResult
 from .output import prepare_output_dir, write_manifest
 from .render import (
@@ -47,6 +52,7 @@ def render_agent_trajectory_svg(
         y_range=y_range,
         equal_scale=equal_scale,
         run_info=load_run_info_for_agent_state_file(source_path),
+        geometries=load_agent_geometry_for_state_file(source_path),
     )
 
 
@@ -77,7 +83,9 @@ def visualize_trajectories(
         if origin_agent_id is not None:
             origin = origin_for_agent(states, origin_agent_id)
             if origin is None:
-                raise TrajectoryError(f"origin agent id not found in {source_file}: {origin_agent_id}")
+                raise TrajectoryError(
+                    f"origin agent id not found in {source_file}: {origin_agent_id}"
+                )
             states = translate_states(states, origin=origin)
         states = filter_states_by_agent(states, ignore_agent_ids=ignore_agent_ids)
         states = filter_states_by_range(states, x_range=x_range, y_range=y_range)
@@ -94,6 +102,7 @@ def visualize_trajectories(
             y_range=y_range,
             equal_scale=equal_scale,
             run_info=run_info,
+            geometries=load_agent_geometry_for_state_file(source_file),
         )
         svg_path = output_dir / f"{_output_stem_for_source(source_file, input_path)}.svg"
         svg_path.write_text(svg, encoding="utf-8")
@@ -128,7 +137,9 @@ def visualize_trajectories(
         ignore_agent_ids=ignore_agent_ids,
         origin_agent_id=origin_agent_id,
     )
-    return TrajectoryBatchResult(output_dir=output_dir, manifest_path=manifest_path, results=results)
+    return TrajectoryBatchResult(
+        output_dir=output_dir, manifest_path=manifest_path, results=results
+    )
 
 
 def _default_title(source_path: Path) -> str:

@@ -9,6 +9,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Polygon
 
 from .axes import axis_rule_for, resolve_axis_limits, series_presentation
 from .ingest import read_trace_rows
@@ -56,9 +57,7 @@ def render_core_figures(
             else output_dir / "parameter_space" / f"{_slug(pair_x)}__{_slug(pair_y)}"
         )
         pair_dir.mkdir(parents=True, exist_ok=True)
-        hidden = sorted(
-            set(name for run in runs for name in run.params) - {pair_x, pair_y}
-        )
+        hidden = sorted(set(name for run in runs for name in run.params) - {pair_x, pair_y})
         paths.extend(_parameter_scatter(runs, spec, pair_dir, pair_x, pair_y, hidden))
         paths.extend(
             _binned_heatmap(
@@ -95,11 +94,7 @@ def render_core_figures(
                         cmap=cmap,
                     )
                 )
-        paths.extend(
-            _categorical_map(
-                runs, spec, pair_dir, pair_x, pair_y, "termination_reason"
-            )
-        )
+        paths.extend(_categorical_map(runs, spec, pair_dir, pair_x, pair_y, "termination_reason"))
         paths.extend(
             _categorical_map(
                 runs,
@@ -170,7 +165,9 @@ def representative_case_series(
         field = item["field"]
         rule = axis_rule_for(spec, field, item.get("semantic_name"))
         own_values = [point[1] for point in item["points"]]
-        semantic_values = shared_values.get(field, own_values) if rule.shared_across_cases else own_values
+        semantic_values = (
+            shared_values.get(field, own_values) if rule.shared_across_cases else own_values
+        )
         series.append(
             {
                 **item,
@@ -189,9 +186,7 @@ def _raw_case_series(run: RunRecord, spec: AnalysisSpec) -> list[dict[str, Any]]
     for metric_name in ("min_ttc", "min_distance"):
         binding = spec.metrics.get(metric_name)
         if binding and binding.series:
-            frame_definitions.append(
-                (metric_name, binding.series, binding.label, binding.unit)
-            )
+            frame_definitions.append((metric_name, binding.series, binding.label, binding.unit))
     frame_definitions.extend(
         [
             ("ego.speed", "ego.speed", None, None),
@@ -314,9 +309,7 @@ def render_component_figures(
     for run in runs:
         key = json_group_key(run)
         repeat_groups[key].append(run)
-    repeat_groups = {
-        key: members for key, members in repeat_groups.items() if len(members) > 1
-    }
+    repeat_groups = {key: members for key, members in repeat_groups.items() if len(members) > 1}
     if repeat_groups:
         labels = [f"group {index + 1}" for index in range(len(repeat_groups))]
         consistencies = []
@@ -358,9 +351,7 @@ def render_component_figures(
     return paths
 
 
-def _outcome_counts(
-    runs: list[RunRecord], spec: AnalysisSpec, output_dir: Path
-) -> list[Path]:
+def _outcome_counts(runs: list[RunRecord], spec: AnalysisSpec, output_dir: Path) -> list[Path]:
     counts = Counter(normalized_outcome(run, spec) for run in runs)
     labels = list(counts)
     values = [counts[label] for label in labels]
@@ -596,9 +587,7 @@ def _metric_distribution(
         ax.boxplot([grouped[item] for item in labels], tick_labels=labels)
         ax.set_ylabel(label)
         ax.set_title(f"{label} by outcome")
-        paths.extend(
-            _save_figure(fig, output_dir / f"{metric_name}_by_outcome", spec, rows)
-        )
+        paths.extend(_save_figure(fig, output_dir / f"{metric_name}_by_outcome", spec, rows))
     return paths
 
 
@@ -606,14 +595,18 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
     rows = read_trace_rows(run.agent_states_path)
     if not rows:
         return []
-    by_agent: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    by_agent: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
+    actor_names: dict[str, str] = {}
     output_rows = []
     for row in rows:
         x, y = as_float(row.get("x")), as_float(row.get("y"))
         if x is None or y is None:
             continue
         agent = str(row.get("agent_id", "unknown"))
-        by_agent[agent].append((x, y))
+        by_agent[agent].append((x, y, as_float(row.get("yaw")) or 0.0))
+        actor_names[agent] = str(
+            row.get("entity_name") or row.get("agent_name") or f"agent {agent}"
+        )
         output_rows.append(
             {
                 "step_index": row.get("step_index"),
@@ -621,15 +614,30 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
                 "agent_id": agent,
                 "x": x,
                 "y": y,
+                "yaw": row.get("yaw"),
+                "entity_name": row.get("entity_name") or row.get("agent_name"),
             }
         )
     if not by_agent:
         return []
     fig, ax = plt.subplots(figsize=(8, 6.5))
+    geometry_by_agent = {
+        str(row.get("agent_id") or row.get("actor_id")): row
+        for row in read_trace_rows(run.agent_geometry_path)
+    }
     for agent, points in sorted(by_agent.items()):
-        ax.plot([item[0] for item in points], [item[1] for item in points], label=f"agent {agent}")
+        label = f"{actor_names[agent]} [{agent}]"
+        ax.plot([item[0] for item in points], [item[1] for item in points], label=label)
         ax.scatter([points[0][0]], [points[0][1]], marker="o", s=35)
         ax.scatter([points[-1][0]], [points[-1][1]], marker="x", s=45)
+        geometry = geometry_by_agent.get(agent)
+        if geometry:
+            for point in (points[0], points[-1]):
+                footprint = _plot_footprint(point, geometry)
+                if footprint:
+                    ax.add_patch(
+                        Polygon(footprint, closed=True, fill=True, alpha=0.12, linewidth=1.2)
+                    )
     collision_rows = read_trace_rows(run.collision_events_path)
     collision_output_rows = []
     for collision in collision_rows:
@@ -661,6 +669,35 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
         output_rows + collision_output_rows,
         formats=("svg", "png"),
     )
+
+
+def _plot_footprint(
+    point: tuple[float, float, float], geometry: dict[str, str]
+) -> list[tuple[float, float]]:
+    length, width = as_float(geometry.get("length_m")), as_float(geometry.get("width_m"))
+    if not length or not width or length <= 0 or width <= 0:
+        return []
+    x, y, yaw = point
+    offset_x, offset_y = (
+        as_float(geometry.get("center_offset_x")) or 0.0,
+        as_float(geometry.get("center_offset_y")) or 0.0,
+    )
+    center_x = x + math.cos(yaw) * offset_x - math.sin(yaw) * offset_y
+    center_y = y + math.sin(yaw) * offset_x + math.cos(yaw) * offset_y
+    angle = yaw + (as_float(geometry.get("yaw_offset")) or 0.0)
+    local = [
+        (-length / 2, -width / 2),
+        (length / 2, -width / 2),
+        (length / 2, width / 2),
+        (-length / 2, width / 2),
+    ]
+    return [
+        (
+            center_x + math.cos(angle) * px - math.sin(angle) * py,
+            center_y + math.sin(angle) * px + math.cos(angle) * py,
+        )
+        for px, py in local
+    ]
 
 
 def _timeseries_plot(
@@ -721,8 +758,7 @@ def _control_plot(
         axis.plot([item[0] for item in points], [item[1] for item in points])
         _apply_axis_style(axis, item)
         output_rows.extend(
-            {"time_s": time, "series": field, "value": value}
-            for time, value in points
+            {"time_s": time, "series": field, "value": value} for time, value in points
         )
     axes_array[-1].set_xlabel("Simulation time (s)")
     fig.suptitle(f"{prefix.replace('_', ' ').title()} controls: {run.run_id}")
@@ -750,9 +786,7 @@ def _apply_axis_style(axis, item: dict[str, Any]) -> None:
     if limits.get("out_of_range"):
         for nominal in (limits.get("nominal_lower"), limits.get("nominal_upper")):
             if nominal is not None and lower < float(nominal) < upper:
-                axis.axhline(
-                    float(nominal), color="#dc2626", linestyle="--", linewidth=0.9
-                )
+                axis.axhline(float(nominal), color="#dc2626", linestyle="--", linewidth=0.9)
         axis.text(
             0.99,
             0.92,

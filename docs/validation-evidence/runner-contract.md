@@ -480,11 +480,20 @@ shape can change during execution. The analyzer expects these columns when avail
 step_index
 sim_time_ms
 agent_id
+sim_tracking_id
+entity_name
+is_ego
 shape_type
 length_m
 width_m
 height_m
 reference_point
+center_offset_x
+center_offset_y
+center_offset_z
+roll_offset
+pitch_offset
+yaw_offset
 footprint_json
 source
 ```
@@ -492,6 +501,19 @@ source
 Use `source` to distinguish simulator runtime geometry from defaults or spec-provided
 geometry. Keep per-frame pose in `agent_states.csv`; do not repeat static dimensions on
 every frame unless they actually change.
+
+The analyzer joins geometry and pose by `agent_id`, uses the latest geometry row at or
+before each frame, and applies center/yaw offsets before drawing the oriented footprint.
+`entity_name` is a display label; stable comparisons continue to use `agent_id`.
+
+### Metric applicability status
+
+Numeric frame metrics may provide companion `<metric>_valid` and `<metric>_status`
+columns. An empty numeric value with an explanatory status such as
+`outside_lateral_threshold`, `non_closing`, or `not_ahead` is not missing data. The
+analyzer reports these frames as not applicable and excludes them from numeric
+aggregation. A `valid` status without a numeric value, an unknown status, or a blank
+value without status is reported as a data-quality problem.
 
 ### Collision event position
 

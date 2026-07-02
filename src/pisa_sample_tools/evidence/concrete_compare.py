@@ -12,6 +12,7 @@ from typing import Any
 
 from .axes import axis_rule_for, resolve_axis_limits, series_presentation
 from .ingest import read_trace_rows
+from .metric_status import metric_coverage, status_points
 from .models import AnalysisSpec, ConcreteComparisonGroup, EvidenceError, RunRecord
 from .statistics import as_float, metric_value, normalized_outcome, safety_region
 
@@ -57,9 +58,7 @@ def build_concrete_comparison_groups(
             if len(sample_ids) == 1 and all(run.sample_id is not None for run in selected)
             else "parameters"
         )
-        group_id = hashlib.sha256(
-            f"{scenario_name}\0{parameter_key}".encode()
-        ).hexdigest()[:16]
+        group_id = hashlib.sha256(f"{scenario_name}\0{parameter_key}".encode()).hexdigest()[:16]
         groups.append(
             ConcreteComparisonGroup(
                 group_id=group_id,
@@ -106,14 +105,12 @@ def align_numeric_series(
     ]
 
 
-def build_comparison_chunk(
-    group: ConcreteComparisonGroup, spec: AnalysisSpec
-) -> dict[str, Any]:
+def build_comparison_chunk(group: ConcreteComparisonGroup, spec: AnalysisSpec) -> dict[str, Any]:
     configs = [_extract_config(run, spec) for run in group.runs]
     _apply_axis_limits(configs, spec)
     group_warnings = _group_warnings(configs)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "group": {
             "group_id": group.group_id,
             "logical_scenario_name": group.logical_scenario_name,
@@ -225,9 +222,7 @@ def _extract_config(run: RunRecord, spec: AnalysisSpec) -> dict[str, Any]:
         "stop_reason": run.stop_reason,
         "params": run.params,
         "metrics": run.metrics,
-        "canonical_metrics": {
-            name: metric_value(run, spec, name) for name in spec.metrics
-        },
+        "canonical_metrics": {name: metric_value(run, spec, name) for name in spec.metrics},
         "trajectory": trajectory,
         "series": series,
         "events": events,
@@ -286,6 +281,13 @@ def _trajectory_payload(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows = read_trace_rows(run.agent_states_path)
     grouped: dict[str, list[list[float | None]]] = defaultdict(list)
+    identities: dict[str, dict[str, Any]] = {}
+    geometry_rows = read_trace_rows(run.agent_geometry_path)
+    geometry_by_agent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for geometry in geometry_rows:
+        geometry_id = geometry.get("agent_id") or geometry.get("actor_id")
+        if geometry_id not in {None, ""}:
+            geometry_by_agent[str(geometry_id)].append(_geometry_payload(geometry))
     warnings: list[str] = []
     missing_time = False
     for row in rows:
@@ -305,22 +307,74 @@ def _trajectory_payload(
                 y,
                 as_float(row.get("z")),
                 as_float(row.get("speed") or row.get("speed_mps")),
+                as_float(row.get("yaw")),
             ]
         )
+        identities[str(agent_id)] = {
+            "entity_name": row.get("entity_name") or row.get("agent_name"),
+            "sim_tracking_id": row.get("sim_tracking_id"),
+            "is_ego": _as_bool(row.get("is_ego")),
+        }
     if missing_time:
         warnings.append("agent state rows missing sim_time_ms; step_index fallback used")
     ego_id = str(run.metadata.get("ego_agent_id") or "0")
     actors = []
     for agent_id, points in sorted(grouped.items()):
         points.sort(key=lambda point: float(point[0] or 0))
+        identity = identities.get(agent_id, {})
+        geometries = geometry_by_agent.get(agent_id, [])
+        if geometries:
+            identity = {
+                **{
+                    key: geometries[0].get(key)
+                    for key in ("entity_name", "sim_tracking_id", "is_ego")
+                },
+                **{key: value for key, value in identity.items() if value not in {None, ""}},
+            }
         actors.append(
             {
                 "agent_id": agent_id,
-                "is_ego": agent_id == ego_id,
+                "entity_name": identity.get("entity_name"),
+                "sim_tracking_id": identity.get("sim_tracking_id"),
+                "is_ego": identity.get("is_ego")
+                if identity.get("is_ego") is not None
+                else agent_id == ego_id,
+                "geometry": geometries,
                 "points": _downsample_even(points, spec.comparison_detail.max_points_per_series),
             }
         )
     return actors, warnings
+
+
+def _geometry_payload(row: dict[str, str]) -> dict[str, Any]:
+    return {
+        "step_index": as_float(row.get("step_index")),
+        "sim_time_ms": as_float(row.get("sim_time_ms")),
+        "entity_name": row.get("entity_name") or row.get("agent_name"),
+        "sim_tracking_id": row.get("sim_tracking_id"),
+        "is_ego": _as_bool(row.get("is_ego")),
+        "shape_type": row.get("shape_type"),
+        "length_m": as_float(row.get("length_m")),
+        "width_m": as_float(row.get("width_m")),
+        "height_m": as_float(row.get("height_m")),
+        "reference_point": row.get("reference_point"),
+        "center_offset_x": as_float(row.get("center_offset_x")) or 0.0,
+        "center_offset_y": as_float(row.get("center_offset_y")) or 0.0,
+        "center_offset_z": as_float(row.get("center_offset_z")) or 0.0,
+        "yaw_offset": as_float(row.get("yaw_offset")) or 0.0,
+        "footprint_json": row.get("footprint_json") or None,
+        "source": row.get("source"),
+    }
+
+
+def _as_bool(value: Any) -> bool | None:
+    if value in {None, ""}:
+        return None
+    if str(value).strip().lower() in {"true", "1", "yes"}:
+        return True
+    if str(value).strip().lower() in {"false", "0", "no"}:
+        return False
+    return None
 
 
 def _series_payload(run: RunRecord, spec: AnalysisSpec) -> list[dict[str, Any]]:
@@ -358,6 +412,8 @@ def _series_payload(run: RunRecord, spec: AnalysisSpec) -> list[dict[str, Any]]:
                     "label": label,
                     "unit": unit,
                     "interpolation": "linear",
+                    "coverage": metric_coverage(frame_rows, field),
+                    "statuses": status_points(frame_rows, field),
                     "points": _downsample_minmax(
                         points, spec.comparison_detail.max_points_per_series
                     ),
@@ -403,9 +459,7 @@ def _apply_axis_limits(configs: list[dict[str, Any]], spec: AnalysisSpec) -> Non
             own_values = [float(point[1]) for point in item["points"]]
             semantic_values = shared[(item["source"], item["field"])]
             item["semantic_limits"] = resolve_axis_limits(semantic_values, rule).as_dict()
-            item["detail_limits"] = resolve_axis_limits(
-                own_values, rule, detail=True
-            ).as_dict()
+            item["detail_limits"] = resolve_axis_limits(own_values, rule, detail=True).as_dict()
 
 
 def _trajectory_summaries(
@@ -458,9 +512,7 @@ def _trajectory_summaries(
     return rows
 
 
-def _series_summaries(
-    configs: list[dict[str, Any]], spec: AnalysisSpec
-) -> list[dict[str, Any]]:
+def _series_summaries(configs: list[dict[str, Any]], spec: AnalysisSpec) -> list[dict[str, Any]]:
     rows = []
     for left, right in combinations(configs, 2):
         left_series = {(item["source"], item["field"]): item for item in left["series"]}
@@ -480,10 +532,18 @@ def _series_summaries(
                 left_item["semantic_name"],
                 spec.comparison_detail.tolerances.get(left_item["field"], 0.0),
             )
-            first_divergence = next(
-                (aligned[index][0] for index, value in enumerate(absolute) if value >= tolerance),
-                None,
-            ) if tolerance > 0 else None
+            first_divergence = (
+                next(
+                    (
+                        aligned[index][0]
+                        for index, value in enumerate(absolute)
+                        if value >= tolerance
+                    ),
+                    None,
+                )
+                if tolerance > 0
+                else None
+            )
             step = _median_step([(time, value) for time, value, _ in aligned])
             rows.append(
                 {
@@ -520,9 +580,7 @@ def _numeric_points(rows: list[dict[str, str]], field: str) -> list[list[float]]
 def _downsample_even(points: list[list[Any]], limit: int) -> list[list[Any]]:
     if len(points) <= limit:
         return points
-    indexes = {
-        round(index * (len(points) - 1) / (limit - 1)) for index in range(limit)
-    }
+    indexes = {round(index * (len(points) - 1) / (limit - 1)) for index in range(limit)}
     return [points[index] for index in sorted(indexes)]
 
 
@@ -538,7 +596,10 @@ def _downsample_minmax(points: list[list[float]], limit: int) -> list[list[float
         values = interior[start:end]
         if not values:
             continue
-        extremes = {min(range(len(values)), key=lambda i: values[i][1]), max(range(len(values)), key=lambda i: values[i][1])}
+        extremes = {
+            min(range(len(values)), key=lambda i: values[i][1]),
+            max(range(len(values)), key=lambda i: values[i][1]),
+        }
         sampled.extend(values[index] for index in sorted(extremes, key=lambda i: values[i][0]))
     sampled.append(points[-1])
     return sampled[:limit]
@@ -553,9 +614,7 @@ def _median_step(points: list[tuple[float, float]]) -> float:
     return statistics.median(deltas) if deltas else 0.0
 
 
-def _interpolate(
-    points: list[tuple[float, float]], time: float, interpolation: str
-) -> float:
+def _interpolate(points: list[tuple[float, float]], time: float, interpolation: str) -> float:
     if time <= points[0][0]:
         return points[0][1]
     for index in range(1, len(points)):
@@ -598,13 +657,15 @@ def _group_warnings(configs: list[dict[str, Any]]) -> list[str]:
     maps = {config.get("map_name") for config in configs if config.get("map_name")}
     if len(maps) > 1:
         warnings.append("configs report different map_name values; XY overlay may be invalid")
-    actor_sets = [
-        {actor["agent_id"] for actor in config["trajectory"]} for config in configs
-    ]
+    actor_sets = [{actor["agent_id"] for actor in config["trajectory"]} for config in configs]
     if actor_sets and any(actor_set != actor_sets[0] for actor_set in actor_sets[1:]):
-        warnings.append("actor sets differ across configs; only common actors are enabled by default")
+        warnings.append(
+            "actor sets differ across configs; only common actors are enabled by default"
+        )
     if len(configs) > 10:
-        warnings.append("more than ten configs are available; select a subset for readable overlays")
+        warnings.append(
+            "more than ten configs are available; select a subset for readable overlays"
+        )
     return warnings
 
 
