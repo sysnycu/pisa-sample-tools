@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from pisa_sample_tools.common.formatting import format_number, panel_value, wrap_text
+from pisa_sample_tools.common.goal import EgoGoal
 from pisa_sample_tools.common.sorting import natural_key
 from pisa_sample_tools.common.svg import escape, svg_header, svg_rect, svg_text
 
@@ -64,6 +65,7 @@ def states_to_svg(
     equal_scale: bool = True,
     run_info: RunInfo | None = None,
     geometries: list[AgentGeometry] | None = None,
+    ego_goal: EgoGoal | None = None,
 ) -> str:
     if width < 500 or height < 360:
         raise TrajectoryError("SVG width/height are too small")
@@ -88,6 +90,9 @@ def states_to_svg(
     ]
     xs = [state.x for state in states] + [point[0] for point in footprint_points]
     ys = [state.y for state in states] + [point[1] for point in footprint_points]
+    if ego_goal is not None:
+        xs.append(ego_goal.x)
+        ys.append(ego_goal.y)
     min_x, max_x = x_range if x_range is not None else expanded_range(min(xs), max(xs))
     min_y, max_y = y_range if y_range is not None else expanded_range(min(ys), max(ys))
 
@@ -170,6 +175,18 @@ def states_to_svg(
             f'fill="{color}"><title>{escape(f"agent {agent_id} end")}</title></circle>'
         )
 
+    if ego_goal is not None:
+        goal_x, goal_y = sx(ego_goal.x), sy(ego_goal.y)
+        parts.append(
+            f'<circle cx="{goal_x:.2f}" cy="{goal_y:.2f}" r="8" fill="none" stroke="#111827" stroke-width="2"><title>Ego goal ({ego_goal.x:g}, {ego_goal.y:g})</title></circle>'
+        )
+        parts.append(
+            f'<line x1="{goal_x - 11:.2f}" y1="{goal_y:.2f}" x2="{goal_x + 11:.2f}" y2="{goal_y:.2f}" stroke="#111827" stroke-width="2"/>'
+        )
+        parts.append(
+            f'<line x1="{goal_x:.2f}" y1="{goal_y - 11:.2f}" x2="{goal_x:.2f}" y2="{goal_y + 11:.2f}" stroke="#111827" stroke-width="2"/>'
+        )
+
     parts.extend(
         _side_panel(
             agent_ids,
@@ -180,6 +197,7 @@ def states_to_svg(
             run_info=run_info,
             states_by_agent=by_agent,
             geometry_by_agent=geometry_by_agent,
+            ego_goal=ego_goal,
         )
     )
     parts.append("</svg>")
@@ -288,6 +306,7 @@ def _side_panel(
     run_info: RunInfo | None,
     states_by_agent: dict[str, list[AgentState]],
     geometry_by_agent: dict[str, list[AgentGeometry]],
+    ego_goal: EgoGoal | None,
 ) -> list[str]:
     parts = [
         f'<g transform="translate({x:.2f},{y:.2f})">',
@@ -315,6 +334,18 @@ def _side_panel(
     parts.append(svg_text(42, cursor_y + 22, "medium", size=12))
     parts.append(svg_text(42, cursor_y + 40, f"fast {format_number(max_speed)}", size=12))
     cursor_y += 68
+    if ego_goal is not None:
+        parts.append(svg_text(0, cursor_y, "Ego goal", size=15, weight="700"))
+        cursor_y += 20
+        parts.append(
+            svg_text(
+                0,
+                cursor_y,
+                f"x: {format_number(ego_goal.x)}, y: {format_number(ego_goal.y)}",
+                size=11,
+            )
+        )
+        cursor_y += 28
     if run_info is not None and run_info.params:
         cursor_y = _append_kv_section(parts, "Params", run_info.params, cursor_y)
     if run_info is not None and run_info.result:

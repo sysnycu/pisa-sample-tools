@@ -174,11 +174,32 @@ def test_single_config_chunk_contains_trajectory_and_series(tmp_path: Path) -> N
     assert chunk["pairwise_series"] == []
 
 
+def test_chunk_derives_current_distance_to_ego_goal(tmp_path: Path) -> None:
+    run = _run(tmp_path, "a")
+    run = RunRecord(
+        **{
+            **run.__dict__,
+            "metadata": {**run.metadata, "ego_goal": {"x": 3.0, "y": 4.0}},
+        }
+    )
+    groups, _ = build_concrete_comparison_groups([run], _spec())
+    chunk = build_comparison_chunk(groups[0], _spec())
+    distance = next(
+        item for item in chunk["configs"][0]["series"] if item["field"] == "ego.distance_to_goal_m"
+    )
+    assert distance["label"] == "Distance to ego goal"
+    assert distance["unit"] == "m"
+    assert distance["points"][0] == pytest.approx([0.0, 5.0])
+    assert distance["points"][1][1] == pytest.approx(20**0.5)
+
+
 def test_comparison_page_defaults_to_fixed_full_trajectory_viewport() -> None:
     assert '<option value="full" selected>Full trajectory</option>' in _HTML
     assert '<option value="follow">Follow cursor</option>' in _HTML
     assert "follow?path.actor.points.filter" in _HTML
     assert "equalAspectBounds(xmin,xmax,ymin,ymax,w-2*m,h-2*m,.06)" in _HTML
+    assert "config.ego_goal" in _HTML
+    assert "goals.forEach" in _HTML
 
 
 def test_duplicate_dataset_parameter_group_is_rejected_in_strict_mode(tmp_path: Path) -> None:

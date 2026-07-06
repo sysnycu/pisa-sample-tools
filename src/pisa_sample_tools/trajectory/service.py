@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from pisa_sample_tools.common.formatting import slug
+from pisa_sample_tools.common.goal import load_ego_goal
 
 from .io import (
     discover_agent_state_files,
@@ -34,11 +36,14 @@ def render_agent_trajectory_svg(
     origin_agent_id: str | None = None,
 ) -> str:
     states = load_agent_states(source_path)
+    ego_goal = load_ego_goal(source_path)[0]
     if origin_agent_id is not None:
         origin = origin_for_agent(states, origin_agent_id)
         if origin is None:
             raise TrajectoryError(f"origin agent id not found in {source_path}: {origin_agent_id}")
         states = translate_states(states, origin=origin)
+        if ego_goal is not None:
+            ego_goal = replace(ego_goal, x=ego_goal.x - origin[0], y=ego_goal.y - origin[1])
     states = filter_states_by_agent(states, ignore_agent_ids=ignore_agent_ids)
     states = filter_states_by_range(states, x_range=x_range, y_range=y_range)
     if not states:
@@ -53,6 +58,7 @@ def render_agent_trajectory_svg(
         equal_scale=equal_scale,
         run_info=load_run_info_for_agent_state_file(source_path),
         geometries=load_agent_geometry_for_state_file(source_path),
+        ego_goal=ego_goal,
     )
 
 
@@ -79,6 +85,7 @@ def visualize_trajectories(
     results: list[TrajectorySvgResult] = []
     for source_file in source_files:
         states = load_agent_states(source_file)
+        ego_goal = load_ego_goal(source_file)[0]
         origin: tuple[float, float] | None = None
         if origin_agent_id is not None:
             origin = origin_for_agent(states, origin_agent_id)
@@ -87,6 +94,8 @@ def visualize_trajectories(
                     f"origin agent id not found in {source_file}: {origin_agent_id}"
                 )
             states = translate_states(states, origin=origin)
+            if ego_goal is not None:
+                ego_goal = replace(ego_goal, x=ego_goal.x - origin[0], y=ego_goal.y - origin[1])
         states = filter_states_by_agent(states, ignore_agent_ids=ignore_agent_ids)
         states = filter_states_by_range(states, x_range=x_range, y_range=y_range)
         if not states:
@@ -103,6 +112,7 @@ def visualize_trajectories(
             equal_scale=equal_scale,
             run_info=run_info,
             geometries=load_agent_geometry_for_state_file(source_file),
+            ego_goal=ego_goal,
         )
         svg_path = output_dir / f"{_output_stem_for_source(source_file, input_path)}.svg"
         svg_path.write_text(svg, encoding="utf-8")

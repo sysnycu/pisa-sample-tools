@@ -22,6 +22,26 @@ uv run pisa-analysis compare \
   --output analysis/av-comparison
 ```
 
+For legacy result roots without a resolved goal in `execution_manifest.yaml`, provide a
+world-space goal without modifying the historical runner output through campaign metadata:
+
+```yaml
+version: 1
+datasets:
+  - id: legacy-run
+    results: /path/to/legacy-results
+    metadata:
+      ego_goal:
+        x: 37.81155
+        y: -8.22845
+        z: 0.0
+        heading: 2.37029
+        source_type: manual_world_position
+```
+
+Then build with `pisa-analysis build --campaign campaign.yaml ...`. The goal coordinates
+must use the same world frame as `agent_states.csv`.
+
 For reproducible comparisons, define grouping and display labels on the analysis side:
 
 ```bash
@@ -214,6 +234,7 @@ runs remain available as single-config concrete analyses.
 The concrete page provides:
 
 - selectable multi-config trajectory overlays with equal XY scale;
+- ego destination markers resolved from each dataset's `runner_spec` goal configuration;
 - ego and common interacting-actor toggles;
 - synchronized simulation-time cursor and optional path-to-cursor display;
 - metric and control overlays using stable config colors;

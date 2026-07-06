@@ -206,6 +206,9 @@ def write_concrete_comparison_data(
 def _extract_config(run: RunRecord, spec: AnalysisSpec) -> dict[str, Any]:
     trajectory, trajectory_warnings = _trajectory_payload(run, spec)
     series = _series_payload(run, spec)
+    goal_distance = _goal_distance_series(trajectory, run.metadata.get("ego_goal"))
+    if goal_distance is not None:
+        series.append(goal_distance)
     events = read_trace_rows(run.scenario_events_path)
     collisions = read_trace_rows(run.collision_events_path)
     warnings = trajectory_warnings
@@ -223,6 +226,7 @@ def _extract_config(run: RunRecord, spec: AnalysisSpec) -> dict[str, Any]:
         "params": run.params,
         "metrics": run.metrics,
         "canonical_metrics": {name: metric_value(run, spec, name) for name in spec.metrics},
+        "ego_goal": run.metadata.get("ego_goal"),
         "trajectory": trajectory,
         "series": series,
         "events": events,
@@ -231,6 +235,41 @@ def _extract_config(run: RunRecord, spec: AnalysisSpec) -> dict[str, Any]:
     }
     config["timeline_s"] = _timeline_union([config])
     return config
+
+
+def _goal_distance_series(trajectory: list[dict[str, Any]], goal: Any) -> dict[str, Any] | None:
+    if not isinstance(goal, dict):
+        return None
+    goal_x, goal_y = as_float(goal.get("x")), as_float(goal.get("y"))
+    ego = next((actor for actor in trajectory if actor.get("is_ego")), None)
+    if goal_x is None or goal_y is None or ego is None:
+        return None
+    points = [
+        [float(point[0]), math.hypot(float(point[1]) - goal_x, float(point[2]) - goal_y)]
+        for point in ego.get("points", [])
+    ]
+    if not points:
+        return None
+    return {
+        "source": "metrics",
+        "semantic_name": "ego.distance_to_goal",
+        "field": "ego.distance_to_goal_m",
+        "label": "Distance to ego goal",
+        "unit": "m",
+        "interpolation": "linear",
+        "coverage": {
+            "total": len(points),
+            "valid": len(points),
+            "not_applicable": 0,
+            "status_counts": {},
+            "invalid": 0,
+            "missing": 0,
+            "valid_field": None,
+            "status_field": None,
+        },
+        "statuses": [],
+        "points": points,
+    }
 
 
 def _timeline_union(configs: list[dict[str, Any]]) -> list[float]:

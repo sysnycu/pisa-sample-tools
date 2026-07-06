@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from pisa_sample_tools.common.goal import load_ego_goal
 from pisa_sample_tools.sample_analyze.utils import coerce_scalar, none_if_empty, read_csv_dicts
 
 from .models import AnalysisSpec, DatasetSpec, EvidenceError, RunRecord
@@ -60,10 +61,15 @@ def load_experiment(
     base_metadata = dict(spec.metadata)
     base_metadata.update(_execution_metadata(manifest))
     base_metadata.update(dataset.metadata)
+    ego_goal, goal_warning = load_ego_goal(root)
+    if ego_goal is not None:
+        base_metadata["ego_goal"] = ego_goal.as_dict()
     for key in ("dt", "seed", "runner_version"):
         if manifest.get(key) not in {None, ""}:
             base_metadata[key] = manifest[key]
     warnings: list[str] = []
+    if goal_warning:
+        warnings.append(f"{experiment_id}: {goal_warning}")
     if manifest_path is None:
         warnings.append(
             f"{experiment_id}: no execution_manifest.yaml; execution provenance is incomplete"
@@ -74,9 +80,7 @@ def load_experiment(
     records: list[RunRecord] = []
     for index, iteration_dir in enumerate(iteration_dirs, start=1):
         if progress is not None and index == 1:
-            progress(
-                f"reading {len(iteration_dirs)} iteration(s) from {dataset.dataset_id}"
-            )
+            progress(f"reading {len(iteration_dirs)} iteration(s) from {dataset.dataset_id}")
         monitor = iteration_dir / "monitor"
         result_path = monitor / "result.csv"
         if not result_path.exists():
@@ -140,9 +144,7 @@ def load_experiment(
             )
         )
         if progress is not None and (index % 1000 == 0 or index == len(iteration_dirs)):
-            progress(
-                f"{dataset.dataset_id}: loaded {index}/{len(iteration_dirs)} iteration(s)"
-            )
+            progress(f"{dataset.dataset_id}: loaded {index}/{len(iteration_dirs)} iteration(s)")
     return records, warnings
 
 
@@ -154,9 +156,7 @@ def read_trace_rows(path: Path | None) -> list[dict[str, str]]:
 
 
 @lru_cache(maxsize=256)
-def _read_trace_rows_cached(
-    path: str, _mtime_ns: int, _size: int
-) -> tuple[dict[str, str], ...]:
+def _read_trace_rows_cached(path: str, _mtime_ns: int, _size: int) -> tuple[dict[str, str], ...]:
     return tuple(read_csv_dicts(Path(path)))
 
 
@@ -216,7 +216,7 @@ def _json_mapping(value: Any) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(str(value))
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError, TypeError:
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
 

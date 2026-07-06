@@ -638,6 +638,31 @@ def _trajectory_plot(run: RunRecord, output_dir: Path, prefix: str) -> list[Path
                     ax.add_patch(
                         Polygon(footprint, closed=True, fill=True, alpha=0.12, linewidth=1.2)
                     )
+    goal = run.metadata.get("ego_goal")
+    if (
+        isinstance(goal, dict)
+        and as_float(goal.get("x")) is not None
+        and as_float(goal.get("y")) is not None
+    ):
+        goal_x, goal_y = float(goal["x"]), float(goal["y"])
+        ax.scatter(
+            [goal_x],
+            [goal_y],
+            marker="P",
+            facecolors="none",
+            edgecolors="#111827",
+            s=120,
+            linewidths=1.8,
+            label="ego goal",
+        )
+        output_rows.append(
+            {
+                "agent_id": "ego_goal",
+                "x": goal_x,
+                "y": goal_y,
+                "source_type": goal.get("source_type"),
+            }
+        )
     collision_rows = read_trace_rows(run.collision_events_path)
     collision_output_rows = []
     for collision in collision_rows:

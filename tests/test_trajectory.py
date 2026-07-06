@@ -170,6 +170,54 @@ def test_load_geometry_and_render_named_oriented_bounding_box(tmp_path: Path) ->
     assert "Ego [0] (ego)" in svg
 
 
+def test_visualize_renders_world_position_ego_goal(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    monitor = results / "iteration_1" / "monitor"
+    _write_agent_states(monitor / "agent_states.csv", _rows())
+    (results / "runner_spec.json").write_text(
+        json.dumps(
+            {
+                "scenario": {
+                    "goal_config": {
+                        "position": {
+                            "type": "WorldPosition",
+                            "value": [25, 7, 0, 0, None, None],
+                        },
+                        "target_speed": 12,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "trajectory"
+    visualize_trajectories(input_path=results, output_dir=output)
+    svg = (output / "iteration_1_trajectory.svg").read_text(encoding="utf-8")
+    assert "Ego goal (25, 7)" in svg
+    assert "x: 25, y: 7" in svg
+
+
+def test_visualize_prefers_execution_manifest_resolved_ego_goal(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    monitor = results / "iteration_1" / "monitor"
+    _write_agent_states(monitor / "agent_states.csv", _rows())
+    (results / "execution_manifest.yaml").write_text(
+        """ego_goal:
+  source_type: LanePosition
+  world:
+    x_m: 37.5
+    y_m: -8.25
+    z_m: 0.0
+    heading_rad: 2.37
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "trajectory"
+    visualize_trajectories(input_path=results, output_dir=output)
+    svg = (output / "iteration_1_trajectory.svg").read_text(encoding="utf-8")
+    assert "Ego goal (37.5, -8.25)" in svg
+
+
 def test_visualize_single_iteration_writes_svg_with_agent_legend_and_speed_opacity(
     tmp_path: Path,
 ) -> None:

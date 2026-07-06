@@ -2,6 +2,10 @@
 
 Command: `pisa-sample-trajectory`
 
+When a parent `execution_manifest` contains `ego_goal.world`, the trajectory includes the
+resolved ego destination automatically. Older outputs fall back to `runner_spec`;
+world positions are used directly and lane positions are resolved through OpenDRIVE.
+
 Render `agent_state.csv` or `agent_states.csv` from completed runner outputs.
 
 ```bash
