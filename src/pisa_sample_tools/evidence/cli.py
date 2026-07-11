@@ -11,7 +11,7 @@ from pisa_sample_tools.trajectory.cli import main as trajectory_main
 from pisa_sample_tools.trajectory_compare.cli import main as trajectory_compare_main
 
 from .models import EvidenceError
-from .service import build_evidence, validate_evidence_inputs
+from .service import build_evidence, enrich_sensitivity_bundle, validate_evidence_inputs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +54,21 @@ def build_parser() -> argparse.ArgumentParser:
                 default="interactive",
                 help="HTML report mode. Interactive is the default offline dashboard.",
             )
+            command.add_argument(
+                "--sensitivity",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Run parameter sensitivity training. Disabled by default unless enabled in the spec.",
+            )
+    sensitivity = subparsers.add_parser(
+        "sensitivity", help="Compute sensitivity for an existing evidence bundle."
+    )
+    sensitivity.add_argument("--bundle", type=Path, required=True)
     subparsers.add_parser("trajectory", add_help=False)
+    builder = subparsers.add_parser("builder", help="Launch the interactive report builder.")
+    builder.add_argument("--host", default="127.0.0.1")
+    builder.add_argument("--port", type=int, default=0)
+    builder.add_argument("--no-open", action="store_true")
     subparsers.add_parser("trajectory-compare", add_help=False)
     subparsers.add_parser("outcome-eval", add_help=False)
     sample = subparsers.add_parser("sample")
@@ -78,6 +92,25 @@ def main(argv: list[str] | None = None) -> int:
         return sample_export_main(argv[2:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "builder":
+        from .builder_server import run_builder
+
+        try:
+            run_builder(host=args.host, port=args.port, open_browser=not args.no_open)
+        except EvidenceError as exc:
+            parser.error(str(exc))
+        return 0
+    if args.command == "sensitivity":
+        try:
+            result = enrich_sensitivity_bundle(
+                args.bundle,
+                progress=lambda message: print(message, file=sys.stderr),
+            )
+        except EvidenceError as exc:
+            parser.error(str(exc))
+        print(f"sensitivity targets: {len(result.model_quality)}")
+        print(f"bundle: {args.bundle.expanduser().resolve()}")
+        return 0
     if args.command == "validate":
         try:
             run_count, findings = validate_evidence_inputs(
@@ -109,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             progress=lambda message: print(message, file=sys.stderr),
             validation_mode=args.validation,
             report_mode=args.report_mode,
+            sensitivity=args.sensitivity,
         )
     except EvidenceError as exc:
         parser.error(str(exc))

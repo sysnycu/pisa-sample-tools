@@ -41,6 +41,7 @@ def _run(
 
 def _settings(**overrides) -> SensitivitySpec:
     values = {
+        "enabled": True,
         "outcome_targets": ("failure",),
         "metric_targets": (),
         "minimum_samples": 30,

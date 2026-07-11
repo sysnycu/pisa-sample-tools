@@ -305,7 +305,7 @@ def test_load_analysis_spec_reads_metric_bindings(tmp_path: Path) -> None:
     assert spec.x_param == "x"
     assert spec.metrics["min_ttc"].summary == "pair.min_ttc_s"
     assert spec.metrics["min_ttc"].risk_direction == "higher_is_safer"
-    assert spec.sensitivity.enabled is True
+    assert spec.sensitivity.enabled is False
     assert spec.sensitivity.outcome_targets == ("failure", "invalidity")
     assert spec.near_critical_ttc_s == 1.5
 
@@ -348,6 +348,7 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
         results_paths=[results],
         output_dir=output,
         spec_path=spec_path,
+        sensitivity=True,
     )
 
     assert result.run_count == 2
@@ -516,6 +517,7 @@ def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
         campaign_path=campaign_path,
         output_dir=output,
         spec_path=spec_path,
+        sensitivity=True,
     )
 
     comparison = (output / "comparison" / "component_comparison.csv").read_text(
@@ -705,6 +707,31 @@ def test_unified_cli_builds_evidence(tmp_path: Path, capsys) -> None:
         == 0
     )
     assert "runs: 2" in capsys.readouterr().out
+    report_data = json.loads(
+        (output / "report" / "analysis_data.json").read_text(encoding="utf-8")
+    )
+    assert report_data["sensitivity"]["generated"] is False
+    assert report_data["sensitivity"]["model_quality"] == []
+
+
+def test_unified_cli_enriches_existing_bundle_with_sensitivity(
+    tmp_path: Path, capsys
+) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis.yaml"
+    output = tmp_path / "evidence"
+    _write_experiment(results)
+    _write_spec(spec_path)
+    build_evidence(results_paths=[results], output_dir=output, spec_path=spec_path)
+
+    assert main(["sensitivity", "--bundle", str(output)]) == 0
+
+    report_data = json.loads(
+        (output / "report" / "analysis_data.json").read_text(encoding="utf-8")
+    )
+    assert report_data["sensitivity"]["generated"] is True
+    assert report_data["sensitivity"]["model_quality"]
+    assert "sensitivity targets:" in capsys.readouterr().out
 
 
 def test_unified_cli_emits_progress_logs(tmp_path: Path, capsys) -> None:

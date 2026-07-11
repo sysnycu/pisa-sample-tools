@@ -10,10 +10,13 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 
+from pisa_sample_tools.common.sorting import natural_key
+
 from .axes import axis_rule_for, resolve_axis_limits, series_presentation
 from .ingest import read_trace_rows
 from .metric_status import metric_coverage, status_points
 from .models import AnalysisSpec, ConcreteComparisonGroup, EvidenceError, RunRecord
+from .opendrive import discover_xodr, load_map_geometry
 from .statistics import as_float, metric_value, normalized_outcome, safety_region
 
 TRACE_EXCLUDED_FIELDS = {"step_index", "sim_time_ms", "control_type", "payload_json"}
@@ -138,8 +141,20 @@ def write_concrete_comparison_data(
     index: list[dict[str, Any]] = []
     run_to_group: dict[str, str] = {}
     csv_rows: list[dict[str, Any]] = []
-    for group in groups:
+    scenario_ordinals: dict[str, int] = defaultdict(int)
+    ordered_groups = sorted(
+        groups,
+        key=lambda group: (
+            group.logical_scenario_name,
+            natural_key(str(group.runs[0].sample_id or group.runs[0].scenario_id)),
+            group.parameter_key,
+        ),
+    )
+    for group in ordered_groups:
+        scenario_ordinals[group.logical_scenario_name] += 1
+        sample_ordinal = scenario_ordinals[group.logical_scenario_name]
         chunk = build_comparison_chunk(group, spec)
+        chunk["group"]["sample_ordinal"] = sample_ordinal
         chunk_json = _json_text(chunk)
         (data_dir / f"{group.group_id}.json").write_text(chunk_json + "\n", encoding="utf-8")
         (data_dir / f"{group.group_id}.js").write_text(
@@ -154,6 +169,7 @@ def write_concrete_comparison_data(
             "parameter_key": group.parameter_key,
             "pairing_method": group.pairing_method,
             "params": group.params,
+            "sample_ordinal": sample_ordinal,
             "configs": config_summaries,
             "chunk": f"comparison_data/{group.group_id}.js",
         }
@@ -161,6 +177,7 @@ def write_concrete_comparison_data(
             [
                 group.group_id,
                 group.logical_scenario_name,
+                f"sample {sample_ordinal}",
                 json.dumps(group.params, sort_keys=True),
                 *[
                     " ".join(
@@ -184,6 +201,7 @@ def write_concrete_comparison_data(
                 "group_id": group.group_id,
                 "logical_scenario_name": group.logical_scenario_name,
                 "pairing_method": group.pairing_method,
+                "sample_ordinal": sample_ordinal,
                 "config_count": len(group.runs),
                 "configs": json.dumps([run.experiment_id for run in group.runs]),
                 "outcomes": json.dumps(
@@ -212,6 +230,18 @@ def _extract_config(run: RunRecord, spec: AnalysisSpec) -> dict[str, Any]:
     events = read_trace_rows(run.scenario_events_path)
     collisions = read_trace_rows(run.collision_events_path)
     warnings = trajectory_warnings
+    xodr_path = discover_xodr(run.result_path, run.metadata)
+    map_geometry = None
+    map_status = "unavailable"
+    if xodr_path is not None:
+        map_geometry, map_warning = load_map_geometry(xodr_path)
+        if map_warning:
+            warnings.append(map_warning)
+            map_status = "error"
+        else:
+            map_status = "available"
+    elif run.metadata.get("xodr_path"):
+        warnings.append(f"configured OpenDRIVE file is unavailable: {run.metadata['xodr_path']}")
     if run.frame_metrics_path is None:
         warnings.append("frame_metrics.csv unavailable")
     if run.control_commands_path is None:
@@ -227,6 +257,12 @@ def _extract_config(run: RunRecord, spec: AnalysisSpec) -> dict[str, Any]:
         "metrics": run.metrics,
         "canonical_metrics": {name: metric_value(run, spec, name) for name in spec.metrics},
         "ego_goal": run.metadata.get("ego_goal"),
+        "map": {
+            "status": map_status,
+            "name": run.metadata.get("map_name"),
+            "source": xodr_path.name if xodr_path else None,
+            "geometry": map_geometry,
+        },
         "trajectory": trajectory,
         "series": series,
         "events": events,
@@ -696,6 +732,16 @@ def _group_warnings(configs: list[dict[str, Any]]) -> list[str]:
     maps = {config.get("map_name") for config in configs if config.get("map_name")}
     if len(maps) > 1:
         warnings.append("configs report different map_name values; XY overlay may be invalid")
+    map_hashes = {
+        geometry.get("sha256")
+        for config in configs
+        if isinstance((geometry := config.get("map", {}).get("geometry")), dict)
+        and geometry.get("sha256")
+    }
+    if len(map_hashes) > 1:
+        warnings.append(
+            "configs use different OpenDRIVE geometry; the baseline map is shown"
+        )
     actor_sets = [{actor["agent_id"] for actor in config["trajectory"]} for config in configs]
     if actor_sets and any(actor_set != actor_sets[0] for actor_set in actor_sets[1:]):
         warnings.append(

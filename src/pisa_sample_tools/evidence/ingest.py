@@ -208,7 +208,33 @@ def _execution_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
     ):
         if manifest.get(key) not in {None, ""}:
             metadata[key] = manifest[key]
+    metadata.update(execution_component_metadata(manifest))
     return metadata
+
+
+def execution_component_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Normalize modern runner component provenance into analysis metadata."""
+    components = _mapping(manifest.get("components"))
+    normalized: dict[str, Any] = {}
+    for kind in ("simulator", "av"):
+        descriptor = _mapping(components.get(kind))
+        wrapper = _mapping(descriptor.get("wrapper"))
+        component = _mapping(descriptor.get("component"))
+        if component.get("name") not in {None, ""}:
+            normalized[f"{kind}_name"] = component["name"]
+        if wrapper.get("name") not in {None, ""}:
+            normalized[f"{kind}_wrapper_name"] = wrapper["name"]
+        if wrapper.get("version") not in {None, ""}:
+            normalized[f"{kind}_wrapper_version"] = wrapper["version"]
+        if component:
+            normalized[f"{kind}_component"] = component
+    execution = _mapping(manifest.get("execution"))
+    if execution.get("sampler_name") not in {None, ""}:
+        normalized["sampler_name"] = execution["sampler_name"]
+    resolved = _mapping(manifest.get("resolved_inputs"))
+    if resolved.get("map_xodr") not in {None, ""}:
+        normalized["xodr_path"] = resolved["map_xodr"]
+    return normalized
 
 
 def _json_mapping(value: Any) -> dict[str, Any]:

@@ -5,11 +5,13 @@ description = "Offline sampling and validation evidence tools for PISA experimen
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "fastapi>=0.116",
     "matplotlib>=3.10",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.9",
     "scipy>=1.17",
     "simcore",
+    "uvicorn>=0.35",
 ]
 
 [project.scripts]
@@ -36,6 +38,9 @@ simcore = { git = "https://github.com/pisa-hut/simulation-core.git" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pisa_sample_tools = ["evidence/builder_web/*.html"]
 
 [tool.ruff]
 line-length = 100

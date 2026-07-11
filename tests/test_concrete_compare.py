@@ -200,6 +200,12 @@ def test_comparison_page_defaults_to_fixed_full_trajectory_viewport() -> None:
     assert "equalAspectBounds(xmin,xmax,ymin,ymax,w-2*m,h-2*m,.06)" in _HTML
     assert "config.ego_goal" in _HTML
     assert "goals.forEach" in _HTML
+    assert "OpenDRIVE Map Layers" in _HTML
+    assert 'id="map-road-surface"' in _HTML
+    assert 'id="map-boundaries"' in _HTML
+    assert 'id="map-reference-lines"' in _HTML
+    assert 'id="map-junctions"' in _HTML
+    assert 'id="map-opacity"' in _HTML
 
 
 def test_duplicate_dataset_parameter_group_is_rejected_in_strict_mode(tmp_path: Path) -> None:

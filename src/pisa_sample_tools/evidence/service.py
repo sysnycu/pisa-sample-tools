@@ -40,7 +40,7 @@ from .plots import (
     render_representative_cases,
     representative_case_series,
 )
-from .sensitivity import analyze_sensitivity, render_sensitivity_figures
+from .sensitivity import SensitivityResult, analyze_sensitivity, render_sensitivity_figures
 from .spec import load_analysis_spec, spec_to_dict
 from .statistics import (
     apply_derived_parameters,
@@ -69,6 +69,7 @@ def build_evidence(
     validation_mode: str | None = None,
     deep_validation: bool = False,
     report_mode: str = "interactive",
+    sensitivity: bool | None = None,
 ) -> EvidenceResult:
     clear_trace_cache()
     reporter = _ProgressReporter(progress)
@@ -76,6 +77,8 @@ def build_evidence(
         raise EvidenceError("report_mode must be 'interactive' or 'static'")
     reporter.step("loading analysis spec")
     spec = load_analysis_spec(spec_path)
+    if sensitivity is not None:
+        spec = replace(spec, sensitivity=replace(spec.sensitivity, enabled=sensitivity))
     if validation_mode is not None:
         if validation_mode not in {"strict", "permissive"}:
             raise EvidenceError("validation_mode must be 'strict' or 'permissive'")
@@ -335,7 +338,10 @@ def build_evidence(
         data_quality_rows=data_quality_rows,
         figure_paths=figure_paths,
         warnings=warnings,
-        sensitivity_payload=sensitivity_result.payload(),
+        sensitivity_payload={
+            **sensitivity_result.payload(),
+            "generated": spec.sensitivity.enabled,
+        },
     )
     _write_report_payload(report_dir, report_payload)
 
@@ -402,6 +408,109 @@ def build_evidence(
         run_count=len(runs),
         figure_paths=tuple(figure_paths),
         warning_count=len(warnings),
+    )
+
+
+def enrich_sensitivity_bundle(
+    bundle_path: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> SensitivityResult:
+    bundle = bundle_path.expanduser().resolve()
+    report_dir = bundle / "report"
+    summary_dir = bundle / "summary"
+    figures_dir = bundle / "figures"
+    provenance_dir = bundle / "provenance"
+    data_path = report_dir / "analysis_data.json"
+    spec_path = provenance_dir / "resolved_analysis_spec.yaml"
+    manifest_path = bundle / "manifest.yaml"
+    if not data_path.is_file() or not spec_path.is_file() or not manifest_path.is_file():
+        raise EvidenceError(f"not a complete pisa-analysis evidence bundle: {bundle}")
+    try:
+        payload = json.loads(data_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvidenceError(f"failed to read bundle report data: {exc}") from exc
+    spec = load_analysis_spec(spec_path)
+    spec = replace(spec, sensitivity=replace(spec.sensitivity, enabled=True))
+    runs = [_run_from_report_payload(item) for item in payload.get("runs", [])]
+    if not runs:
+        raise EvidenceError("bundle report data contains no runs")
+    comparison = payload.get("comparison") or {}
+    result = analyze_sensitivity(
+        runs,
+        spec,
+        matched_rows=comparison.get("matched_runs") or [],
+        delta_rows=comparison.get("metric_deltas") or [],
+        progress=progress,
+    )
+    for name, rows in (
+        ("parameter_sensitivity", result.effects),
+        ("parameter_importance", result.importance),
+        ("parameter_response_profiles", result.profiles),
+        ("parameter_interactions", result.interactions),
+        ("sensitivity_model_quality", result.model_quality),
+        ("parameter_correlations", result.correlations),
+        ("sensitivity_sampling_plan", result.sampling_plan),
+    ):
+        _write_rows(summary_dir / f"{name}.csv", rows)
+    generated_figures = render_sensitivity_figures(result, figures_dir / "sensitivity")
+    payload["sensitivity"] = {**result.payload(), "generated": True}
+    existing_figures = [
+        item for item in payload.get("figures", []) if item.get("category") != "Parameter Sensitivity"
+    ]
+    payload["figures"] = [
+        *existing_figures,
+        *_figure_payloads(generated_figures, bundle, spec),
+    ]
+    resolved_spec = spec_to_dict(spec)
+    previous_spec = payload.get("provenance", {}).get("resolved_spec") or {}
+    if previous_spec.get("parameters", {}).get("resolved_pairs"):
+        resolved_spec["parameters"]["resolved_pairs"] = previous_spec["parameters"][
+            "resolved_pairs"
+        ]
+    payload.setdefault("provenance", {})["resolved_spec"] = resolved_spec
+    _write_report_payload(report_dir, payload)
+    write_yaml(spec_path, resolved_spec)
+    write_yaml(provenance_dir / "analysis_spec.yaml", resolved_spec)
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    manifest["figures"] = sorted(
+        {*(manifest.get("figures") or []), *(str(path) for path in generated_figures)}
+    )
+    manifest["outputs"] = [
+        str(path)
+        for path in sorted(bundle.rglob("*"))
+        if path.is_file() and path != manifest_path
+    ]
+    write_yaml(manifest_path, manifest)
+    return result
+
+
+def _run_from_report_payload(item: dict[str, Any]) -> RunRecord:
+    artifacts = item.get("artifacts") or {}
+
+    def optional_path(key: str) -> Path | None:
+        value = artifacts.get(key)
+        return Path(value) if value else None
+
+    return RunRecord(
+        experiment_id=str(item.get("experiment_id") or "experiment"),
+        scenario_id=str(item.get("scenario_id") or item.get("run_id") or "run"),
+        sample_id=item.get("sample_id"),
+        logical_scenario_name=str(item.get("logical_scenario_name") or "scenario"),
+        params=dict(item.get("params") or {}),
+        metadata=dict(item.get("metadata") or {}),
+        status=item.get("status"),
+        outcome=item.get("outcome") or item.get("normalized_outcome"),
+        termination_reason=item.get("termination_reason"),
+        stop_reason=item.get("stop_reason"),
+        metrics=dict(item.get("metrics") or {}),
+        result_path=Path(str(item.get("result_path") or ".")),
+        frame_metrics_path=optional_path("frame_metrics"),
+        agent_states_path=optional_path("agent_states"),
+        agent_geometry_path=optional_path("agent_geometry"),
+        collision_events_path=optional_path("collision_events"),
+        scenario_events_path=optional_path("scenario_events"),
+        control_commands_path=optional_path("control_commands"),
     )
 
 
@@ -1908,6 +2017,7 @@ def _write_html_report(
 <div class="shell">
 <nav>
   <a href="#overview">Overview</a>
+  <a href="#experiments">Experiments</a>
   <a href="#explorer">Parameter Space</a>
   <a href="#sensitivity">Parameter Sensitivity</a>
   <a href="#boundary">Boundary Explorer</a>
@@ -1940,6 +2050,11 @@ def _write_html_report(
     <h3>Outcomes</h3><div id="outcome-table"></div>
     <h3>Safety metrics</h3><div id="metric-table"></div>
   </section>
+  <section id="experiments">
+    <h2>Experiment Configurations</h2>
+    <p class="muted">Every outcome and run in this report remains associated with one of these execution configurations.</p>
+    <div id="experiment-cards" class="cards"></div>
+  </section>
   <section id="explorer">
     <h2>Parameter Space Explorer</h2>
     <div class="filters"><strong>Experiments</strong><span id="experiment-filters"></span><span class="experiment-actions"><button id="experiments-all" type="button">Select all</button><button id="experiments-clear" type="button">Clear</button></span></div>
@@ -1965,6 +2080,7 @@ def _write_html_report(
   <section id="sensitivity">
     <h2>Parameter Sensitivity</h2>
     <p class="muted">Observed associations and held-out surrogate-model sensitivity; these are not causal effects or formal Sobol indices.</p>
+    <div id="sensitivity-not-generated" class="notice" hidden><strong>Sensitivity analysis was not generated for this bundle.</strong><p>Run the command below from the report directory, then reload this page.</p><button id="copy-sensitivity-command" type="button">Copy generation command</button><pre id="sensitivity-command">uv run pisa-analysis sensitivity --bundle ..</pre></div>
     <div class="inline">
       <label>Experiment<select id="sensitivity-experiment"></select></label>
       <label>Target<select id="sensitivity-target"></select></label>
@@ -2592,6 +2708,8 @@ def _write_html_report(
     document.getElementById('summary-cards').innerHTML = cards([{label:'Runs', value:s.run_count}, {label:'Experiments', value:s.experiment_count}, {label:'Parameters', value:s.parameter_count}, {label:'Warnings', value:s.warning_count}]);
     document.getElementById('outcome-table').innerHTML = table(payload.report_mode === 'compare' ? payload.experiment_summaries.outcomes : s.outcomes);
     document.getElementById('metric-table').innerHTML = table(payload.report_mode === 'compare' ? payload.experiment_summaries.metrics : payload.metrics);
+    const sensitivityMissing=!payload.sensitivity?.generated;document.getElementById('sensitivity-not-generated').hidden=!sensitivityMissing;document.getElementById('copy-sensitivity-command').addEventListener('click',async()=>{const command=document.getElementById('sensitivity-command').textContent;try{await navigator.clipboard.writeText(command);document.getElementById('copy-sensitivity-command').textContent='Copied';}catch(_error){document.getElementById('sensitivity-command').focus();}});
+    document.getElementById('experiment-cards').innerHTML = experiments.map(item=>{const metadata=item.metadata||{},fields=[['AV',item.av],['Simulator',item.simulator],['Sampler',item.sampler],['Scenario',metadata.logical_scenario_name||metadata.scenario_name],['Map',metadata.map_name],['Repeat',metadata.repeat_id],['Seed',metadata.seed],['Runner',metadata.runner_version]].filter(([,value])=>value!==null&&value!==undefined&&value!=='');return `<article class="card"><span class="muted">Dataset</span><b style="font-size:18px">${escapeHtml(item.label||item.id)}</b><p>${fields.map(([label,value])=>`<span class="muted">${label}:</span> ${escapeHtml(value)}`).join('<br>')}</p><strong>${item.run_count} runs</strong></article>`;}).join('')||'<p class="muted">No experiment descriptors available.</p>';
     document.getElementById('case-table').innerHTML = table(payload.representative_cases);
     document.getElementById('component-table').innerHTML = table(payload.comparison.component_comparison);
     document.getElementById('transition-table').innerHTML = table(payload.comparison.outcome_transition);

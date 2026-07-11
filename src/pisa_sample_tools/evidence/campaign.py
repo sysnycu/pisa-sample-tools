@@ -33,6 +33,12 @@ def load_campaign(path: Path) -> list[DatasetSpec]:
             raise EvidenceError(f"duplicate campaign dataset id: {dataset_id}")
         seen_ids.add(dataset_id)
         metadata = _mapping(item.get("metadata"))
+        xodr_path = metadata.get("xodr_path") or item.get("xodr_path")
+        if xodr_path not in {None, ""}:
+            resolved_xodr = Path(str(xodr_path)).expanduser()
+            if not resolved_xodr.is_absolute():
+                resolved_xodr = (base / resolved_xodr).resolve()
+            metadata["xodr_path"] = str(resolved_xodr)
         labels = _mapping(item.get("labels"))
         grouping = _mapping(item.get("grouping"))
         metadata.update(

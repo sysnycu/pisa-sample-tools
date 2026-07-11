@@ -2,6 +2,28 @@
 
 Command: `pisa-analysis`
 
+## Interactive Report Builder
+
+Run `uv run pisa-analysis builder` to start the localhost-only Report Builder and open it
+in the default browser. Use `--no-open` for headless environments or `--port` to select a
+fixed local port.
+
+The first page is a Report Browser that recursively discovers PISA evidence bundles under
+`./analysis` (or another navigated root), previews their experiments and outcomes, and opens
+the selected offline report. **Create New Report** enters the four-step builder.
+
+The builder can browse and automatically preview valid result roots (defaulting to
+`/opt/sbsvf/outputs/`), load or assemble campaigns, enforce shared map/sampler/OpenDRIVE and
+exact logical-scenario/sample-ID/parameter compatibility, show simulator/AV component and
+wrapper differences, edit every resolved spec field, validate inputs, stream build progress,
+and open the completed report. Modern execution manifests prefill component names, wrapper
+names/versions, sampler, map, and resolved OpenDRIVE. Drafts are kept in browser local storage
+until campaign/spec YAML is explicitly exported.
+
+The server binds only to a loopback host and protects APIs and generated-report routes with
+a random session token. Existing non-empty output directories require an explicit overwrite
+confirmation in the UI.
+
 Build a reproducible evidence bundle from one or more completed runner result roots:
 
 ```bash
@@ -41,6 +63,18 @@ datasets:
 
 Then build with `pisa-analysis build --campaign campaign.yaml ...`. The goal coordinates
 must use the same world frame as `agent_states.csv`.
+
+To overlay trajectories on an OpenDRIVE map, provide an optional dataset-level path.
+Relative paths are resolved from the campaign file. If omitted, the analyzer searches the
+scenario/result hierarchy by `map_name`; missing or unsupported maps fall back to the
+trajectory-only view with a data-quality warning.
+
+```yaml
+datasets:
+  - id: carla-autoware
+    results: /path/to/results
+    xodr_path: maps/town.xodr
+```
 
 For reproducible comparisons, define grouping and display labels on the analysis side:
 
@@ -157,6 +191,23 @@ from the selected Left and Right experiments and shows explicit unavailable stat
 when only one side exists.
 
 ## Parameter Sensitivity
+
+Sensitivity model training is opt-in because it can dominate bundle build time. Enable it
+during the initial build with `--sensitivity` or `sensitivity.enabled: true` in the analysis
+spec. The CLI flag wins when `--sensitivity` or `--no-sensitivity` is supplied.
+
+```bash
+uv run pisa-analysis build ... --sensitivity
+```
+
+The offline report shows a generation command when sensitivity was skipped. To enrich an
+existing bundle without rebuilding ingestion, concrete comparisons, or other figures, run:
+
+```bash
+uv run pisa-analysis sensitivity --bundle analysis-output
+```
+
+Reload `report/analysis_report.html` after the command finishes.
 
 The interactive report analyzes each experiment independently for failure,
 invalidity, and configured numeric metrics. Compare reports additionally analyze

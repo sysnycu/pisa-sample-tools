@@ -34,6 +34,13 @@ This repo provides these commands:
 - `pisa-trajectory-compare`: compare non-ego trajectories between two simulator result sets. See [docs/trajectory-compare](docs/trajectory-compare/README.md).
 - `pisa-outcome-eval`: evaluate offline condition trees against completed monitor logs. See [docs/outcome-eval](docs/outcome-eval/README.md).
 
+Launch the interactive local Report Builder when you prefer to configure experiments,
+campaigns, specs, validation, and output without writing CLI commands:
+
+```bash
+uv run pisa-analysis builder
+```
+
 ## Validation Evidence
 
 ```bash

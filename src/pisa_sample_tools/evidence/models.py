@@ -68,7 +68,7 @@ class ComparisonDetailSpec:
 
 @dataclass(frozen=True)
 class SensitivitySpec:
-    enabled: bool = True
+    enabled: bool = False
     outcome_targets: tuple[str, ...] = ("failure", "invalidity")
     metric_targets: tuple[str, ...] = ()
     bins: int = 10
