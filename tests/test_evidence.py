@@ -368,6 +368,7 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert (output / "summary" / "agent_geometry.csv").exists()
     assert (output / "summary" / "collision_events.csv").exists()
     assert (output / "summary" / "scenario_events.csv").exists()
+    assert (output / "summary" / "experiment_timing.csv").exists()
     assert (output / "report" / "analysis_report.html").exists()
     assert (output / "report" / "analysis_data.json").exists()
     assert (output / "report" / "analysis_data.js").exists()
@@ -394,8 +395,60 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert "Advanced run explorer and Spec Lab" in report
     assert "Download YAML spec" in report
     assert 'id="run-select"' in report
+    assert "run.metrics[metric?.source || key.slice(7)]" in report
+    assert "N/A (${colors.unavailable})" in report
+    assert "mode:'ttc_gradient'" in report
+    assert "1 critical · 2 near-critical" in report
+    assert 'id="aspect-select"' in report
+    assert '<option value="equal" selected>1:1 data scale</option>' in report
+    assert 'id="background-select"' in report
+    assert 'id="scatter-export"' in report
+    assert 'id="scatter-export-crop"' in report
+    assert 'id="scatter-export-axes"' in report
+    assert 'id="scatter-export-labels"' in report
+    assert 'id="scatter-export-grid"' in report
+    assert "function exportScatter" in report
+    assert "iterationState.active?iterationState.points.slice(0,iterationState.index)" in report
+    assert "iterationProgress=iterationState.active?iterationState.index:null" in report
+    assert "ctx.lineWidth = 0.65*devicePixelRatio" in report
+    assert "Publication PNG" in report
+    assert "function scatterExportRect" in report
+    assert "rightPad=options.axes?56:8" in report
+    assert "options.grid" in report
+    assert '<option value="square">Square plot</option>' in report
+    assert "function scatterBounds" in report
+    assert "ctx.fillText(fmt(xv)" in report
+    assert "function saveExplorerState" in report
+    assert "sessionStorage.setItem(explorerStateKey" in report
+    assert 'id="iteration-play"' in report
+    assert 'id="iteration-timing-mode"' in report
+    assert 'id="iteration-timing-value"' in report
+    assert "function iterationRate" in report
+    assert "function prepareIteration" in report
+    assert "recordCanvasAnimation" in report
+    assert 'id="run-sensitivity"' in report
+    assert "updateSensitivityOnline" in report
+    assert "Open visualization" in report
+    assert "Total sim time" in report
+    assert "Timing coverage" in report
+    assert "run.metrics?.['run.total_steps']" in report
+    payload = json.loads((output / "report" / "analysis_data.json").read_text())
+    timing = payload["experiment_summaries"]["timing"][0]
+    assert timing["total_steps"] == 6
+    assert timing["total_sim_time_ms"] == 200
+    assert timing["total_wall_time_ms"] == 240
+    assert timing["speedup"] == pytest.approx(200 / 240)
+    assert timing["speedup_run_count"] == 2
+    comparison = (output / "report" / "comparison.html").read_text(encoding="utf-8")
+    assert "total_steps:c.metrics['run.total_steps']" in comparison
+    assert "sim_time:durationMs(c.metrics['run.final_sim_time_ms'])" in comparison
+    assert "wall_time:durationMs(c.metrics['run.wall_time_ms'])" in comparison
+    assert "speed_up:" in comparison
+    comparison_page = (output / "report" / "comparison.html").read_text(encoding="utf-8")
+    assert 'id="trajectory-export"' in comparison_page
+    assert "function exportTrajectory" in comparison_page
     data = json.loads((output / "report" / "analysis_data.json").read_text(encoding="utf-8"))
-    assert data["schema_version"] == 4
+    assert data["schema_version"] == 6
     assert data["sensitivity"]["effects"]
     assert data["sensitivity"]["model_quality"]
     assert data["report_mode"] == "single"

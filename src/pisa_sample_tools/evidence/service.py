@@ -32,7 +32,14 @@ from .ingest import (
     read_trace_rows,
 )
 from .metric_status import metric_coverage
-from .models import AnalysisSpec, DatasetSpec, EvidenceError, EvidenceResult, RunRecord
+from .models import (
+    AnalysisSpec,
+    DatasetSpec,
+    EvidenceError,
+    EvidenceResult,
+    MetricBinding,
+    RunRecord,
+)
 from .plots import (
     collect_representative_axis_values,
     render_component_figures,
@@ -40,6 +47,7 @@ from .plots import (
     render_representative_cases,
     representative_case_series,
 )
+from .report_version import REPORT_BUILD_VERSION
 from .sensitivity import SensitivityResult, analyze_sensitivity, render_sensitivity_figures
 from .spec import load_analysis_spec, spec_to_dict
 from .statistics import (
@@ -144,6 +152,7 @@ def build_evidence(
     experiment_outcome_rows = _experiment_outcome_rows(runs, spec)
     experiment_metric_rows = _experiment_metric_rows(runs, spec)
     experiment_performance_rows = _experiment_performance_rows(runs)
+    experiment_timing_rows = _experiment_timing_rows(runs)
     agent_geometry_rows = _agent_geometry_rows(runs)
     collision_event_rows = _collision_event_rows(runs)
     scenario_event_rows = _scenario_event_rows(runs)
@@ -158,6 +167,7 @@ def build_evidence(
         summary_dir / "experiment_execution_performance.csv",
         experiment_performance_rows,
     )
+    _write_rows(summary_dir / "experiment_timing.csv", experiment_timing_rows)
     _write_rows(summary_dir / "agent_geometry.csv", agent_geometry_rows)
     _write_rows(summary_dir / "collision_events.csv", collision_event_rows)
     _write_rows(summary_dir / "scenario_events.csv", scenario_event_rows)
@@ -324,6 +334,7 @@ def build_evidence(
         experiment_outcome_rows=experiment_outcome_rows,
         experiment_metric_rows=experiment_metric_rows,
         experiment_performance_rows=experiment_performance_rows,
+        experiment_timing_rows=experiment_timing_rows,
         pairing_rows=paired.pairing_summary,
         paired_summary_rows=paired.paired_summary,
         component_rows=component_rows,
@@ -385,6 +396,7 @@ def build_evidence(
     manifest = {
         "tool": "pisa-analysis-tools",
         "schema_version": 2,
+        "report_build_version": REPORT_BUILD_VERSION,
         "generated_at": datetime.now(UTC).isoformat(),
         "run_count": len(runs),
         "warning_count": len(warnings),
@@ -783,17 +795,47 @@ def _metric_rows(runs: list[RunRecord], spec: AnalysisSpec) -> list[dict[str, An
     for name, binding in spec.metrics.items():
         values = [value for run in runs if (value := metric_value(run, spec, name)) is not None]
         summary = numeric_summary(values)
+        unavailable = _metric_unavailable_coverage(runs, binding)
         rows.append(
             {
                 "metric": name,
                 "source": binding.summary,
                 "label": binding.label,
                 "unit": binding.unit,
-                "missing": len(runs) - len(values),
+                "not_applicable": unavailable["not_applicable"],
+                "not_applicable_reasons": unavailable["not_applicable_reasons"],
+                "missing": len(runs) - len(values) - unavailable["not_applicable"],
                 **summary,
             }
         )
     return rows
+
+
+def _metric_unavailable_coverage(
+    runs: list[RunRecord], binding: MetricBinding
+) -> dict[str, Any]:
+    """Separate intentional frame-level N/A values from unavailable data."""
+    not_applicable = 0
+    reasons: Counter[str] = Counter()
+    if binding.summary is None or binding.series is None:
+        return {"not_applicable": 0, "not_applicable_reasons": {}}
+    for run in runs:
+        if binding.summary in run.metrics:
+            continue
+        coverage = metric_coverage(read_trace_rows(run.frame_metrics_path), binding.series)
+        if (
+            coverage["not_applicable"]
+            and not coverage["valid"]
+            and not coverage["missing"]
+            and not coverage["invalid"]
+        ):
+            not_applicable += 1
+            # A run may contain more than one frame-level N/A reason.
+            reasons.update(coverage["status_counts"].keys())
+    return {
+        "not_applicable": not_applicable,
+        "not_applicable_reasons": dict(sorted(reasons.items())),
+    }
 
 
 def _parameter_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
@@ -877,6 +919,51 @@ def _experiment_performance_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
         for experiment_id, members in _experiment_groups(runs).items()
         for row in _performance_rows(members)
     ]
+
+
+def _experiment_timing_rows(runs: list[RunRecord]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for experiment_id, members in _experiment_groups(runs).items():
+        steps = [
+            value
+            for run in members
+            if (value := as_float(run.metrics.get("run.total_steps"))) is not None
+        ]
+        sim_times = [
+            value
+            for run in members
+            if (value := as_float(run.metrics.get("run.final_sim_time_ms"))) is not None
+        ]
+        wall_times = [
+            value
+            for run in members
+            if (value := as_float(run.metrics.get("run.wall_time_ms"))) is not None
+        ]
+        paired_times = [
+            (sim_time, wall_time)
+            for run in members
+            if (sim_time := as_float(run.metrics.get("run.final_sim_time_ms"))) is not None
+            and (wall_time := as_float(run.metrics.get("run.wall_time_ms"))) is not None
+        ]
+        paired_sim_time = sum(item[0] for item in paired_times)
+        paired_wall_time = sum(item[1] for item in paired_times)
+        rows.append(
+            {
+                "experiment_id": experiment_id,
+                "run_count": len(members),
+                "total_steps": sum(steps),
+                "total_sim_time_ms": sum(sim_times),
+                "total_wall_time_ms": sum(wall_times),
+                "speedup": paired_sim_time / paired_wall_time
+                if paired_wall_time > 0
+                else None,
+                "steps_run_count": len(steps),
+                "sim_time_run_count": len(sim_times),
+                "wall_time_run_count": len(wall_times),
+                "speedup_run_count": len(paired_times),
+            }
+        )
+    return rows
 
 
 def _experiment_groups(runs: list[RunRecord]) -> dict[str, list[RunRecord]]:
@@ -1063,6 +1150,7 @@ def _build_report_payload(
     experiment_outcome_rows: list[dict[str, Any]],
     experiment_metric_rows: list[dict[str, Any]],
     experiment_performance_rows: list[dict[str, Any]],
+    experiment_timing_rows: list[dict[str, Any]],
     pairing_rows: list[dict[str, Any]],
     paired_summary_rows: list[dict[str, Any]],
     component_rows: list[dict[str, Any]],
@@ -1092,13 +1180,14 @@ def _build_report_payload(
     experiment_ids = list(input_manifest.get("experiments") or _experiment_groups(runs))
     report_mode = "compare" if len(experiment_ids) > 1 else "single"
     payload = {
-        "schema_version": 4,
+        "schema_version": 6,
         "report_mode": report_mode,
         "experiments": _experiment_descriptors(input_manifest, runs),
         "experiment_summaries": {
             "outcomes": experiment_outcome_rows,
             "metrics": experiment_metric_rows,
             "performance": experiment_performance_rows,
+            "timing": experiment_timing_rows,
         },
         "summary": {
             "run_count": len(runs),
@@ -1662,6 +1751,22 @@ def _insight_payload(
                 )
             )
     for metric in payload["metrics"]:
+        if metric.get("metric") == "min_ttc" and metric.get("not_applicable"):
+            not_applicable = int(metric["not_applicable"])
+            reasons = metric.get("not_applicable_reasons") or {}
+            insights.append(
+                _insight(
+                    "not-applicable-min-ttc",
+                    "info",
+                    "Minimum TTC is conditionally applicable",
+                    f"{not_applicable} runs have no TTC because frame-level applicability conditions were not met.",
+                    {
+                        "not_applicable": not_applicable,
+                        "run_count": run_count,
+                        "frame_status_reasons": reasons,
+                    },
+                )
+            )
         if metric.get("metric") == "min_ttc" and metric.get("missing"):
             missing = int(metric["missing"])
             if run_count and missing / run_count >= 0.1:
@@ -1693,13 +1798,23 @@ def _insight_payload(
             )
         if pairs:
             pair = pairs[0]
+            hidden_parameters = sorted(
+                set(pair.get("nonfailure_params", {}))
+                - {boundary["x_param"], boundary["y_param"]}
+            )
+            projected = bool(hidden_parameters)
             insights.append(
                 _insight(
                     f"boundary-pair-{key}",
-                    "high",
-                    f"Nearest safe/failure boundary pair in {boundary['x_param']} vs {boundary['y_param']}",
-                    f"{pair['nonfailure_run_id']} and {pair['failure_run_id']} are close in normalized parameter space.",
-                    {"pair": key, **pair},
+                    "medium" if projected else "high",
+                    f"Nearest projected safe/failure pair in {boundary['x_param']} vs {boundary['y_param']}",
+                    f"{pair['nonfailure_run_id']} and {pair['failure_run_id']} are close on the displayed axes; hidden parameters may differ.",
+                    {
+                        "pair": key,
+                        "projected": projected,
+                        "hidden_parameters": hidden_parameters,
+                        **pair,
+                    },
                     [
                         {
                             "type": "select_runs",
@@ -1969,7 +2084,10 @@ def _write_html_report(
     .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
     .card { background:white; border:1px solid var(--line); border-radius:8px; padding:12px; }
     .card b { display:block; margin-top:4px; font-size:24px; }
-    .layout { display:grid; grid-template-columns:minmax(0,1fr) 380px; gap:14px; align-items:start; }
+    .layout { display:grid; grid-template-columns:minmax(0,2fr) minmax(280px,1fr); gap:14px; align-items:start; }
+    .scenario-info { display:grid; gap:10px; }
+    .scenario-info dl { display:grid; grid-template-columns:auto 1fr; gap:5px 10px; margin:0; font-size:13px; }
+    .scenario-info dt { color:var(--muted); } .scenario-info dd { margin:0; overflow-wrap:anywhere; }
     canvas { width:100%; min-height:620px; display:block; background:#101820; border:1px solid var(--line); border-radius:6px; }
     .panel { border:1px solid var(--line); border-radius:8px; padding:12px; background:#f8fafc; }
     .filters { display:flex; flex-wrap:wrap; gap:8px 14px; margin:8px 0; }
@@ -1986,6 +2104,8 @@ def _write_html_report(
     .figure { border:1px solid var(--line); border-radius:8px; padding:10px; background:white; }
     .figure img { width:100%; height:auto; }
     .inline { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; align-items:end; }
+    .iteration-controls { display:grid; grid-template-columns:auto auto minmax(110px,1fr) minmax(110px,1fr); gap:6px; align-items:end; }
+    .iteration-controls button { min-width:38px; }
     .segmented { display:inline-flex; border:1px solid #aab7c4; border-radius:6px; overflow:hidden; }
     .segmented button { min-height:32px; border:0; border-radius:0; background:white; color:var(--ink); }
     .segmented button.active { background:var(--navy); color:white; }
@@ -2042,6 +2162,8 @@ def _write_html_report(
     <label>Z axis<select id="z-select"></select></label>
     <label>Color by<select id="color-select"></select></label>
     <label>View<select id="view-select"><option value="scatter">scatter</option><option value="heatmap">heatmap</option><option value="3d">3D</option></select></label>
+    <label>Aspect ratio<select id="aspect-select"><option value="fit">Fit to window</option><option value="square">Square plot</option><option value="equal" selected>1:1 data scale</option></select></label>
+    <label>Chart background<select id="background-select"><option value="dark">Dark</option><option value="light">Light</option></select></label>
     <label><span>Overlay</span><select id="overlay-select"><option value="none">none</option><option value="boundary">boundary</option><option value="uncertainty">uncertainty</option></select></label>
   </div>
   <section id="overview">
@@ -2062,25 +2184,32 @@ def _write_html_report(
     <div class="filters"><strong>Safety filters</strong><span id="safety-filters"></span></div>
     <div class="filters"><strong>Status filters</strong><span id="status-filters"></span></div>
     <div id="space-legend" class="legend" aria-label="Chart legend"></div>
+    <div id="selection-summary" class="cards"></div>
     <div class="layout">
       <canvas id="space-canvas"></canvas>
       <aside class="panel">
-        <h3>Selected Set</h3>
-        <div id="selection-summary" class="cards"></div>
-        <button id="download-filtered" type="button">Download Filtered CSV</button>
-        <h3>Run Detail</h3>
+        <h3>Iteration Playback</h3>
+        <div class="iteration-controls"><button id="iteration-play" type="button">▶</button><button id="iteration-restart" class="secondary" type="button">↺</button><label>Timing mode<select id="iteration-timing-mode"><option value="rate">Points / second</option><option value="duration">Total duration</option></select></label><label id="iteration-value-label">Points / second<input id="iteration-timing-value" type="number" min="0.01" step="any" value="100" list="iteration-rate-presets"></label></div>
+        <datalist id="iteration-rate-presets"><option value="10"><option value="50"><option value="100"><option value="200"><option value="500"><option value="1000"></datalist><datalist id="iteration-duration-presets"><option value="2"><option value="5"><option value="10"><option value="20"><option value="30"><option value="60"></datalist>
+        <input id="iteration-progress" type="range" min="0" max="0" value="0" style="width:100%"><div id="iteration-label" class="muted">Available in scatter view.</div>
+        <div class="inline"><label>Export<select id="iteration-format"><option value="mp4">MP4</option><option value="gif">GIF</option></select></label><button id="iteration-export" type="button">Export animation</button></div>
+        <h3>Scatter Export</h3>
+        <div class="inline"><label>Format<select id="scatter-export-format"><option value="png">PNG · current theme</option><option value="publication-png">Publication PNG · white 2×</option><option value="csv">CSV</option></select></label><label>Crop<select id="scatter-export-crop"><option value="tight">Tight to plot</option><option value="full">Full canvas</option></select></label></div>
+        <div class="filters" aria-label="Scatter export layers"><label><input id="scatter-export-axes" type="checkbox" checked> Axes &amp; values</label><label><input id="scatter-export-labels" type="checkbox" checked> Parameter labels</label><label><input id="scatter-export-grid" type="checkbox" checked> Grid</label></div>
+        <button id="scatter-export" type="button">Export current view</button>
+        <h3>Concrete Scenario</h3>
         <label>Run<select id="run-select"></select></label>
         <a id="compare-run" class="button-link" href="comparison.html" hidden>Analyze concrete run</a>
         <input id="search" placeholder="Filter by run id, parameter, component, outcome, or reason">
         <div id="group-inspector" hidden></div>
-        <pre id="detail">Click a point or choose a run.</pre>
+        <div id="detail" class="scenario-info"><p class="muted">Click a point or choose a run.</p></div>
       </aside>
     </div>
   </section>
   <section id="sensitivity">
     <h2>Parameter Sensitivity</h2>
     <p class="muted">Observed associations and held-out surrogate-model sensitivity; these are not causal effects or formal Sobol indices.</p>
-    <div id="sensitivity-not-generated" class="notice" hidden><strong>Sensitivity analysis was not generated for this bundle.</strong><p>Run the command below from the report directory, then reload this page.</p><button id="copy-sensitivity-command" type="button">Copy generation command</button><pre id="sensitivity-command">uv run pisa-analysis sensitivity --bundle ..</pre></div>
+    <div id="sensitivity-not-generated" class="notice" hidden><strong>Sensitivity analysis was not generated for this bundle.</strong></div><button id="run-sensitivity" type="button">Update sensitivity analysis</button><div id="sensitivity-update-status" class="axis-info"></div>
     <div class="inline">
       <label>Experiment<select id="sensitivity-experiment"></select></label>
       <label>Target<select id="sensitivity-target"></select></label>
@@ -2179,10 +2308,11 @@ def _write_html_report(
   const concreteScenarios = payload.comparison?.concrete_scenarios || [];
   const numericParams = payload.parameters.filter(item => item.numeric).map(item => item.parameter);
   const metricNames = payload.metrics.map(item => item.metric);
-  const state = { projected: [], selectedIds: new Set(), draftRuns: null, comparePoints: [] };
+  const state = { projected: [], selectedIds: new Set(), draftRuns: null, comparePoints: [], plotBounds:null, exportOptions:null };
+  const iterationState={points:[],index:0,timer:null,playing:false,carry:0,active:false};
   const els = {
     pair: document.getElementById('pair-select'), x: document.getElementById('x-select'), y: document.getElementById('y-select'), z: document.getElementById('z-select'),
-    color: document.getElementById('color-select'), view: document.getElementById('view-select'), overlay: document.getElementById('overlay-select'),
+    color: document.getElementById('color-select'), view: document.getElementById('view-select'), aspect: document.getElementById('aspect-select'), background: document.getElementById('background-select'), overlay: document.getElementById('overlay-select'),
     canvas: document.getElementById('space-canvas'), detail: document.getElementById('detail'), runSelect: document.getElementById('run-select'), search: document.getElementById('search'),
     mode: document.getElementById('explorer-mode'), reference: document.getElementById('reference-experiment'), left: document.getElementById('left-experiment'), right: document.getElementById('right-experiment'), deltaMetric: document.getElementById('delta-metric'),
     experimentFilters: document.getElementById('experiment-filters'), legend: document.getElementById('space-legend'),
@@ -2200,6 +2330,13 @@ def _write_html_report(
   const caseCtx = caseEls.canvas.getContext('2d');
   const caseState = {mode:'semantic', hoverIndex:null};
   const semanticColors = {success:'#16a34a', failure:'#dc2626', invalid:'#2563eb', execution_error:'#7f1d1d', unclassified:'#6b7280', safe:'#16a34a', near_critical:'#f59e0b', unknown:'#6b7280', all_success:'#16a34a', all_failure:'#991b1b', all_invalid:'#6b7280', disagreement:'#f59e0b', mixed_with_invalid:'#7c3aed'};
+  const ttcStops = [
+    {value:0,label:'Collision',color:[127,29,29]},
+    {value:1,label:'Critical',color:[220,38,38]},
+    {value:2,label:'Near-critical',color:[249,115,22]},
+    {value:5,label:'Caution',color:[250,204,21]},
+    {value:10,label:'Lower immediate risk',color:[163,230,53]},
+  ];
   const palette = ['#7c3aed','#f59e0b','#0891b2','#be123c','#4b5563','#84cc16','#c026d3','#0f766e'];
   const experimentColors = new Map(experiments.map((item,index) => [item.id, palette[index % palette.length]]));
   const transitionColors = {success__success:'#16a34a',failure__failure:'#991b1b',success__failure:'#ef4444',failure__success:'#0284c7',success__invalid:'#a78bfa',failure__invalid:'#7c3aed',invalid__success:'#14b8a6',invalid__failure:'#f97316',invalid__invalid:'#6b7280',unmatched:'#cbd5e1'};
@@ -2209,6 +2346,8 @@ def _write_html_report(
   function text(value) { return value === null || value === undefined ? '' : String(value); }
   function number(value) { const n = Number(value); return Number.isFinite(n) ? n : null; }
   function fmt(value) { const n = Number(value); return Number.isFinite(n) ? Number(n.toPrecision(4)).toString() : text(value); }
+  function durationMs(value) { const ms=number(value);if(ms===null)return 'N/A';const seconds=ms/1000;if(seconds<60)return `${fmt(seconds)} s`;const minutes=seconds/60;if(minutes<60)return `${fmt(minutes)} min`;return `${fmt(minutes/60)} h`; }
+  function experimentTimingRows() {const provided=payload.experiment_summaries?.timing||[];if(provided.length)return provided;const groups=new Map();runs.forEach(run=>{const row=groups.get(run.experiment_id)||{experiment_id:run.experiment_id,run_count:0,total_steps:0,total_sim_time_ms:0,total_wall_time_ms:0,paired_sim_time_ms:0,paired_wall_time_ms:0,speedup_run_count:0};row.run_count++;const steps=number(run.metrics?.['run.total_steps']),sim=number(run.metrics?.['run.final_sim_time_ms']),wall=number(run.metrics?.['run.wall_time_ms']);if(steps!==null)row.total_steps+=steps;if(sim!==null)row.total_sim_time_ms+=sim;if(wall!==null)row.total_wall_time_ms+=wall;if(sim!==null&&wall!==null){row.paired_sim_time_ms+=sim;row.paired_wall_time_ms+=wall;row.speedup_run_count++;}groups.set(run.experiment_id,row);});return [...groups.values()].map(row=>({...row,speedup:row.paired_wall_time_ms>0?row.paired_sim_time_ms/row.paired_wall_time_ms:null})); }
   function addOptions(select, values, includeNone=false) {
     select.textContent = '';
     if (includeNone) select.appendChild(new Option('(none)', ''));
@@ -2244,7 +2383,10 @@ def _write_html_report(
     if (key === 'termination_reason') return run.termination_reason || 'unknown';
     if (key === 'status') return run.status || 'unknown';
     if (key.startsWith('param:')) return run.params[key.slice(6)];
-    if (key.startsWith('metric:')) return run.metrics[key.slice(7)];
+    if (key.startsWith('metric:')) {
+      const metric = payload.metrics.find(item => item.metric === key.slice(7));
+      return run.metrics[metric?.source || key.slice(7)];
+    }
     if (key.startsWith('metadata:')) return run.metadata[key.slice(9)];
     return run[key];
   }
@@ -2295,10 +2437,13 @@ def _write_html_report(
     const key = els.color.value;
     const numericValues = rows.map(run => numericField(run, key));
     const present = numericValues.filter(value => value !== null);
+    if (key === 'metric:min_ttc' && present.length) {
+      return {mode:'ttc_gradient',numericValues,unavailable:numericValues.length-present.length};
+    }
     if ((key.startsWith('param:') || key.startsWith('metric:')) && present.length) {
       let min = Math.min(...present), max = Math.max(...present);
       if (min === max) { min -= 0.5; max += 0.5; }
-      return {mode:'continuous', numericValues, min, max};
+      return {mode:'continuous', numericValues, min, max, unavailable:numericValues.filter(value => value === null).length};
     }
     const values = rows.map(run => text(fieldValue(run, key) || 'unknown'));
     const keys = unique(values);
@@ -2306,6 +2451,13 @@ def _write_html_report(
     return {mode:'categorical', values, map};
   }
   function colorFor(colors, index) {
+    if (colors.mode === 'ttc_gradient') {
+      const value = colors.numericValues[index];
+      if (value === null) return '#9ca3af';
+      const capped=Math.max(0,Math.min(10,value));let right=ttcStops.findIndex(stop=>stop.value>=capped);if(right<0)right=ttcStops.length-1;else if(right===0)right=1;
+      const left=ttcStops[right-1],upper=ttcStops[right]||ttcStops.at(-1),t=(capped-left.value)/Math.max(upper.value-left.value,1e-9);
+      return `rgb(${left.color.map((channel,i)=>Math.round(channel+(upper.color[i]-channel)*t)).join(',')})`;
+    }
     if (colors.mode === 'continuous') {
       const value = colors.numericValues[index];
       if (value === null) return '#9ca3af';
@@ -2326,13 +2478,23 @@ def _write_html_report(
     els.canvas.height = 620 * devicePixelRatio;
     draw();
   }
-  function clearCanvas() { ctx.clearRect(0,0,els.canvas.width,els.canvas.height); ctx.fillStyle = '#101820'; ctx.fillRect(0,0,els.canvas.width,els.canvas.height); }
-  function axes(xLabel, yLabel, w, h, margin) {
-    ctx.strokeStyle = '#d7e0ea'; ctx.lineWidth = devicePixelRatio; ctx.beginPath(); ctx.moveTo(margin,h-margin); ctx.lineTo(w-margin,h-margin); ctx.moveTo(margin,margin); ctx.lineTo(margin,h-margin); ctx.stroke();
-    ctx.fillStyle = '#edf3f8'; ctx.font = `${13 * devicePixelRatio}px system-ui`; ctx.textAlign = 'center'; ctx.fillText(xLabel, w/2, h - 18 * devicePixelRatio);
-    ctx.save(); ctx.translate(18 * devicePixelRatio, h/2); ctx.rotate(-Math.PI/2); ctx.fillText(yLabel, 0, 0); ctx.restore();
+  function chartTheme(){return els.background.value==='light'?{background:'#ffffff',foreground:'#334155',grid:'rgba(100,116,139,.18)',pointStroke:'#111827'}:{background:'#101820',foreground:'#edf3f8',grid:'rgba(215,224,234,.22)',pointStroke:'#111827'};}
+  function clearCanvas() { const theme=chartTheme();ctx.clearRect(0,0,els.canvas.width,els.canvas.height);ctx.fillStyle=theme.background;ctx.fillRect(0,0,els.canvas.width,els.canvas.height); }
+  function axes(xLabel,yLabel,bounds,xDomain,yDomain) {
+    const {left,right,top,bottom}=bounds,theme=chartTheme(),options=state.exportOptions||{axes:true,labels:true,grid:true};state.plotBounds=bounds;
+    if(options.axes){ctx.strokeStyle=theme.foreground;ctx.lineWidth=devicePixelRatio;ctx.beginPath();ctx.moveTo(left,bottom);ctx.lineTo(right,bottom);ctx.moveTo(left,top);ctx.lineTo(left,bottom);ctx.stroke();}
+    ctx.fillStyle=theme.foreground;ctx.font=`${12*devicePixelRatio}px system-ui`;
+    for(let i=0;i<=5;i++){const t=i/5,x=left+t*(right-left),y=bottom-t*(bottom-top),xv=xDomain[0]+t*(xDomain[1]-xDomain[0]),yv=yDomain[0]+t*(yDomain[1]-yDomain[0]);if(options.grid){ctx.strokeStyle=theme.grid;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.moveTo(left,y);ctx.lineTo(right,y);ctx.stroke();}if(options.axes){ctx.fillStyle=theme.foreground;ctx.textAlign='center';ctx.fillText(fmt(xv),x,bottom+18*devicePixelRatio);ctx.textAlign='right';ctx.fillText(fmt(yv),left-8*devicePixelRatio,y+4*devicePixelRatio);}}
+    if(options.labels){ctx.font=`${13*devicePixelRatio}px system-ui`;ctx.textAlign='center';ctx.fillText(xLabel,(left+right)/2,bottom+42*devicePixelRatio);ctx.save();ctx.translate(left-50*devicePixelRatio,(top+bottom)/2);ctx.rotate(-Math.PI/2);ctx.fillText(yLabel,0,0);ctx.restore();}
+  }
+  function scatterBounds(w,h,margin,xDomain,yDomain) {
+    const available={left:margin,right:w-margin,top:margin,bottom:h-margin};if(els.aspect.value==='fit')return available;
+    if(els.aspect.value==='square'){const side=Math.min(available.right-available.left,available.bottom-available.top),cx=w/2,cy=h/2;return {left:cx-side/2,right:cx+side/2,top:cy-side/2,bottom:cy+side/2};}
+    const scale=Math.min((available.right-available.left)/(xDomain[1]-xDomain[0]),(available.bottom-available.top)/(yDomain[1]-yDomain[0]));const width=(xDomain[1]-xDomain[0])*scale,height=(yDomain[1]-yDomain[0])*scale,cx=w/2,cy=h/2;
+    return {left:cx-width/2,right:cx+width/2,top:cy-height/2,bottom:cy+height/2};
   }
   function draw() {
+    iterationState.active=false;
     const rows = payload.report_mode==='compare'&&els.mode.value==='explore'?filteredParameterGroups():filteredRuns();
     const xParam = els.x.value, yParam = els.y.value, zParam = els.z.value;
     clearCanvas(); state.projected = [];
@@ -2355,25 +2517,37 @@ def _write_html_report(
     if (!points.length) return;
     const w = els.canvas.width, h = els.canvas.height, margin = 70 * devicePixelRatio;
     const [xMin,xMax] = range(points.map(p => p.x)), [yMin,yMax] = range(points.map(p => p.y));
-    axes(xParam, yParam, w, h, margin);
+    const bounds=scatterBounds(w,h,margin,[xMin,xMax],[yMin,yMax]);axes(xParam,yParam,bounds,[xMin,xMax],[yMin,yMax]);
     points.forEach(point => {
-      const sx = margin + (point.x - xMin) / (xMax - xMin) * (w - 2*margin);
-      const sy = h - margin - (point.y - yMin) / (yMax - yMin) * (h - 2*margin);
-      drawMarker(sx, sy, 5.2 * devicePixelRatio, colorFor(colors, point.index), point.run.complete===false?'#f8fafc':'#102033', 0, point.run.complete===false);
+      const sx = bounds.left + (point.x - xMin) / (xMax - xMin) * (bounds.right-bounds.left);
+      const sy = bounds.bottom - (point.y - yMin) / (yMax - yMin) * (bounds.bottom-bounds.top);
+      drawMarker(sx, sy, 5.2 * devicePixelRatio, colorFor(colors, point.index), chartTheme().pointStroke, 0, point.run.complete===false);
       state.projected.push(point.run.group_id?{x:sx,y:sy,parameterGroup:point.run}:{x:sx,y:sy,run:point.run});
     });
   }
+  function stopIteration(){if(iterationState.timer)clearInterval(iterationState.timer);iterationState.timer=null;iterationState.playing=false;iterationState.carry=0;document.getElementById('iteration-play').textContent='▶';}
+  function prepareIteration(){stopIteration();if(els.view.value!=='scatter'||els.mode.value!=='explore'){iterationState.active=false;document.getElementById('iteration-label').textContent='Available in scatter view.';return false;}const rows=filteredRuns().slice().sort((a,b)=>(Number(a.scenario_id)||0)-(Number(b.scenario_id)||0)),xParam=els.x.value,yParam=els.y.value,colors=colorState(rows),raw=rows.map((run,index)=>({run,index,x:paramValue(run,xParam),y:paramValue(run,yParam)})).filter(point=>point.x!==null&&point.y!==null);if(!raw.length){iterationState.active=false;return false;}const w=els.canvas.width,h=els.canvas.height,margin=70*devicePixelRatio,[xMin,xMax]=range(raw.map(point=>point.x)),[yMin,yMax]=range(raw.map(point=>point.y)),bounds=scatterBounds(w,h,margin,[xMin,xMax],[yMin,yMax]);clearCanvas();axes(xParam,yParam,bounds,[xMin,xMax],[yMin,yMax]);renderLegend(colors);iterationState.points=raw.map(point=>({...point,sx:bounds.left+(point.x-xMin)/(xMax-xMin)*(bounds.right-bounds.left),sy:bounds.bottom-(point.y-yMin)/(yMax-yMin)*(bounds.bottom-bounds.top),color:colorFor(colors,point.index)}));iterationState.index=0;iterationState.active=true;state.projected=[];const slider=document.getElementById('iteration-progress');slider.max=iterationState.points.length;slider.value=0;updateIterationLabel();return true;}
+  function setIterationProgress(target){target=Math.max(0,Math.min(iterationState.points.length,Number(target)||0));if(target<iterationState.index){if(!prepareIteration())return;}for(let i=iterationState.index;i<target;i++){const point=iterationState.points[i];drawMarker(point.sx,point.sy,5.2*devicePixelRatio,point.color,chartTheme().pointStroke);state.projected.push({x:point.sx,y:point.sy,run:point.run});}iterationState.index=target;document.getElementById('iteration-progress').value=target;updateIterationLabel();}
+  function iterationRate(){const value=Math.max(.01,Number(document.getElementById('iteration-timing-value').value)||1);return document.getElementById('iteration-timing-mode').value==='duration'?Math.max(1,iterationState.points.length)/value:value;}
+  function updateIterationTiming(reset=true){const durationMode=document.getElementById('iteration-timing-mode').value==='duration',input=document.getElementById('iteration-timing-value'),label=document.getElementById('iteration-value-label');label.firstChild.textContent=durationMode?'Total seconds':'Points / second';input.setAttribute('list',durationMode?'iteration-duration-presets':'iteration-rate-presets');if(reset)input.value=durationMode?'5':'100';updateIterationLabel();}
+  function updateIterationLabel(){const point=iterationState.points[Math.max(0,iterationState.index-1)],duration=iterationState.points.length/iterationRate();document.getElementById('iteration-label').textContent=`Iteration ${iterationState.index} / ${iterationState.points.length}${point?' · '+point.run.run_id:''} · full animation ${fmt(duration)} s`;}
+  function toggleIteration(){if(iterationState.playing)return stopIteration();if(!iterationState.points.length||iterationState.index>=iterationState.points.length)prepareIteration();iterationState.playing=true;document.getElementById('iteration-play').textContent='Ⅱ';iterationState.timer=setInterval(()=>{iterationState.carry+=iterationRate()/20;const batch=Math.floor(iterationState.carry);iterationState.carry-=batch;if(batch)setIterationProgress(iterationState.index+batch);if(iterationState.index>=iterationState.points.length)stopIteration();},50);}
+  function restartIteration(){prepareIteration();}
   function drawMarker(x,y,r,fill,stroke,shape=0,hollow=false) {
     ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
-    ctx.fillStyle = hollow ? '#101820' : fill; ctx.globalAlpha = hollow ? 1 : 0.85; ctx.fill(); ctx.globalAlpha = 1;
-    ctx.strokeStyle = stroke; ctx.lineWidth = 2*devicePixelRatio; ctx.stroke();
+    ctx.fillStyle = hollow ? chartTheme().background : fill; ctx.globalAlpha = hollow ? 1 : 0.85; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.strokeStyle = stroke; ctx.lineWidth = 0.65*devicePixelRatio; ctx.stroke();
   }
   function renderLegend(colors) {
     const selected = [...selectedExperiments()];
     const experimentItems = selected.map(id => `<span class="legend-item"><i class="swatch" style="background:transparent;border-color:${experimentColors.get(id) || '#64748b'}"></i>${escapeHtml(id)}</span>`).join('');
     let valueItems = '';
-    if (colors.mode === 'continuous') {
-      valueItems = `<span>${escapeHtml(els.color.value)}: ${fmt(colors.min)} to ${fmt(colors.max)}</span>`;
+    if (colors.mode === 'ttc_gradient') {
+      valueItems = `<span style="display:inline-block;width:180px;height:12px;border-radius:6px;background:linear-gradient(90deg,#7f1d1d,#dc2626 10%,#f97316 20%,#facc15 50%,#a3e635)"></span><span>0 collision · 1 critical · 2 near-critical · 5 caution · ≥10 s lower immediate risk</span>`;
+      if (colors.unavailable) valueItems += `<span class="legend-item"><i class="swatch" style="background:#9ca3af;border-color:#9ca3af"></i>N/A (${colors.unavailable})</span>`;
+    } else if (colors.mode === 'continuous') {
+      const unavailable = colors.unavailable ? `<span class="legend-item"><i class="swatch" style="background:#9ca3af;border-color:#9ca3af"></i>N/A (${colors.unavailable})</span>` : '';
+      valueItems = `<span>${escapeHtml(els.color.value)}: ${fmt(colors.min)} to ${fmt(colors.max)}</span>${unavailable}`;
     } else {
       valueItems = [...colors.map.entries()].map(([label,color]) => `<span class="legend-item"><i class="swatch" style="background:${color};border-color:${color}"></i>${escapeHtml(label)}</span>`).join('');
     }
@@ -2402,12 +2576,12 @@ def _write_html_report(
     }
     const w=els.canvas.width,h=els.canvas.height,margin=70*devicePixelRatio;
     const [xMin,xMax]=range(points.map(item=>item.x)),[yMin,yMax]=range(points.map(item=>item.y));
-    axes(xParam,yParam,w,h,margin);
+    const bounds=scatterBounds(w,h,margin,[xMin,xMax],[yMin,yMax]);axes(xParam,yParam,bounds,[xMin,xMax],[yMin,yMax]);
     const used = new Set();
     let maxAbs=0;
     if (els.mode.value === 'metric_delta') points.forEach(({point}) => { const value=number(point.metric_deltas?.[els.deltaMetric.value]?.delta); if (value !== null) maxAbs=Math.max(maxAbs,Math.abs(value)); });
     points.forEach(({point,x,y}) => {
-      const sx=margin+(x-xMin)/(xMax-xMin)*(w-2*margin),sy=h-margin-(y-yMin)/(yMax-yMin)*(h-2*margin);
+      const sx=bounds.left+(x-xMin)/(xMax-xMin)*(bounds.right-bounds.left),sy=bounds.bottom-(y-yMin)/(yMax-yMin)*(bounds.bottom-bounds.top);
       let color='#94a3b8',label='unmatched';
       if (point.matched && els.mode.value === 'outcome_compare') { label=point.transition; color=transitionColors[label] || '#94a3b8'; }
       if (point.matched && els.mode.value === 'metric_delta') { const delta=number(point.metric_deltas?.[els.deltaMetric.value]?.delta); label=delta === null ? 'missing' : 'delta'; color=deltaColor(delta,maxAbs); }
@@ -2434,9 +2608,9 @@ def _write_html_report(
     const [xMin,xMax] = range(points.map(p => p.x)), [yMin,yMax] = range(points.map(p => p.y));
     const cells = Array.from({length: bins*bins}, () => ({n:0, f:0}));
     points.forEach(p => { const ix = Math.min(bins-1, Math.max(0, Math.floor((p.x-xMin)/(xMax-xMin)*bins))); const iy = Math.min(bins-1, Math.max(0, Math.floor((p.y-yMin)/(yMax-yMin)*bins))); cells[iy*bins+ix].n++; if (p.fail) cells[iy*bins+ix].f++; });
-    const cw = (w-2*margin)/bins, ch = (h-2*margin)/bins;
-    cells.forEach((cell, index) => { const ix = index % bins, iy = Math.floor(index/bins), rate = cell.n ? cell.f/cell.n : 0; ctx.fillStyle = cell.n ? `rgba(220,38,38,${0.15 + rate*0.75})` : 'rgba(148,163,184,0.08)'; ctx.fillRect(margin + ix*cw, h-margin-(iy+1)*ch, cw+1, ch+1); });
-    axes(xParam, yParam, w, h, margin);
+    const bounds=scatterBounds(w,h,margin,[xMin,xMax],[yMin,yMax]),cw=(bounds.right-bounds.left)/bins,ch=(bounds.bottom-bounds.top)/bins;
+    cells.forEach((cell, index) => { const ix = index % bins, iy = Math.floor(index/bins), rate = cell.n ? cell.f/cell.n : 0; ctx.fillStyle = cell.n ? `rgba(220,38,38,${0.15 + rate*0.75})` : 'rgba(148,163,184,0.08)'; ctx.fillRect(bounds.left + ix*cw, bounds.bottom-(iy+1)*ch, cw+1, ch+1); });
+    axes(xParam,yParam,bounds,[xMin,xMax],[yMin,yMax]);
   }
   function drawHeatmapFacets(rows,xParam,yParam,groups) {
     const points=rows.map(run=>({run,x:paramValue(run,xParam),y:paramValue(run,yParam),fail:(run.draft_outcome || run.normalized_outcome)==='failure'})).filter(p=>p.x!==null&&p.y!==null);
@@ -2481,8 +2655,9 @@ def _write_html_report(
     if (!points.length) return;
     const w = els.canvas.width, h = els.canvas.height, margin = 70 * devicePixelRatio;
     const [xMin,xMax] = range(points.map(p => p.x)), [yMin,yMax] = range(points.map(p => p.y));
-    const sx = x => margin + (x-xMin)/(xMax-xMin)*(w-2*margin);
-    const sy = y => h - margin - (y-yMin)/(yMax-yMin)*(h-2*margin);
+    const bounds=scatterBounds(w,h,margin,[xMin,xMax],[yMin,yMax]);
+    const sx = x => bounds.left + (x-xMin)/(xMax-xMin)*(bounds.right-bounds.left);
+    const sy = y => bounds.bottom - (y-yMin)/(yMax-yMin)*(bounds.bottom-bounds.top);
     boundaries.forEach(({experimentId,boundary}) => {
       if (!boundary.available) return;
       const color=experimentColors.get(experimentId) || '#facc15';ctx.strokeStyle=color;ctx.lineWidth=2*devicePixelRatio;ctx.setLineDash([6*devicePixelRatio,5*devicePixelRatio]);
@@ -2501,7 +2676,10 @@ def _write_html_report(
   }
   function showRun(run) {
     document.getElementById('group-inspector').hidden=true;els.detail.hidden=false;
-    els.detail.textContent = JSON.stringify(run || {}, null, 2);
+    if(!run){els.detail.innerHTML='<p class="muted">No scenario selected.</p>';return;}
+    const metricRows=payload.metrics.map(metric=>({metric:metric.label||metric.metric,value:run.metrics?.[metric.source],unit:metric.unit||''})).filter(row=>row.value!==null&&row.value!==undefined);
+    const steps=number(run.metrics?.['run.total_steps']),simTime=run.metrics?.['run.final_sim_time_ms'],wallTime=run.metrics?.['run.wall_time_ms'],speedup=number(run.metrics?.['run.speedup']);
+    els.detail.innerHTML=`<dl><dt>Iteration</dt><dd>${escapeHtml(run.scenario_id||run.sample_id||run.run_id)}</dd><dt>Run ID</dt><dd>${escapeHtml(run.run_id)}</dd><dt>Outcome</dt><dd>${escapeHtml(run.normalized_outcome)}</dd><dt>Safety</dt><dd>${escapeHtml(run.safety_region)}</dd><dt>Termination</dt><dd>${escapeHtml(run.termination_reason||'—')}</dd><dt>Total steps</dt><dd>${steps===null?'N/A':escapeHtml(fmt(steps))}</dd><dt>Simulation time</dt><dd>${escapeHtml(durationMs(simTime))}</dd><dt>Wall time</dt><dd>${escapeHtml(durationMs(wallTime))}</dd><dt>Speed-up</dt><dd>${speedup===null?'N/A':escapeHtml(fmt(speedup))+'×'}</dd></dl><h3>Parameters</h3>${table(Object.entries(run.params||{}).map(([parameter,value])=>({parameter,value})),50)}<h3>Safety metrics</h3>${table(metricRows,20)}`;
     if (run) els.runSelect.value = run.run_id;
     const compare = document.getElementById('compare-run');
     compare.hidden = !run?.comparison_group_id;
@@ -2708,9 +2886,10 @@ def _write_html_report(
     document.getElementById('summary-cards').innerHTML = cards([{label:'Runs', value:s.run_count}, {label:'Experiments', value:s.experiment_count}, {label:'Parameters', value:s.parameter_count}, {label:'Warnings', value:s.warning_count}]);
     document.getElementById('outcome-table').innerHTML = table(payload.report_mode === 'compare' ? payload.experiment_summaries.outcomes : s.outcomes);
     document.getElementById('metric-table').innerHTML = table(payload.report_mode === 'compare' ? payload.experiment_summaries.metrics : payload.metrics);
-    const sensitivityMissing=!payload.sensitivity?.generated;document.getElementById('sensitivity-not-generated').hidden=!sensitivityMissing;document.getElementById('copy-sensitivity-command').addEventListener('click',async()=>{const command=document.getElementById('sensitivity-command').textContent;try{await navigator.clipboard.writeText(command);document.getElementById('copy-sensitivity-command').textContent='Copied';}catch(_error){document.getElementById('sensitivity-command').focus();}});
-    document.getElementById('experiment-cards').innerHTML = experiments.map(item=>{const metadata=item.metadata||{},fields=[['AV',item.av],['Simulator',item.simulator],['Sampler',item.sampler],['Scenario',metadata.logical_scenario_name||metadata.scenario_name],['Map',metadata.map_name],['Repeat',metadata.repeat_id],['Seed',metadata.seed],['Runner',metadata.runner_version]].filter(([,value])=>value!==null&&value!==undefined&&value!=='');return `<article class="card"><span class="muted">Dataset</span><b style="font-size:18px">${escapeHtml(item.label||item.id)}</b><p>${fields.map(([label,value])=>`<span class="muted">${label}:</span> ${escapeHtml(value)}`).join('<br>')}</p><strong>${item.run_count} runs</strong></article>`;}).join('')||'<p class="muted">No experiment descriptors available.</p>';
-    document.getElementById('case-table').innerHTML = table(payload.representative_cases);
+    const sensitivityMissing=!payload.sensitivity?.generated;document.getElementById('sensitivity-not-generated').hidden=!sensitivityMissing;
+    const timingByExperiment=new Map(experimentTimingRows().map(row=>[row.experiment_id,row]));
+    document.getElementById('experiment-cards').innerHTML = experiments.map(item=>{const metadata=item.metadata||{},timing=timingByExperiment.get(item.id)||{},fields=[['AV',item.av],['Simulator',item.simulator],['Sampler',item.sampler],['Scenario',metadata.logical_scenario_name||metadata.scenario_name],['Map',metadata.map_name],['Repeat',metadata.repeat_id],['Seed',metadata.seed],['Runner',metadata.runner_version]].filter(([,value])=>value!==null&&value!==undefined&&value!=='');const coverage=`${timing.speedup_run_count??0} / ${item.run_count}`;return `<article class="card"><span class="muted">Dataset</span><b style="font-size:18px">${escapeHtml(item.label||item.id)}</b><p>${fields.map(([label,value])=>`<span class="muted">${label}:</span> ${escapeHtml(value)}`).join('<br>')}</p><strong>${item.run_count} runs</strong><p><span class="muted">Total steps:</span> ${escapeHtml(fmt(timing.total_steps))}<br><span class="muted">Total sim time:</span> ${escapeHtml(durationMs(timing.total_sim_time_ms))}<br><span class="muted">Total wall time:</span> ${escapeHtml(durationMs(timing.total_wall_time_ms))}<br><span class="muted">Speed-up:</span> ${timing.speedup===null||timing.speedup===undefined?'N/A':escapeHtml(fmt(timing.speedup))+'×'}<br><span class="muted">Timing coverage:</span> ${escapeHtml(coverage)} runs</p></article>`;}).join('')||'<p class="muted">No experiment descriptors available.</p>';
+    document.getElementById('case-table').innerHTML = `<div class="cards">${(payload.representative_cases||[]).map(item=>{const run=runs.find(candidate=>candidate.run_id===item.run_id),group=run?.comparison_group_id;return `<article class="card"><b style="font-size:16px">${escapeHtml(item.case_type||item.case)}</b><p>${escapeHtml(item.run_id)}</p><p class="muted">${escapeHtml(item.selection_reason||item.reason||'')}</p>${group?`<a class="button-link" href="comparison.html?group=${encodeURIComponent(group)}">Open visualization</a>`:'<span class="muted">Visualization unavailable</span>'}</article>`}).join('')}</div>`;
     document.getElementById('component-table').innerHTML = table(payload.comparison.component_comparison);
     document.getElementById('transition-table').innerHTML = table(payload.comparison.outcome_transition);
     document.getElementById('paired-table').innerHTML = table(payload.comparison.paired_summary);
@@ -2792,14 +2971,42 @@ def _write_html_report(
     const blob = new Blob([lines.join('\\n')], {type:'text/csv'});
     const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'filtered_runs.csv'; link.click(); URL.revokeObjectURL(link.href);
   }
+  function scatterExportOptions(){return {crop:document.getElementById('scatter-export-crop').value,axes:document.getElementById('scatter-export-axes').checked,labels:document.getElementById('scatter-export-labels').checked,grid:document.getElementById('scatter-export-grid').checked};}
+  function scatterExportRect(options=scatterExportOptions()){if(options.crop==='full')return {left:0,top:0,width:els.canvas.width,height:els.canvas.height};const bounds=state.plotBounds;if(!bounds)return null;const leftPad=options.labels?64:options.axes?56:8,bottomPad=options.labels?56:options.axes?30:8,rightPad=options.axes?56:8,left=Math.max(0,bounds.left-leftPad*devicePixelRatio),top=Math.max(0,bounds.top-8*devicePixelRatio),right=Math.min(els.canvas.width,bounds.right+rightPad*devicePixelRatio),bottom=Math.min(els.canvas.height,bounds.bottom+bottomPad*devicePixelRatio);return {left,top,width:right-left,height:bottom-top};}
+  function downloadCanvasRegion(rect,scale,filename){const output=document.createElement('canvas');output.width=Math.max(1,Math.round(rect.width*scale));output.height=Math.max(1,Math.round(rect.height*scale));const outputCtx=output.getContext('2d');outputCtx.imageSmoothingEnabled=true;outputCtx.imageSmoothingQuality='high';outputCtx.drawImage(els.canvas,rect.left,rect.top,rect.width,rect.height,0,0,output.width,output.height);output.toBlob(blob=>{if(!blob)return;const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=filename;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);},'image/png');}
+  function exportScatter(){
+    const format=document.getElementById('scatter-export-format').value,xParam=els.x.value,yParam=els.y.value,rows=(iterationState.active?iterationState.points.slice(0,iterationState.index).map(point=>point.run):filteredRuns()).filter(run=>paramValue(run,xParam)!==null&&paramValue(run,yParam)!==null);
+    if(format==='csv'){const colorKey=els.color.value,columns=['run_id','iteration',xParam,yParam,'color_by','color_value'],escapeCsv=value=>'"'+text(value).replace(/"/g,'""')+'"',lines=[columns.map(escapeCsv).join(',')];rows.forEach(run=>lines.push([run.run_id,run.scenario_id,paramValue(run,xParam),paramValue(run,yParam),colorKey,fieldValue(run,colorKey)].map(escapeCsv).join(',')));const blob=new Blob([lines.join('\\n')],{type:'text/csv'}),link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`scatter-${xParam}-vs-${yParam}.csv`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);return;}
+    const previousBackground=els.background.value,iterationProgress=iterationState.active?iterationState.index:null,options=scatterExportOptions(),publication=format==='publication-png';state.exportOptions=options;if(publication)els.background.value='light';if(iterationProgress===null)draw();else{prepareIteration();setIterationProgress(iterationProgress);}const rect=scatterExportRect(options);if(rect)downloadCanvasRegion(rect,publication?2:1,`scatter-${xParam}-vs-${yParam}${publication?'-publication':''}.png`);state.exportOptions=null;els.background.value=previousBackground;if(iterationProgress===null)draw();else{prepareIteration();setIterationProgress(iterationProgress);}
+  }
+  function builderToken(){const parts=location.pathname.split('/').filter(Boolean);return ['library','reports'].includes(parts[0])?parts[1]:null;}
+  function libraryReportId(){const parts=location.pathname.split('/').filter(Boolean);return parts[0]==='library'?parts[2]:null;}
+  async function updateSensitivityOnline(){const token=builderToken(),reportId=libraryReportId(),button=document.getElementById('run-sensitivity'),status=document.getElementById('sensitivity-update-status');if(!token||!reportId)return alert('Open this report from the Report Browser library to update sensitivity online.');button.disabled=true;status.textContent='Starting sensitivity update…';try{const response=await fetch(`/api/reports/${encodeURIComponent(reportId)}/sensitivity?token=${encodeURIComponent(token)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),job=await response.json();if(!response.ok)throw new Error(job.detail||'Unable to start sensitivity update');const source=new EventSource(`/api/jobs/${job.job_id}/events?token=${encodeURIComponent(token)}`);source.onmessage=event=>status.textContent=JSON.parse(event.data).message;source.addEventListener('complete',event=>{source.close();const done=JSON.parse(event.data);if(done.status==='complete'){status.textContent='Sensitivity updated. Reloading…';location.reload()}else{button.disabled=false;status.textContent=done.error||'Sensitivity update failed.'}});}catch(error){button.disabled=false;status.textContent=error.message;}}
+  async function recordCanvasAnimation(canvas,format,renderFrames,filename){const token=builderToken();if(!token)return alert('Animation export requires opening this report from Report Browser.');if(!canvas.captureStream||!window.MediaRecorder)return alert('This browser does not support canvas recording.');const stream=canvas.captureStream(30),type=['video/webm;codecs=vp9','video/webm'].find(value=>MediaRecorder.isTypeSupported(value));if(!type)return alert('This browser cannot record a WebM source for export.');const chunks=[],recorder=new MediaRecorder(stream,{mimeType:type});recorder.ondataavailable=event=>{if(event.data.size)chunks.push(event.data)};const stopped=new Promise(resolve=>recorder.onstop=resolve);recorder.start(200);await renderFrames();recorder.stop();await stopped;const response=await fetch(`/api/animation/transcode?format=${encodeURIComponent(format)}&token=${encodeURIComponent(token)}`,{method:'POST',headers:{'Content-Type':'video/webm'},body:new Blob(chunks,{type})});if(!response.ok)return alert((await response.json().catch(()=>({}))).detail||'Animation export failed.');const link=document.createElement('a');link.href=URL.createObjectURL(await response.blob());link.download=`${filename}.${format}`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);}
+  async function exportIteration(){stopIteration();if(!prepareIteration())return;const rate=iterationRate(),format=document.getElementById('iteration-format').value;document.getElementById('iteration-export').disabled=true;try{await recordCanvasAnimation(els.canvas,format,async()=>{let carry=0;while(iterationState.index<iterationState.points.length){carry+=rate/30;const batch=Math.floor(carry);carry-=batch;if(batch)setIterationProgress(iterationState.index+batch);await new Promise(resolve=>setTimeout(resolve,1000/30));}},'sampler-iterations');}finally{document.getElementById('iteration-export').disabled=false;}}
   function downloadSpec() {
     const yaml = `version: 2\\nvalidation:\\n  mode: strict\\nparameters:\\n  mode: single\\n  axes:\\n    x: ${els.x.value}\\n    y: ${els.y.value}\\nthresholds:\\n  near_critical_ttc_s: ${document.getElementById('draft-ttc').value}\\noutput:\\n  formats: [svg, png]\\n`;
     const blob = new Blob([yaml], {type:'text/yaml'});
     const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'analysis_spec.yaml'; link.click(); URL.revokeObjectURL(link.href);
   }
-  populate(); populateCaseViewer(); renderStatic(); resize(); caseResize();
-  els.pair.addEventListener('change', () => { const pair = payload.parameter_pairs.find(item => item.key === els.pair.value); if (pair) { els.x.value = pair.x; els.y.value = pair.y; } updateFigureVisibility(); draw(); });
-  [els.x,els.y,els.z,els.color,els.view,els.overlay,els.deltaMetric,els.reference].forEach(el => el.addEventListener('change', () => { updateFigureVisibility(); draw(); }));
+  const explorerStateKey=`pisa-report-state:${location.pathname}`;
+  function saveExplorerState() {
+    const controls=[els.mode,els.reference,els.left,els.right,els.deltaMetric,els.pair,els.x,els.y,els.z,els.color,els.view,els.aspect,els.background,els.overlay,els.runSelect,document.getElementById('iteration-timing-mode'),document.getElementById('iteration-timing-value'),caseEls.caseSelect,caseEls.seriesSelect];
+    const filters={};for(const [name,container] of Object.entries({experiments:els.experimentFilters,outcomes:els.outcomeFilters,safety:els.safetyFilters,status:els.statusFilters}))filters[name]=[...container.querySelectorAll('input:checked')].map(input=>input.value);
+    try{sessionStorage.setItem(explorerStateKey,JSON.stringify({controls:Object.fromEntries(controls.filter(Boolean).map(control=>[control.id,control.value])),filters,scatterExport:scatterExportOptions(),scrollY:window.scrollY,yaw,pitch,zoom,caseMode:caseState.mode}));}catch(error){}
+  }
+  function restoreExplorerState() {
+    let saved;try{saved=JSON.parse(sessionStorage.getItem(explorerStateKey)||'null');}catch(error){return;}if(!saved)return;
+    for(const [id,value] of Object.entries(saved.controls||{})){const control=document.getElementById(id);if(control&&(!control.options||[...control.options].some(option=>option.value===value)))control.value=value;}
+    for(const [name,container] of Object.entries({experiments:els.experimentFilters,outcomes:els.outcomeFilters,safety:els.safetyFilters,status:els.statusFilters})){const selected=new Set(saved.filters?.[name]||[]);container.querySelectorAll('input').forEach(input=>input.checked=selected.has(input.value));}
+    if(saved.scatterExport){document.getElementById('scatter-export-crop').value=saved.scatterExport.crop||'tight';document.getElementById('scatter-export-axes').checked=saved.scatterExport.axes!==false;document.getElementById('scatter-export-labels').checked=saved.scatterExport.labels!==false;document.getElementById('scatter-export-grid').checked=saved.scatterExport.grid!==false;}
+    yaw=number(saved.yaw)??yaw;pitch=number(saved.pitch)??pitch;zoom=number(saved.zoom)??zoom;caseState.mode=saved.caseMode==='detail'?'detail':'semantic';updateIterationTiming(false);
+    populateCaseSeries();setCaseMode(caseState.mode);const run=activeRuns().find(item=>item.run_id===els.runSelect.value);if(run)showRun(run);
+    requestAnimationFrame(()=>window.scrollTo(0,number(saved.scrollY)??0));
+  }
+  populate(); populateCaseViewer(); restoreExplorerState(); renderStatic(); resize(); caseResize();
+  els.pair.addEventListener('change', () => { stopIteration();const pair = payload.parameter_pairs.find(item => item.key === els.pair.value); if (pair) { els.x.value = pair.x; els.y.value = pair.y; } updateFigureVisibility(); draw(); });
+  [els.x,els.y,els.z,els.color,els.view,els.aspect,els.background,els.overlay,els.deltaMetric,els.reference].forEach(el => el.addEventListener('change', () => { stopIteration();iterationState.points=[];updateFigureVisibility(); draw(); }));
   [els.left,els.right].forEach(control => control.addEventListener('change', () => { keepComparisonPairDistinct(control);if(figureEls.left.options.length){figureEls.left.value=els.left.value;figureEls.right.value=els.right.value;}updateFigureVisibility();draw(); }));
   els.mode.addEventListener('change', () => { updateCompareControls(); updateFigureVisibility(); draw(); });
   els.experimentFilters.addEventListener('change', () => { updateFigureVisibility(); draw(); });
@@ -2812,13 +3019,20 @@ def _write_html_report(
   els.runSelect.addEventListener('change', () => showRun(activeRuns().find(run => run.run_id === els.runSelect.value)));
   els.search.addEventListener('input', () => { const q = els.search.value.toLowerCase(); if (!q) return; els.detail.textContent = JSON.stringify(activeRuns().filter(run => JSON.stringify(run).toLowerCase().includes(q)).slice(0, 100), null, 2); });
   els.canvas.addEventListener('click', event => selectNearest(event.clientX, event.clientY));
+  document.getElementById('iteration-play').addEventListener('click',toggleIteration);
+  document.getElementById('iteration-restart').addEventListener('click',restartIteration);
+  document.getElementById('iteration-progress').addEventListener('input',event=>{stopIteration();if(!iterationState.points.length)prepareIteration();setIterationProgress(event.target.value);});
+  document.getElementById('iteration-export').addEventListener('click',exportIteration);
+  document.getElementById('scatter-export').addEventListener('click',exportScatter);
+  document.getElementById('run-sensitivity').addEventListener('click',updateSensitivityOnline);
+  document.getElementById('iteration-timing-mode').addEventListener('change',updateIterationTiming);
+  document.getElementById('iteration-timing-value').addEventListener('input',updateIterationLabel);
   els.canvas.addEventListener('mousedown', event => { dragging = true; lastX = event.clientX; lastY = event.clientY; });
   window.addEventListener('mouseup', () => dragging = false);
   window.addEventListener('mousemove', event => { if (!dragging || els.view.value !== '3d') return; yaw += (event.clientX-lastX)*0.01; pitch += (event.clientY-lastY)*0.01; lastX=event.clientX; lastY=event.clientY; draw(); });
   els.canvas.addEventListener('wheel', event => { if (els.view.value !== '3d') return; event.preventDefault(); zoom *= Math.exp(-event.deltaY*0.001); draw(); });
   document.getElementById('rule-source').addEventListener('change', updateRuleFields);
   document.getElementById('apply-draft').addEventListener('click', applyDraft);
-  document.getElementById('download-filtered').addEventListener('click', downloadFiltered);
   document.getElementById('draft-download').addEventListener('click', downloadSpec);
   caseEls.caseSelect.addEventListener('change', populateCaseSeries);
   caseEls.seriesSelect.addEventListener('change', () => { caseState.hoverIndex = null; drawCaseSeries(); });
@@ -2827,6 +3041,8 @@ def _write_html_report(
   caseEls.canvas.addEventListener('mousemove', hoverCaseSeries);
   caseEls.canvas.addEventListener('mouseleave', () => { caseState.hoverIndex = null; drawCaseSeries(); });
   window.addEventListener('resize', () => { resize(); caseResize(); renderSensitivity(); });
+  document.addEventListener('change',saveExplorerState);
+  window.addEventListener('beforeunload',saveExplorerState);
   updateFigureVisibility();
 })();
 </script>

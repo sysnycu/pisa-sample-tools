@@ -14,6 +14,7 @@ from pisa_sample_tools.common.yaml import write_yaml
 from .campaign import load_campaign
 from .ingest import execution_component_metadata, load_experiment, read_execution_manifest
 from .models import DatasetSpec, EvidenceError
+from .report_version import REPORT_BUILD_VERSION
 from .spec import load_analysis_spec, spec_to_dict
 from .statistics import apply_derived_parameters, normalized_outcome
 from .validation import validate_runs
@@ -133,7 +134,7 @@ def scan_reports(root: Path) -> dict[str, Any]:
     reports, warnings = [], []
     candidates = [resolved] if is_report_bundle(resolved) else []
     try:
-        candidates.extend(path.parent for path in resolved.rglob("manifest.yaml"))
+        candidates.extend(path for path in resolved.iterdir() if path.is_dir())
     except OSError as exc:
         warnings.append(str(exc))
     seen: set[Path] = set()
@@ -180,6 +181,10 @@ def preview_report(path: Path) -> dict[str, Any] | None:
         "experiment_count": summary.get("experiment_count", len(experiments)),
         "parameter_count": summary.get("parameter_count", 0),
         "report_mode": data.get("report_mode"),
+        "report_build_version": int(manifest.get("report_build_version") or 0),
+        "latest_report_build_version": REPORT_BUILD_VERSION,
+        "update_available": int(manifest.get("report_build_version") or 0)
+        < REPORT_BUILD_VERSION,
         "experiments": experiments,
         "outcomes": outcomes,
         "sensitivity_generated": bool(data.get("sensitivity", {}).get("generated")),

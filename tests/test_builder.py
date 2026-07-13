@@ -17,6 +17,7 @@ from pisa_sample_tools.evidence.builder import (
     validate_builder_request,
 )
 from pisa_sample_tools.evidence.builder_server import create_builder_app
+from pisa_sample_tools.evidence.report_version import REPORT_BUILD_VERSION
 from pisa_sample_tools.evidence.spec import spec_to_dict
 
 
@@ -138,7 +139,7 @@ def test_modern_manifest_prefills_components_sampler_and_xodr(tmp_path: Path) ->
 
 
 def test_report_catalog_only_includes_evidence_bundles(tmp_path: Path) -> None:
-    valid = tmp_path / "nested" / "report-one"
+    valid = tmp_path / "report-one"
     (valid / "report").mkdir(parents=True)
     (valid / "manifest.yaml").write_text(
         yaml.safe_dump(
@@ -171,8 +172,20 @@ def test_report_catalog_only_includes_evidence_bundles(tmp_path: Path) -> None:
 
     assert [item["name"] for item in catalog["reports"]] == ["report-one"]
     assert catalog["reports"][0]["run_count"] == 3
+    assert catalog["reports"][0]["report_build_version"] == 0
+    assert catalog["reports"][0]["latest_report_build_version"] == REPORT_BUILD_VERSION
+    assert catalog["reports"][0]["update_available"] is True
     assert inspect_output(valid)["state"] == "pisa_report"
     assert inspect_output(other)["state"] == "non_pisa_nonempty"
+
+
+def test_report_catalog_does_not_recurse(tmp_path: Path) -> None:
+    nested = tmp_path / "group" / "report"
+    (nested / "report").mkdir(parents=True)
+    (nested / "manifest.yaml").write_text("tool: pisa-analysis-tools\n", encoding="utf-8")
+    (nested / "report" / "analysis_report.html").write_text("report", encoding="utf-8")
+
+    assert scan_reports(tmp_path)["reports"] == []
 
 
 def test_builder_api_requires_token_and_serves_ui() -> None:
@@ -183,6 +196,12 @@ def test_builder_api_requires_token_and_serves_ui() -> None:
     assert "/api/build" in paths
     assert "/api/reports" in paths
     assert "/api/output" in paths
+    assert "/api/animation/transcode" in paths
+    assert "/api/reports/{report_id}/update" in paths
+    assert "/api/reports/{report_id}/rename" in paths
+    assert "/api/reports/{report_id}/delete" in paths
+    assert "/api/reports/update-all" in paths
+    assert "/api/reports/{report_id}/sensitivity" in paths
     assert "/api/jobs/{job_id}/events" in paths
     assert "/reports/{report_token}/{job_id}/{asset_path:path}" in paths
     assert "/library/{report_token}/{report_id}/{asset_path:path}" in paths
@@ -200,6 +219,16 @@ def test_builder_ui_starts_with_report_browser_and_has_validated_controls() -> N
 
     assert "PISA Report Browser" in html
     assert "Create New Report" in html
+    assert "async function startNewReport()" in html
+    assert "$('create-report').onclick=startNewReport" in html
+    assert "state.page=0;state.experiments=[]" in html
+    assert "function suggestedReportName()" in html
+    assert "updateSelectedReport" in html
+    assert "estimated remaining" in html
+    assert "renameSelectedReport" in html
+    assert "deleteSelectedReport" in html
+    assert "updateAllReports" in html
+    assert "directly inside this directory" in html
     assert 'data-dir="true">↩ ..' in html
     assert 'id="format-svg" type="checkbox"' in html
     assert 'id="format-png" type="checkbox"' in html
