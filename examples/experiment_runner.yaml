@@ -1,0 +1,10 @@
+# Copy this file to config/experiment_runner.yaml and keep only values that
+# should override the bundled component and experiment profiles.
+version: 1
+variables:
+  PISA_ROOT: /home/your-user/ysws/PISA
+  PISA_DATA_DIR: /opt/sbsvf
+  OUTPUT_ROOT: /opt/sbsvf/outputs/local-experiments
+  REPORT_ROOT: ./analysis/local-experiments
+components: {}
+experiments: {}

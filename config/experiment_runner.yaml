@@ -1,0 +1,246 @@
+version: 1
+variables:
+  PISA_ROOT: /home/hcis-s05/ysws/PISA
+  PISA_DATA_DIR: /opt/sbsvf
+  OUTPUT_ROOT: /opt/sbsvf/outputs/local-experiments
+  REPORT_ROOT: ./analysis/local-experiments
+components:
+  carla:
+    kind: simulator
+    label: CARLA Simulator
+    image: carla-wrapper:native
+    defaults:
+      config_path: ${PISA_DATA_DIR}/config/sim/carla.yaml
+    build:
+      repo_path: ${PISA_ROOT}/carla-wrapper
+      context: ${PISA_ROOT}/carla-wrapper
+      builder: docker buildx build
+      load: true
+      args:
+        SRUNNER_GIT: https://github.com/carla-simulator/scenario_runner.git
+        WITH_CATALOGS: 0
+    run:
+      network: host
+      gpu: true
+      ports:
+        service: auto
+        carla: auto
+        traffic_manager: auto
+      env:
+        DISPLAY: ${DISPLAY}
+      mounts:
+      - source: /tmp/.X11-unix
+        target: /tmp/.X11-unix
+        mode: rw
+  esmini:
+    kind: simulator
+    label: esmini Simulator
+    image: tonychi/esmini-wrapper:latest
+    defaults:
+      config_path: ${PISA_DATA_DIR}/config/sim/esmini.yaml
+    build:
+      repo_path: ${PISA_ROOT}/esmini-wrapper
+      context: ${PISA_ROOT}/esmini-wrapper
+      builder: docker build
+    run:
+      network: host
+      gpu: true
+      ports:
+        service: auto
+      env:
+        DISPLAY: ${DISPLAY}
+      mounts:
+      - source: /tmp/.X11-unix
+        target: /tmp/.X11-unix
+        mode: rw
+  simple:
+    kind: av
+    label: Simple deterministic AV
+    image: simple_av_wrapper:latest
+    defaults:
+      config_path: ${PISA_DATA_DIR}/config/av/simple.yaml
+    build:
+      repo_path: ${PISA_ROOT}/simple-av-wrapper
+      context: ${PISA_ROOT}/simple-av-wrapper
+      builder: docker build
+    run:
+      network: bridge
+      ports:
+        service: auto
+  autoware:
+    kind: av
+    label: Autoware
+    image: tonychi/autoware-wrapper:latest
+    defaults:
+      config_path: ${PISA_DATA_DIR}/config/av/autoware.yaml
+    build:
+      repo_path: ${PISA_ROOT}/autoware-wrapper
+      context: ${PISA_ROOT}/autoware-wrapper
+      builder: docker build
+    run:
+      network: host
+      ports:
+        service: auto
+      ros_domain: auto
+      env:
+        DISPLAY: ${DISPLAY}
+      mounts:
+      - source: /tmp/.X11-unix
+        target: /tmp/.X11-unix
+        mode: rw
+  carla-agent:
+    kind: av
+    label: CARLA Behavior Agent
+    image: tonychi/carla-agent-wrapper:latest
+    defaults:
+      config_path: ${PISA_DATA_DIR}/config/av/carla_agent.yaml
+    build:
+      repo_path: ${PISA_ROOT}/carla-agent-wrapper
+      context: ${PISA_ROOT}/carla-agent-wrapper
+      builder: docker build
+    run:
+      network: host
+      gpu: true
+      ports:
+        service: auto
+        carla: auto
+        traffic_manager: auto
+      ros_domain: auto
+      env:
+        DISPLAY: ${DISPLAY}
+      mounts:
+      - source: /tmp/.X11-unix
+        target: /tmp/.X11-unix
+        mode: rw
+  pcla:
+    kind: av
+    label: PCLA
+    image: pcla-wrapper:common-slim
+    defaults:
+      config_path: ${PISA_DATA_DIR}/config/av/pcla.yaml
+    build:
+      repo_path: ${PISA_ROOT}/pcla-wrapper
+      context: ${PISA_ROOT}/pcla-wrapper
+      builder: docker build
+      target: common-slim
+    run:
+      network: host
+      gpu: true
+      ports:
+        service: auto
+        carla: auto
+        traffic_manager: auto
+      ros_domain: auto
+      mounts:
+      - source: ${PISA_ROOT}/pcla-wrapper/PCLA/pcla_agents
+        target: /mnt/weights
+        mode: ro
+experiments:
+  cutin-esmini-simple:
+    label: Cut-in · esmini + Simple AV
+    runtime:
+      dt: 0.05
+      log_level: info
+      overwrite: false
+      max_concrete_retries: 3
+    task:
+      output_dir: ${OUTPUT_ROOT}/cutin-esmini-simple
+    simulator:
+      component: esmini
+      config_path: ${PISA_DATA_DIR}/config/sim/esmini.yaml
+    av:
+      component: simple
+      config_path: ${PISA_DATA_DIR}/config/av/simple.yaml
+      observation_identity: full
+    map:
+      name: tyms
+      xodr_path: /opt/sbsvf/map/tyms/xodr
+      osm_path: /opt/sbsvf/map/tyms/osm
+    scenario:
+      name: HetroD-01BYPASS_02CREEP_902_901_f15171
+      format: open_scenario1
+      path: /opt/sbsvf/scenario/HetroD-01BYPASS_02CREEP_902_901_f15171
+      stop_condition_config_path: stop_condition.yaml
+      goal_config:
+        position:
+          type: LanePosition
+          value:
+          - 22
+          - -2
+          - 32
+          - 0.8678736366539397
+        target_speed: 33.05106
+    sampler:
+      name: lhs
+      config_path: ${PISA_DATA_DIR}/config/sampler/lhs_10.yaml
+    monitor:
+      module_path: simcore.monitor.base:Monitor
+      config_path: ${PISA_DATA_DIR}/config/monitor/sakura_logging_cfg.yaml
+    runner:
+      repo_path: ${PISA_ROOT}/runner
+      command:
+      - uv
+      - run
+      - python
+      - main.py
+      - --runner_spec
+      - '{runner_spec}'
+      rmlib_path: ${PISA_DATA_DIR}/lib/libesminiRMLib.so
+    analysis:
+      spec_path: ./config/cutin.yaml
+      output_dir: ${REPORT_ROOT}/cutin-esmini-simple
+      report_mode: interactive
+      sensitivity: false
+      auto: false
+      overwrite: false
+    tags: []
+  cutin-carla-simple:
+    label: Cut-in · CARLA + Simple AV
+    extends: cutin-esmini-simple
+    runtime:
+      dt: 0.05
+      log_level: info
+      overwrite: false
+      max_concrete_retries: 3
+    task:
+      output_dir: ${OUTPUT_ROOT}/cutin-carla-simple
+    simulator:
+      component: carla
+      config_path: ${PISA_DATA_DIR}/config/sim/carla.yaml
+    av:
+      component: simple
+      config_path: ${PISA_DATA_DIR}/config/av/simple.yaml
+      observation_identity: full
+    map:
+      name: straight_3000m
+      xodr_path: ${PISA_DATA_DIR}/map/straight_3000m/xodr
+      osm_path: ${PISA_DATA_DIR}/map/straight_3000m/osm
+    scenario:
+      name: cutin-opt
+      format: open_scenario1
+      path: ${PISA_DATA_DIR}/scenario/cutin-opt
+      stop_condition_config_path: stop_conditions.yaml
+    sampler:
+      name: lhs
+      config_path: ${PISA_DATA_DIR}/config/sampler/lhs_10.yaml
+    monitor:
+      module_path: simcore.monitor.base:Monitor
+      config_path: ${PISA_DATA_DIR}/config/monitor/sakura_logging_cfg.yaml
+    runner:
+      repo_path: ${PISA_ROOT}/runner
+      command:
+      - uv
+      - run
+      - python
+      - main.py
+      - --runner_spec
+      - '{runner_spec}'
+      rmlib_path: ${PISA_DATA_DIR}/lib/libesminiRMLib.so
+    analysis:
+      spec_path: ./config/cutin.yaml
+      output_dir: ${REPORT_ROOT}/cutin-carla-simple
+      report_mode: interactive
+      sensitivity: false
+      auto: false
+      overwrite: false
+disabled_experiments: []

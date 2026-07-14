@@ -41,6 +41,27 @@ campaigns, specs, validation, and output without writing CLI commands:
 uv run pisa-analysis builder
 ```
 
+## Local Experiment Runner
+
+Launch the standalone Docker-based experiment runner:
+
+```bash
+uv run pisa-experiment-runner
+```
+
+The runner has its own localhost-only web application. It builds and starts simulator/AV
+containers, allocates ports, generates the runner spec, streams execution logs, cleans up
+owned containers, and can build an evidence report from the completed results. It is kept
+separate from the Report Builder so execution presets and container lifecycle state do not
+enter the report-authoring workflow.
+
+Bundled profiles cover CARLA, esmini, Simple AV, Autoware, CARLA Agent, and PCLA. Copy
+`examples/experiment_runner.yaml` to `config/experiment_runner.yaml` for versioned overrides;
+use `config/experiment_runner.local.yaml` for machine-only paths.
+
+See [docs/experiment-runner](docs/experiment-runner/README.md) for the registry structure,
+execution stages, safety behavior, and component options.
+
 ## Validation Evidence
 
 ```bash

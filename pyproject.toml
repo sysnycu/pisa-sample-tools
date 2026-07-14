@@ -22,6 +22,7 @@ pisa-sample-trajectory = "pisa_sample_tools.trajectory.cli:main"
 pisa-trajectory-compare = "pisa_sample_tools.trajectory_compare.cli:main"
 pisa-outcome-eval = "pisa_sample_tools.outcome_eval.cli:main"
 pisa-analysis = "pisa_sample_tools.evidence.cli:main"
+pisa-experiment-runner = "pisa_sample_tools.experiment_runner.cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -40,7 +41,11 @@ simcore = { git = "https://github.com/pisa-hut/simulation-core.git" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-pisa_sample_tools = ["evidence/builder_web/*.html"]
+pisa_sample_tools = [
+    "evidence/builder_web/*.html",
+    "experiment_runner/*.yaml",
+    "experiment_runner/web/*.html",
+]
 
 [tool.ruff]
 line-length = 100
