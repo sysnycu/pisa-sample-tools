@@ -134,7 +134,11 @@ def scan_reports(root: Path) -> dict[str, Any]:
     reports, warnings = [], []
     candidates = [resolved] if is_report_bundle(resolved) else []
     try:
-        candidates.extend(path for path in resolved.iterdir() if path.is_dir())
+        candidates.extend(
+            manifest.parent
+            for manifest in resolved.rglob("manifest.yaml")
+            if not any(part.startswith(".") for part in manifest.relative_to(resolved).parts)
+        )
     except OSError as exc:
         warnings.append(str(exc))
     seen: set[Path] = set()

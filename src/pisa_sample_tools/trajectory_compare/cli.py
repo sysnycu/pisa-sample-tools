@@ -32,8 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ignore-agent-id",
         action="append",
-        default=["0"],
-        help="Agent id to ignore. Defaults to 0. Can be repeated.",
+        default=None,
+        help=(
+            "Agent id to ignore. Can be repeated. By default ego IDs are read from "
+            "is_ego metadata, falling back to agent 0."
+        ),
     )
     parser.add_argument("--width", type=int, default=1200, help="SVG width in pixels.")
     parser.add_argument("--height", type=int, default=820, help="SVG height in pixels.")
@@ -61,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             left_label=args.left_label,
             right_label=args.right_label,
-            ignore_agent_ids=set(args.ignore_agent_id),
+            ignore_agent_ids=set(args.ignore_agent_id) if args.ignore_agent_id else None,
             overwrite=args.overwrite,
             width=args.width,
             height=args.height,

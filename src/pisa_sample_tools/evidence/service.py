@@ -47,7 +47,7 @@ from .plots import (
     render_representative_cases,
     representative_case_series,
 )
-from .report_version import REPORT_BUILD_VERSION
+from .report_version import REPORT_BUILD_VERSION, REPORT_MANIFEST_SCHEMA_VERSION
 from .sensitivity import SensitivityResult, analyze_sensitivity, render_sensitivity_figures
 from .spec import load_analysis_spec, spec_to_dict
 from .statistics import (
@@ -387,6 +387,7 @@ def build_evidence(
     _write_limitations(report_dir / "limitations.md", input_manifest, warnings)
 
     reporter.step("writing stage timings")
+    reporter.finish_current()
     (provenance_dir / "stage_timings.json").write_text(
         json.dumps(reporter.timings, indent=2) + "\n", encoding="utf-8"
     )
@@ -395,7 +396,7 @@ def build_evidence(
     partial_manifest_path = output_dir / _PARTIAL_MANIFEST_NAME
     manifest = {
         "tool": "pisa-analysis-tools",
-        "schema_version": 2,
+        "schema_version": REPORT_MANIFEST_SCHEMA_VERSION,
         "report_build_version": REPORT_BUILD_VERSION,
         "generated_at": datetime.now(UTC).isoformat(),
         "run_count": len(runs),
@@ -566,17 +567,38 @@ class _ProgressReporter:
     def __init__(self, emit: Callable[[str], None] | None) -> None:
         self._emit = emit
         self._started = time.perf_counter()
-        self._last = self._started
+        self._stage_started = self._started
+        self._current_stage: str | None = None
         self.timings: list[dict[str, Any]] = []
 
     def step(self, message: str) -> None:
         now = time.perf_counter()
+        previous_duration = self._complete(now)
         elapsed = now - self._started
-        delta = now - self._last
-        self._last = now
-        self.timings.append({"stage": message, "elapsed_seconds": elapsed, "delta_seconds": delta})
+        self._current_stage = message
+        self._stage_started = now
         if self._emit is not None:
-            self._emit(f"[+{elapsed:6.1f}s | {delta:5.1f}s] {message}")
+            suffix = f" | previous {previous_duration:5.1f}s" if previous_duration is not None else ""
+            self._emit(f"[+{elapsed:6.1f}s{suffix}] {message}")
+
+    def finish_current(self) -> None:
+        self._complete(time.perf_counter())
+
+    def _complete(self, now: float) -> float | None:
+        if self._current_stage is None:
+            return None
+        duration = now - self._stage_started
+        self.timings.append(
+            {
+                "stage": self._current_stage,
+                "started_seconds": self._stage_started - self._started,
+                "elapsed_seconds": now - self._started,
+                "duration_seconds": duration,
+                "delta_seconds": duration,
+            }
+        )
+        self._current_stage = None
+        return duration
 
 
 def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
@@ -2050,8 +2072,8 @@ def _write_html_report(
     mode: str,
 ) -> None:
     static_note = (
-        '<p class="notice">Static report mode requested. Official tables and artifact links '
-        "are shown; interactive controls read the same frozen payload.</p>"
+        '<p class="notice">Portable snapshot: aggregate evidence and representative cases '
+        "are embedded in this file; arbitrary run traces remain available in the full bundle.</p>"
         if mode == "static"
         else ""
     )
@@ -3048,10 +3070,63 @@ def _write_html_report(
 </script>
 </body></html>
 """
-    path.write_text(
-        html_text.replace("__STATIC_NOTE__", static_note),
-        encoding="utf-8",
-    )
+    rendered = html_text.replace("__STATIC_NOTE__", static_note)
+    if mode == "static":
+        compact_payload = _compact_report_payload(payload)
+        payload_json = json.dumps(compact_payload, ensure_ascii=True).replace("</", "<\\/")
+        case_data_path = output_dir / "report" / "case_data.json"
+        case_payload = (
+            json.loads(case_data_path.read_text(encoding="utf-8"))
+            if case_data_path.is_file()
+            else {"schema_version": 1, "cases": []}
+        )
+        case_json = json.dumps(case_payload, ensure_ascii=True).replace("</", "<\\/")
+        rendered = rendered.replace(
+            '<script src="analysis_data.js"></script>',
+            f"<script>window.PISA_ANALYSIS_DATA={payload_json};</script>",
+        ).replace(
+            '<script src="case_data.js"></script>',
+            f"<script>window.PISA_CASE_DATA={case_json};</script>",
+        )
+    path.write_text(rendered, encoding="utf-8")
+
+
+def _compact_report_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Select portable aggregates and representative runs for a static report."""
+
+    representative_ids = {
+        str(item.get("run_id"))
+        for item in payload.get("representative_cases", [])
+        if item.get("run_id") not in {None, ""}
+    }
+    comparison = payload.get("comparison") or {}
+    compact_comparison = {
+        key: comparison.get(key, [])
+        for key in (
+            "pairing_summary",
+            "paired_summary",
+            "component_comparison",
+            "repeated_run_stability",
+            "outcome_transition",
+        )
+    }
+    return {
+        key: value
+        for key, value in {
+            **payload,
+            "runs": [
+                run for run in payload.get("runs", []) if str(run.get("run_id")) in representative_ids
+            ],
+            "comparison": compact_comparison,
+            "snapshot": {
+                "schema_version": 1,
+                "kind": "portable",
+                "run_scope": "representative",
+                "included_run_count": len(representative_ids),
+                "full_run_count": payload.get("summary", {}).get("run_count", 0),
+            },
+        }.items()
+    }
 
 
 def _write_markdown_report(

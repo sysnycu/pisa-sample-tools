@@ -514,6 +514,45 @@ def test_build_evidence_writes_paper_ready_bundle(tmp_path: Path) -> None:
     assert "contact_region_json" in timeline
 
 
+def test_static_profile_build_embeds_compact_snapshot_and_detailed_profile(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "experiment"
+    spec_path = tmp_path / "analysis.yaml"
+    output = tmp_path / "portable"
+    _write_experiment(results)
+    _write_spec(spec_path)
+
+    assert main(
+        [
+            "build",
+            "--results",
+            str(results),
+            "--spec",
+            str(spec_path),
+            "--output",
+            str(output),
+            "--report-mode",
+            "static",
+            "--profile",
+        ]
+    ) == 0
+
+    html = (output / "report" / "analysis_report.html").read_text(encoding="utf-8")
+    manifest = yaml.safe_load((output / "manifest.yaml").read_text(encoding="utf-8"))
+    timings = json.loads(
+        (output / "provenance" / "stage_timings.json").read_text(encoding="utf-8")
+    )
+    assert '<script src="analysis_data.js"></script>' not in html
+    assert "window.PISA_ANALYSIS_DATA=" in html
+    assert '"kind": "portable"' in html
+    assert manifest["schema_version"] == 3
+    assert manifest["report_build_version"] == 9
+    assert (output / "provenance" / "build_profile.pstats").is_file()
+    assert (output / "provenance" / "build_profile.txt").is_file()
+    assert all(item["stage"] and item["duration_seconds"] >= 0 for item in timings)
+
+
 def test_build_evidence_compares_multiple_components(tmp_path: Path) -> None:
     left = tmp_path / "behavior"
     right = tmp_path / "autoware"

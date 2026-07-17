@@ -4,6 +4,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+frontend/node_modules/
+frontend/*.tsbuildinfo
 output*/
 analysis*/
 config*/

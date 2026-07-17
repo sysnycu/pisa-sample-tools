@@ -37,7 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-path-mode",
         choices=[mode.value for mode in SourcePathMode],
         default=SourcePathMode.ABSOLUTE.value,
-        help=argparse.SUPPRESS,
+        help=(
+            "How paths are recorded in manifest.yaml. Relative paths are resolved from the "
+            "output root for portable bundles."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -115,4 +118,3 @@ def format_summary(summary: dict[str, object]) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

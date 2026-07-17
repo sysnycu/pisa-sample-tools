@@ -1,0 +1,201 @@
+:root {
+  color-scheme: light;
+  background: #f6f8fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 78% -10%, rgba(91, 109, 219, 0.10), transparent 35rem),
+    #f6f8fb;
+}
+
+button, input, select, textarea { font: inherit; }
+
+.pisa-main {
+  max-width: 1600px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.pisa-page-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--mantine-spacing-md);
+}
+
+.pisa-chart {
+  width: 100%;
+  height: 320px;
+}
+
+.pisa-chart--compact { height: 240px; }
+
+.pisa-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.65rem;
+  padding: 0.75rem 1rem 0.25rem;
+  min-height: 2.5rem;
+}
+
+.pisa-chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 100%;
+  padding: 0.2rem 0.45rem;
+  border: 1px solid #dce1ea;
+  border-radius: 999px;
+  color: #273247;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.74rem;
+  line-height: 1.25;
+  white-space: normal;
+  text-align: left;
+}
+
+.pisa-chart-legend-item:hover { background: #f4f6fa; }
+.pisa-chart-legend-item--hidden { color: #8a94a5; opacity: 0.58; text-decoration: line-through; }
+.pisa-chart-legend-swatch { width: 0.65rem; height: 0.65rem; flex: 0 0 auto; border-radius: 50%; }
+
+.pisa-replay-slider {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  padding: 0.45rem 0.25rem;
+}
+
+.pisa-replay-slider > * {
+  display: block;
+  width: 100% !important;
+  writing-mode: horizontal-tb !important;
+  transform: none !important;
+}
+
+.pisa-horizontal-range {
+  display: block;
+  width: 100%;
+  height: 1.5rem;
+  writing-mode: horizontal-tb;
+  direction: ltr;
+  appearance: auto;
+}
+
+.pisa-sample-count-range {
+  accent-color: #2563eb;
+}
+
+.pisa-sample-count-range::-webkit-slider-runnable-track {
+  accent-color: #2563eb;
+}
+
+.pisa-sample-count-range::-webkit-slider-thumb {
+  accent-color: #2563eb;
+}
+
+.pisa-scatter-tooltip {
+  max-width: min(34rem, calc(100vw - 2rem));
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  z-index: 5000 !important;
+}
+
+.pisa-trajectory-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 1fr) minmax(0, 3fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.pisa-trajectory-sidebar {
+  position: sticky;
+  top: 5rem;
+}
+
+.pisa-runs-table th:last-child,
+.pisa-runs-table td:last-child {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background: white;
+  box-shadow: -8px 0 12px -12px #64748b;
+}
+
+.pisa-nav-link {
+  transition: background 120ms ease, transform 120ms ease;
+  min-height: 58px;
+}
+
+.pisa-nav-link:hover { transform: translateX(2px); }
+
+.pisa-nav-link--collapsed {
+  justify-content: center !important;
+  align-items: center !important;
+  width: 100%;
+  min-height: 58px;
+  padding: 0 !important;
+}
+
+.pisa-nav-link--collapsed .mantine-NavLink-section {
+  display: grid;
+  place-items: center;
+  margin: 0 !important;
+}
+
+.pisa-nav-link--collapsed .mantine-NavLink-body {
+  display: none;
+}
+
+.pisa-nav-link--collapsed:hover {
+  transform: none;
+}
+
+.pisa-data-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.pisa-data-table th,
+.pisa-data-table td {
+  padding: 0.7rem 0.8rem;
+  border-bottom: 1px solid var(--mantine-color-gray-2);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.pisa-data-table th {
+  color: var(--mantine-color-gray-6);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.pisa-code {
+  font-family: var(--mantine-font-family-monospace);
+  font-size: 0.78rem;
+}
+
+@media (max-width: 62em) {
+  .pisa-page-grid { grid-template-columns: 1fr; }
+  .pisa-page-grid > * { grid-column: 1 !important; }
+  .pisa-trajectory-layout { grid-template-columns: 1fr; }
+  .pisa-trajectory-sidebar { position: static; }
+}
+
+@media print {
+  .mantine-AppShell-header,
+  .mantine-AppShell-navbar,
+  .pisa-no-print { display: none !important; }
+  .mantine-AppShell-main { padding: 0 !important; }
+  body { background: white; }
+}

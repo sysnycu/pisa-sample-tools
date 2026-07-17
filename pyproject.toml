@@ -30,6 +30,7 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.0",
     "pytest>=8.0",
     "ruff>=0.6",
 ]
@@ -45,6 +46,8 @@ pisa_sample_tools = [
     "evidence/builder_web/*.html",
     "experiment_runner/*.yaml",
     "experiment_runner/web/*.html",
+    "webapp/static/*",
+    "webapp/static/assets/*",
 ]
 
 [tool.ruff]

@@ -10,6 +10,7 @@ import yaml
 
 from pisa_sample_tools.cli import main
 from pisa_sample_tools.exporter import export_samples
+from pisa_sample_tools.sample_export.models import SourcePathMode
 
 
 def _write_yaml(path: Path, data: dict[str, Any]) -> None:
@@ -81,6 +82,28 @@ def test_source_path_uses_scenario_path_as_base(tmp_path: Path) -> None:
     manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["source_path"] == str(tmp_path / "scenario" / "params.yaml")
     assert manifest["source_type"] == "param_range"
+
+
+def test_relative_source_path_mode_makes_manifest_portable(tmp_path: Path) -> None:
+    runner_spec = _make_runner_fixture(tmp_path, sample_count=2)
+    output_dir = tmp_path / "artifacts" / "out"
+
+    export_samples(
+        runner_spec_path=runner_spec,
+        output_dir=output_dir,
+        shard_size=10,
+        source_path_mode=SourcePathMode.RELATIVE_TO_OUTPUT,
+    )
+
+    manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["source_path_mode"] == "relative-to-output"
+    assert not Path(manifest["runner_spec_path"]).is_absolute()
+    assert (output_dir / manifest["runner_spec_path"]).resolve() == runner_spec.resolve()
+    assert manifest["shards"][0]["bundle_path"] == "demo_scenario-grid1"
+    assert manifest["shards"][0]["sample_file_path"] == (
+        "demo_scenario-grid1/explicit_samples.yaml"
+    )
+    assert (output_dir / manifest["shards"][0]["sample_file_path"]).is_file()
 
 
 def test_shard_size_splits_samples(tmp_path: Path) -> None:

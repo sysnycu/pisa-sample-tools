@@ -179,13 +179,16 @@ def test_report_catalog_only_includes_evidence_bundles(tmp_path: Path) -> None:
     assert inspect_output(other)["state"] == "non_pisa_nonempty"
 
 
-def test_report_catalog_does_not_recurse(tmp_path: Path) -> None:
+def test_report_catalog_recurses(tmp_path: Path) -> None:
     nested = tmp_path / "group" / "report"
     (nested / "report").mkdir(parents=True)
     (nested / "manifest.yaml").write_text("tool: pisa-analysis-tools\n", encoding="utf-8")
     (nested / "report" / "analysis_report.html").write_text("report", encoding="utf-8")
 
-    assert scan_reports(tmp_path)["reports"] == []
+    reports = scan_reports(tmp_path)["reports"]
+
+    assert [item["name"] for item in reports] == ["report"]
+    assert reports[0]["path"] == str(nested)
 
 
 def test_builder_api_requires_token_and_serves_ui() -> None:

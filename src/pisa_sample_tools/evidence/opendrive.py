@@ -62,34 +62,82 @@ def load_map_geometry(path: Path, *, step_m: float = 2.0) -> tuple[dict[str, Any
 
 def _road_geometry(road: ET.Element, step_m: float) -> dict[str, Any]:
     points: list[list[float]] = []
+    road_positions: list[float] = []
     for geometry in road.findall("./planView/geometry"):
         length = float(geometry.get("length", "0"))
+        start_s = float(geometry.get("s", road_positions[-1] if road_positions else "0"))
         count = max(2, math.ceil(length / step_m) + 1)
         for index in range(count):
             ds = length * index / (count - 1)
             point = _geometry_point(geometry, ds)
             if not points or point != points[-1]:
                 points.append(point)
-    section = road.find("./lanes/laneSection")
-    side_widths = []
-    if section is not None:
-        for side in ("left", "right"):
-            side_widths.append(
-                sum(
-                    abs(float(width.get("a", "0")))
-                    for lane in section.findall(f"./{side}/lane")
-                    if (width := lane.find("width")) is not None
-                )
-            )
-    half_width = max(3.5, *side_widths) if side_widths else 3.5
-    left, right = _offset_lines(points, half_width)
+                road_positions.append(start_s + ds)
+    boundaries = _lane_boundary_lines(road, points, road_positions)
+    if not boundaries:
+        left, right = _offset_lines(points, 3.5)
+        boundaries = [left, right]
     return {
         "road_id": road.get("id"),
         "name": road.get("name") or "",
         "junction": road.get("junction") not in {None, "", "-1"},
         "reference_line": points,
-        "boundaries": [left, right],
+        "boundaries": boundaries,
+        "lane_boundary_count": len(boundaries),
     }
+
+
+def _lane_boundary_lines(
+    road: ET.Element, points: list[list[float]], road_positions: list[float]
+) -> list[list[list[float]]]:
+    sections = sorted(
+        road.findall("./lanes/laneSection"), key=lambda item: float(item.get("s", "0"))
+    )
+    if not sections or len(points) != len(road_positions):
+        return []
+    lines: dict[tuple[str, str], list[list[float]]] = {}
+    for point_index, (point, road_s) in enumerate(zip(points, road_positions, strict=True)):
+        section = max(
+            (item for item in sections if float(item.get("s", "0")) <= road_s),
+            key=lambda item: float(item.get("s", "0")),
+            default=sections[0],
+        )
+        section_s = float(section.get("s", "0"))
+        before, after = points[max(0, point_index - 1)], points[min(len(points) - 1, point_index + 1)]
+        heading = math.atan2(after[1] - before[1], after[0] - before[0])
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            cumulative = 0.0
+            lanes = sorted(
+                section.findall(f"./{side}/lane"),
+                key=lambda lane: abs(int(lane.get("id", "0"))),
+            )
+            for lane in lanes:
+                cumulative += _lane_width(lane, max(0.0, road_s - section_s))
+                if cumulative <= 0:
+                    continue
+                key = (side, str(lane.get("id") or len(lines)))
+                offset = sign * cumulative
+                lines.setdefault(key, []).append(
+                    [
+                        round(point[0] - math.sin(heading) * offset, 6),
+                        round(point[1] + math.cos(heading) * offset, 6),
+                    ]
+                )
+    return [line for line in lines.values() if len(line) >= 2]
+
+
+def _lane_width(lane: ET.Element, section_offset: float) -> float:
+    records = sorted(lane.findall("width"), key=lambda item: float(item.get("sOffset", "0")))
+    if not records:
+        return 0.0
+    record = max(
+        (item for item in records if float(item.get("sOffset", "0")) <= section_offset),
+        key=lambda item: float(item.get("sOffset", "0")),
+        default=records[0],
+    )
+    ds = max(0.0, section_offset - float(record.get("sOffset", "0")))
+    a, b, c, d = (float(record.get(key, "0")) for key in ("a", "b", "c", "d"))
+    return abs(a + b * ds + c * ds**2 + d * ds**3)
 
 
 def _geometry_point(geometry: ET.Element, ds: float) -> list[float]:

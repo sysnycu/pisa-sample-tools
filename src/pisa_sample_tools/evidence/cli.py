@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
+import io
+import pstats
 import sys
 from pathlib import Path
 
+from pisa_sample_tools.experiment_runner.cli import main as experiment_runner_main
 from pisa_sample_tools.outcome_eval.cli import main as outcome_eval_main
+from pisa_sample_tools.sample_analyze.cli import main as sample_analyze_main
 from pisa_sample_tools.sample_export.cli import main as sample_export_main
 from pisa_sample_tools.sampler_preview.cli import main as sample_preview_main
 from pisa_sample_tools.trajectory.cli import main as trajectory_main
@@ -46,7 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--output", type=Path, required=True)
             command.add_argument("--overwrite", action="store_true")
             command.add_argument(
-                "--profile", action="store_true", help="Write stage timings (enabled for all builds)."
+                "--profile",
+                action="store_true",
+                help=(
+                    "Write detailed cProfile artifacts. Lightweight stage timings are always written."
+                ),
             )
             command.add_argument(
                 "--report-mode",
@@ -65,16 +74,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sensitivity.add_argument("--bundle", type=Path, required=True)
     subparsers.add_parser("trajectory", add_help=False)
+    ui = subparsers.add_parser("ui", help="Launch the unified local research console.")
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--port", type=int, default=0)
+    ui.add_argument("--no-open", action="store_true")
+    ui.add_argument("--report-root", type=Path, action="append")
+    ui.add_argument("--results-root", type=Path, action="append")
+    ui.add_argument("--config", type=Path, default=Path("config/experiment_runner.yaml"))
+    ui.add_argument(
+        "--local-config",
+        type=Path,
+        default=Path("config/experiment_runner.local.yaml"),
+    )
+    ui.add_argument("--state-path", type=Path)
+    ui.add_argument("--frontend-dir", type=Path, help=argparse.SUPPRESS)
     builder = subparsers.add_parser("builder", help="Launch the interactive report builder.")
     builder.add_argument("--host", default="127.0.0.1")
     builder.add_argument("--port", type=int, default=0)
     builder.add_argument("--no-open", action="store_true")
     subparsers.add_parser("trajectory-compare", add_help=False)
     subparsers.add_parser("outcome-eval", add_help=False)
+    subparsers.add_parser("experiment-runner", add_help=False)
     sample = subparsers.add_parser("sample")
     sample_subparsers = sample.add_subparsers(dest="sample_command", required=True)
     sample_subparsers.add_parser("preview", add_help=False)
     sample_subparsers.add_parser("export", add_help=False)
+    sample_subparsers.add_parser("analyze", add_help=False)
     return parser
 
 
@@ -86,12 +111,36 @@ def main(argv: list[str] | None = None) -> int:
         return trajectory_compare_main(argv[1:])
     if argv[:1] == ["outcome-eval"]:
         return outcome_eval_main(argv[1:])
+    if argv[:1] == ["experiment-runner"]:
+        return experiment_runner_main(argv[1:])
     if argv[:2] == ["sample", "preview"]:
         return sample_preview_main(argv[2:])
     if argv[:2] == ["sample", "export"]:
         return sample_export_main(argv[2:])
+    if argv[:2] == ["sample", "analyze"]:
+        return sample_analyze_main(argv[2:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "ui":
+        from pisa_sample_tools.webapp import run_server
+
+        default_results = Path("/opt/sbsvf/outputs")
+        try:
+            run_server(
+                host=args.host,
+                port=args.port,
+                open_browser=not args.no_open,
+                report_roots=args.report_root or [Path("analysis")],
+                results_roots=args.results_root
+                or ([default_results] if default_results.is_dir() else [Path.cwd()]),
+                config=args.config,
+                local_config=args.local_config,
+                state_path=args.state_path,
+                frontend_dir=args.frontend_dir,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        return 0
     if args.command == "builder":
         from .builder_server import run_builder
 
@@ -132,7 +181,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"errors: {errors}")
         print(f"warnings: {warnings}")
         return 1 if errors else 0
+    profiler = cProfile.Profile() if args.profile else None
     try:
+        if profiler is not None:
+            profiler.enable()
         result = build_evidence(
             results_paths=args.results,
             campaign_path=args.campaign,
@@ -146,10 +198,24 @@ def main(argv: list[str] | None = None) -> int:
         )
     except EvidenceError as exc:
         parser.error(str(exc))
+    finally:
+        if profiler is not None:
+            profiler.disable()
+    if profiler is not None:
+        _write_profile(profiler, args.output)
     print(f"runs: {result.run_count}")
     print(f"warnings: {result.warning_count}")
     print(f"report: {result.report_path}")
     return 0
+
+
+def _write_profile(profiler: cProfile.Profile, output_dir: Path) -> None:
+    provenance = output_dir.expanduser().resolve() / "provenance"
+    provenance.mkdir(parents=True, exist_ok=True)
+    profiler.dump_stats(provenance / "build_profile.pstats")
+    text = io.StringIO()
+    pstats.Stats(profiler, stream=text).strip_dirs().sort_stats("cumulative").print_stats(100)
+    (provenance / "build_profile.txt").write_text(text.getvalue(), encoding="utf-8")
 
 
 if __name__ == "__main__":

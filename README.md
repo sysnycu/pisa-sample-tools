@@ -13,14 +13,79 @@ commands remain compatible.
 uv sync
 ```
 
-`pyproject.toml` depends on `simcore` through an editable path dependency:
+`pyproject.toml` pins `simcore` to the official simulation-core Git source:
 
 ```toml
 [tool.uv.sources]
-simcore = { path = "/home/hcis-s05/ysws/PISA/runner", editable = true }
+simcore = { git = "https://github.com/pisa-hut/simulation-core.git" }
 ```
 
-If the runner repo moves, update that path and run `uv sync` again. The runner repo must be buildable as an editable package.
+For local simulation-core development, temporarily use a workspace-local editable source and
+regenerate the lock file; do not commit a machine-specific absolute path.
+
+## Unified research console
+
+Launch the localhost-only application that combines reports, experiment execution, sample
+generation/analysis, trajectory tools, outcome evaluation, media, exports, and advanced repair
+workflows:
+
+```bash
+uv run pisa-analysis ui
+```
+
+The console binds to `127.0.0.1` by default. Use `--no-open` in headless environments,
+`--port` for a fixed port, and repeat `--report-root` or `--results-root` to add browsable
+roots. The workbench intentionally refuses non-loopback hosts because experiment execution,
+container cleanup, and signed repair are privileged local operations. Its frontend is compiled
+into the Python package, so Node.js is not required at runtime.
+
+The main pages cover the complete local workflow:
+
+- **Report browser and management** — navigate one directory level at a time and list only the
+  reports directly below the current folder. Preview every experiment/scenario and its recorded
+  simulator, AV, sampler, resolved inputs, manifest and index metadata before opening; generated
+  report bundles can be renamed or deleted with explicit confirmation.
+- **Report build and rebuild** — browse output folders, inspect their execution manifests,
+  automatically populate source and destination paths, review detected configuration, and run a
+  detailed validation before building. Legacy rebuilds are non-destructive and always produce a
+  new normalized current-schema report rather than another legacy bundle.
+- **Report exploration** — browse aggregate outcomes, sampling, performance, safety, comparisons,
+  sensitivity, concrete runs, provenance, and data-health findings. The sampling workspace includes
+  an axis/colour/dataset-controlled scatter explorer; points can be connected in recorded sample
+  order and clicked to open their concrete run.
+- **Run replay and media** — synchronize trajectories, recorded vehicle geometry, safety metrics,
+  controls, and events; play/pause at selectable speed, move through adjacent samples, choose any
+  recorded scalar channel, and toggle OpenDRIVE reference-line, lane-boundary, and junction layers.
+  Create clearly labelled GIF/MP4/WebM schematic replays or PNG keyframes.
+- **Samples** — preview inline or source/native samplers, export portable shards, and analyze
+  planned samples or completed outcomes on a dedicated page.
+- **Experiments** — create/update/rename/delete presets, run configured stages, resume terminal
+  jobs, and clean up only verified PISA-owned containers.
+- **Advanced tools** — retain the trajectory, trajectory comparison, offline outcome evaluation,
+  and signed agent-state repair options previously available only from their individual CLIs.
+
+Generated report charts offer paper-width SVG/PDF, exact 1920×1080 or 3840×2160 slide PNG,
+300/600 DPI raster, CSV, and JSON exports. Browser-composed sample and replay charts offer
+editable SVG, high-resolution PNG, CSV, and JSON locally. Completed server exports expose a
+download link both beside the chart and in **Jobs & exports**.
+
+Normalized report builds use a paginated SQLite index and keep large trace CSVs lazy, so opening
+an overview does not deserialize every trajectory. The source tree is fingerprinted before and
+after indexing; if an experiment is still writing files, the build stops without publishing a
+mixed-time snapshot. Duplicate aliases remain browsable but are excluded exactly once from
+aggregates, and comparisons are only promoted to paired claims when parameter hashes are unique
+and the required simulator/AV/sampler provenance is recorded.
+
+Frontend development uses the pinned npm lock file:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+The React development server proxies `/api` to the FastAPI server. `npm run build` writes the
+production assets consumed by `pisa-analysis ui`.
 
 ## CLI
 
@@ -33,9 +98,13 @@ This repo provides these commands:
 - `pisa-sample-trajectory`: render agent trajectory SVGs from completed runner results. See [docs/trajectory](docs/trajectory/README.md).
 - `pisa-trajectory-compare`: compare non-ego trajectories between two simulator result sets. See [docs/trajectory-compare](docs/trajectory-compare/README.md).
 - `pisa-outcome-eval`: evaluate offline condition trees against completed monitor logs. See [docs/outcome-eval](docs/outcome-eval/README.md).
+- `pisa-experiment-runner`: execute configured experiments and manage owned Docker resources. See [docs/experiment-runner](docs/experiment-runner/README.md).
 
-Launch the interactive local Report Builder when you prefer to configure experiments,
-campaigns, specs, validation, and output without writing CLI commands:
+Every compatibility tool is also reachable through the unified command, including
+`pisa-analysis sample preview|export|analyze`, `trajectory`, `trajectory-compare`,
+`outcome-eval`, and `experiment-runner`.
+
+The previous builder entry remains available as a compatibility route:
 
 ```bash
 uv run pisa-analysis builder
@@ -182,6 +251,10 @@ uv run pisa-sample-export \
 ```
 
 The default archive path is `{output_dir}.zip`. Use `--zip-path /path/to/archive.zip` to choose a specific path.
+
+Use `--source-path-mode relative-to-output` for a relocatable manifest. Every source and
+generated-artifact path is then recorded relative to the export root; the default `absolute`
+mode records resolved absolute paths for machine-local provenance.
 
 You can also use a sampler runtime spec directly when you provide a scenario path:
 
@@ -468,7 +541,11 @@ Existing output directories are rejected by default. Use `--overwrite` only for 
 
 ## Trajectory Comparison
 
-`pisa-trajectory-compare` compares the same concrete scenario across two simulator/result sets. It reads `agent_states.csv` from each side, ignores `agent_id == 1` by default, compares overlapping non-ego agents, truncates each agent to the shorter timestep count, and writes metrics plus overlaid trajectory SVGs.
+`pisa-trajectory-compare` compares the same concrete scenario across two simulator/result sets.
+It reads `agent_states.csv` from each side, uses recorded `is_ego` metadata (falling back to
+`agent_id == 0`), and compares overlapping non-ego agents on their shared simulation-time
+interval. Position and speed are linearly interpolated without extrapolation; legacy traces
+without timestamps fall back to matching step indices and then row order.
 
 Compare one concrete scenario:
 

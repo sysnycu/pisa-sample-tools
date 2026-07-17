@@ -21,7 +21,15 @@ def _write_agent_states(path: Path, rows: list[dict[str, object]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["step_index", "sim_time_ms", "agent_id", "x", "y", "speed"],
+            fieldnames=[
+                "step_index",
+                "sim_time_ms",
+                "agent_id",
+                "x",
+                "y",
+                "speed",
+                "is_ego",
+            ],
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -72,6 +80,24 @@ def test_compare_states_ignores_ego_and_truncates_to_shorter_timestep() -> None:
     assert agent.mean_speed_delta == pytest.approx(2.0)
 
 
+def test_compare_states_aligns_different_sampling_grids_by_sim_time() -> None:
+    left = [
+        AgentState(step_index=0, sim_time_ms=0, agent_id="1", x=0, y=0, speed=0),
+        AgentState(step_index=1, sim_time_ms=100, agent_id="1", x=10, y=0, speed=10),
+    ]
+    right = [
+        AgentState(step_index=0, sim_time_ms=25, agent_id="1", x=2.5, y=1, speed=2.5),
+        AgentState(step_index=1, sim_time_ms=75, agent_id="1", x=7.5, y=1, speed=7.5),
+    ]
+
+    comparison = compare_states(left, right, ignore_agent_ids=set())[0]
+
+    assert comparison.compared_steps == 2
+    assert comparison.ade == pytest.approx(1.0)
+    assert comparison.fde == pytest.approx(1.0)
+    assert comparison.mean_speed_delta == pytest.approx(0.0)
+
+
 def test_compare_single_iteration_writes_svg_summary_and_manifest(tmp_path: Path) -> None:
     left = tmp_path / "left" / "iteration_1"
     right = tmp_path / "right" / "iteration_1"
@@ -82,19 +108,38 @@ def test_compare_single_iteration_writes_svg_summary_and_manifest(tmp_path: Path
     result = compare_trajectory_sets(left_path=left, right_path=right, output_dir=output_dir)
 
     assert len(result.comparisons) == 1
-    assert result.comparisons[0].ade == pytest.approx(1.0)
+    assert result.comparisons[0].ade == pytest.approx(100.0)
     assert (output_dir / "iteration_1_comparison.svg").exists()
     assert (output_dir / "summary.csv").exists()
     manifest = yaml.safe_load((output_dir / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["comparison_count"] == 1
     assert manifest["scale_mode"] == "equal"
-    assert manifest["ignore_agent_ids"] == ["1"]
-    assert manifest["comparisons"][0]["agents"][0]["agent_id"] == "0"
+    assert manifest["ignore_agent_ids"] == ["0"]
+    assert manifest["comparisons"][0]["agents"][0]["agent_id"] == "1"
     svg = (output_dir / "iteration_1_comparison.svg").read_text(encoding="utf-8")
-    assert "ADE 1" in svg
+    assert "ADE 100" in svg
     assert "solid" in svg
     assert "dashed" in svg
-    assert "ignored agents: 1" in svg
+    assert "ignored agents: 0" in svg
+
+
+def test_compare_uses_recorded_ego_metadata_before_fallback(tmp_path: Path) -> None:
+    left = tmp_path / "left" / "iteration_1"
+    right = tmp_path / "right" / "iteration_1"
+    left_rows = [dict(row, is_ego=row["agent_id"] == 1) for row in _left_rows()]
+    right_rows = [dict(row, is_ego=row["agent_id"] == 1) for row in _right_rows()]
+    _write_agent_states(left / "monitor" / "agent_states.csv", left_rows)
+    _write_agent_states(right / "monitor" / "agent_states.csv", right_rows)
+
+    result = compare_trajectory_sets(
+        left_path=left,
+        right_path=right,
+        output_dir=tmp_path / "compare",
+    )
+
+    assert [item.agent_id for item in result.comparisons[0].agents] == ["0"]
+    manifest = yaml.safe_load((tmp_path / "compare" / "manifest.yaml").read_text())
+    assert manifest["ignore_agent_ids"] == ["1"]
 
 
 def test_compare_svg_defaults_to_equal_scale_like_trajectory(tmp_path: Path) -> None:
@@ -104,7 +149,12 @@ def test_compare_svg_defaults_to_equal_scale_like_trajectory(tmp_path: Path) -> 
     _write_agent_states(right / "monitor" / "agent_states.csv", _right_rows())
     output_dir = tmp_path / "compare"
 
-    compare_trajectory_sets(left_path=left, right_path=right, output_dir=output_dir)
+    compare_trajectory_sets(
+        left_path=left,
+        right_path=right,
+        output_dir=output_dir,
+        ignore_agent_ids={"1"},
+    )
 
     svg = (output_dir / "iteration_1_comparison.svg").read_text(encoding="utf-8")
     match = re.search(r'id="trajectory-plot-area"[^>]*width="(?P<width>[^"]+)"[^>]*height="(?P<height>[^"]+)"', svg)
@@ -119,7 +169,13 @@ def test_compare_svg_can_use_stretch_scale(tmp_path: Path) -> None:
     _write_agent_states(right / "monitor" / "agent_states.csv", _right_rows())
     output_dir = tmp_path / "compare"
 
-    compare_trajectory_sets(left_path=left, right_path=right, output_dir=output_dir, equal_scale=False)
+    compare_trajectory_sets(
+        left_path=left,
+        right_path=right,
+        output_dir=output_dir,
+        ignore_agent_ids={"1"},
+        equal_scale=False,
+    )
 
     svg = (output_dir / "iteration_1_comparison.svg").read_text(encoding="utf-8")
     match = re.search(r'id="trajectory-plot-area"[^>]*width="(?P<width>[^"]+)"[^>]*height="(?P<height>[^"]+)"', svg)
@@ -189,7 +245,12 @@ def test_compare_skips_pairs_without_non_ego_overlap_without_writing_svg(tmp_pat
     output_dir = tmp_path / "compare"
 
     with pytest.raises(TrajectoryCompareError, match="no non-ignored agents overlapped"):
-        compare_trajectory_sets(left_path=left, right_path=right, output_dir=output_dir)
+        compare_trajectory_sets(
+            left_path=left,
+            right_path=right,
+            output_dir=output_dir,
+            ignore_agent_ids={"1"},
+        )
 
     assert not (output_dir / "iteration_1_comparison.svg").exists()
 

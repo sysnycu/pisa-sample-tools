@@ -29,7 +29,6 @@ def compare_trajectory_sets(
     height: int = 820,
     equal_scale: bool = True,
 ) -> TrajectoryCompareBatchResult:
-    ignore_agent_ids = ignore_agent_ids or {"1"}
     pairs = pair_agent_state_files(left_path.expanduser(), right_path.expanduser())
     if not pairs:
         raise TrajectoryCompareError("no comparable agent state files found")
@@ -37,7 +36,16 @@ def compare_trajectory_sets(
     output_dir = output_dir.expanduser()
     prepare_compare_output_dir(output_dir, overwrite=overwrite)
     comparisons: list[TrajectoryComparison] = []
+    used_ignore_agent_ids: set[str] = set()
     for name, left_file, right_file in pairs:
+        pair_ignore_ids = ignore_agent_ids
+        if pair_ignore_ids is None:
+            left_states = load_agent_states(left_file)
+            right_states = load_agent_states(right_file)
+            pair_ignore_ids = {
+                state.agent_id for state in (*left_states, *right_states) if state.is_ego is True
+            } or {"0"}
+        used_ignore_agent_ids.update(pair_ignore_ids)
         comparison = compare_agent_state_files(
             left_file=left_file,
             right_file=right_file,
@@ -45,7 +53,7 @@ def compare_trajectory_sets(
             name=name,
             left_label=left_label or _default_label(left_path),
             right_label=right_label or _default_label(right_path),
-            ignore_agent_ids=ignore_agent_ids,
+            ignore_agent_ids=pair_ignore_ids,
             width=width,
             height=height,
             equal_scale=equal_scale,
@@ -65,7 +73,7 @@ def compare_trajectory_sets(
         right_path=right_path,
         left_label=left_label or _default_label(left_path),
         right_label=right_label or _default_label(right_path),
-        ignore_agent_ids=ignore_agent_ids,
+        ignore_agent_ids=used_ignore_agent_ids or {"0"},
         equal_scale=equal_scale,
         comparisons=comparisons,
         summary_csv_path=summary_csv_path,

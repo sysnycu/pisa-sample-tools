@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,6 +86,7 @@ def export_samples(
     if create_zip and zip_path is None:
         zip_path = default_zip_path(output_dir)
 
+    output_dir = output_dir.expanduser()
     shard_entries: list[dict[str, Any]] = []
     for index, shard_samples in enumerate(shards):
         bundle_id = index + 1
@@ -99,11 +101,13 @@ def export_samples(
                 "index": index,
                 "bundle_id": bundle_id,
                 "sample_count": len(shard_samples),
-                "bundle_path": str(bundle_dir),
-                "scenario_file_path": str(xosc_path),
-                "sample_file_path": str(explicit_path),
-                "spec_file_path": str(spec_path),
-                "stop_conditions_file_path": str(stop_conditions_path),
+                "bundle_path": _manifest_path(bundle_dir, output_dir, source_path_mode),
+                "scenario_file_path": _manifest_path(xosc_path, output_dir, source_path_mode),
+                "sample_file_path": _manifest_path(explicit_path, output_dir, source_path_mode),
+                "spec_file_path": _manifest_path(spec_path, output_dir, source_path_mode),
+                "stop_conditions_file_path": _manifest_path(
+                    stop_conditions_path, output_dir, source_path_mode
+                ),
                 "first_sample_id": shard_samples[0].id if shard_samples else None,
                 "last_sample_id": shard_samples[-1].id if shard_samples else None,
             }
@@ -115,32 +119,46 @@ def export_samples(
             assert zip_path is not None
             prepare_zip_path(zip_path, overwrite=overwrite)
         for shard_entry, shard_samples in zip(shard_entries, shards, strict=True):
-            bundle_dir = Path(shard_entry["bundle_path"])
+            bundle_dir = output_dir / (
+                f"{scenario_assets.name}-{sampler_runtime_spec.get('name')}"
+                f"{shard_entry['bundle_id']}"
+            )
             bundle_dir.mkdir()
-            shutil.copy2(scenario_assets.xosc_path, shard_entry["scenario_file_path"])
-            shutil.copy2(scenario_assets.spec_path, shard_entry["spec_file_path"])
+            shutil.copy2(scenario_assets.xosc_path, bundle_dir / f"{scenario_assets.name}.xosc")
+            shutil.copy2(scenario_assets.spec_path, bundle_dir / "spec.yaml")
             shutil.copy2(
                 scenario_assets.stop_conditions_path,
-                shard_entry["stop_conditions_file_path"],
+                bundle_dir / "stop_conditions.yaml",
             )
             write_export_yaml(
-                Path(shard_entry["sample_file_path"]),
+                bundle_dir / EXPLICIT_SAMPLE_FILE_NAME,
                 {"samples": [sample_to_dict(sample) for sample in shard_samples]},
             )
 
     manifest = {
         "generated_at": datetime.now(UTC).isoformat(),
-        "runner_spec_path": str(runner_spec_path) if runner_spec_path is not None else None,
-        "sampler_spec_path": str(sampler_spec_path) if sampler_spec_path is not None else None,
+        "source_path_mode": source_path_mode.value,
+        "runner_spec_path": _optional_manifest_path(
+            runner_spec_path, output_dir, source_path_mode
+        ),
+        "sampler_spec_path": _optional_manifest_path(
+            sampler_spec_path, output_dir, source_path_mode
+        ),
         "scenario_name": scenario_assets.name,
-        "scenario_path": str(scenario_path) if scenario_path is not None else None,
-        "scenario_base": str(scenario_base) if scenario_base is not None else None,
-        "scenario_xosc_path": str(scenario_assets.xosc_path),
-        "scenario_spec_path": str(scenario_assets.spec_path),
-        "stop_conditions_path": str(scenario_assets.stop_conditions_path),
+        "scenario_path": _optional_manifest_path(scenario_path, output_dir, source_path_mode),
+        "scenario_base": _optional_manifest_path(scenario_base, output_dir, source_path_mode),
+        "scenario_xosc_path": _manifest_path(
+            scenario_assets.xosc_path, output_dir, source_path_mode
+        ),
+        "scenario_spec_path": _manifest_path(
+            scenario_assets.spec_path, output_dir, source_path_mode
+        ),
+        "stop_conditions_path": _manifest_path(
+            scenario_assets.stop_conditions_path, output_dir, source_path_mode
+        ),
         "sampler_name": sampler_runtime_spec.get("name"),
         "sampler_config_path": sampler_runtime_spec.get("config_path"),
-        "source_path": str(source_path),
+        "source_path": _manifest_path(source_path, output_dir, source_path_mode),
         "source_type": source_type,
         "total_samples": len(samples),
         "shard_count": len(shards),
@@ -173,3 +191,24 @@ def export_samples(
         summary=summary,
     )
 
+
+def _optional_manifest_path(
+    path: Path | None,
+    output_dir: Path,
+    mode: SourcePathMode,
+) -> str | None:
+    return None if path is None else _manifest_path(path, output_dir, mode)
+
+
+def _manifest_path(path: Path, output_dir: Path, mode: SourcePathMode) -> str:
+    """Serialize paths consistently for either reproducibility or portable bundles.
+
+    Relative paths are relative to the export root (including ``..`` for source
+    inputs outside that root), so relocating the root and its nearby source tree
+    preserves references. Absolute mode resolves symlinks and user expansions.
+    """
+
+    resolved = path.expanduser().resolve()
+    if mode is SourcePathMode.ABSOLUTE:
+        return str(resolved)
+    return os.path.relpath(resolved, start=output_dir.expanduser().resolve())
