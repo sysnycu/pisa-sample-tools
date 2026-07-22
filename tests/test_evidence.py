@@ -547,7 +547,7 @@ def test_static_profile_build_embeds_compact_snapshot_and_detailed_profile(
     assert "window.PISA_ANALYSIS_DATA=" in html
     assert '"kind": "portable"' in html
     assert manifest["schema_version"] == 3
-    assert manifest["report_build_version"] == 9
+    assert manifest["report_build_version"] == 11
     assert (output / "provenance" / "build_profile.pstats").is_file()
     assert (output / "provenance" / "build_profile.txt").is_file()
     assert all(item["stage"] and item["duration_seconds"] >= 0 for item in timings)

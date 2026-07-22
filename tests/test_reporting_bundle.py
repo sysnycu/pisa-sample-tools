@@ -23,7 +23,9 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def _experiment(root: Path, *, execution: str, outcome: str = "success") -> None:
+def _experiment(
+    root: Path, *, execution: str, outcome: str = "success", av: str = "simple-av"
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "execution_manifest.yaml").write_text(
         yaml.safe_dump(
@@ -34,8 +36,14 @@ def _experiment(root: Path, *, execution: str, outcome: str = "success") -> None
                 "summary": {"finished": 1},
                 "execution": {"sampler_name": "lhs"},
                 "components": {
-                    "simulator": {"component": {"name": "esmini"}},
-                    "av": {"component": {"name": "simple-av"}},
+                    "simulator": {
+                        "component": {"name": "esmini"},
+                        "wrapper": {"name": "esmini-wrapper", "version": "1.0"},
+                    },
+                    "av": {
+                        "component": {"name": av},
+                        "wrapper": {"name": "av-wrapper", "version": "1.0"},
+                    },
                 },
             },
             sort_keys=False,
@@ -52,7 +60,7 @@ def _experiment(root: Path, *, execution: str, outcome: str = "success") -> None
                 "run.sample_id": "1",
                 "run.attempt": 1,
                 "run.parameter_hash": "same-hash",
-                "run.params": json.dumps({"x": 1}),
+                "run.params": json.dumps({"x": 1, "y": 2}),
             }
         ],
     )
@@ -73,9 +81,9 @@ def test_bundle_is_atomic_compact_and_collapses_duplicate_aliases(tmp_path: Path
     manifest = yaml.safe_load(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["tool"] == "pisa-analysis-tools"
     assert manifest["schema_version"] == 3
-    assert manifest["report_build_version"] == 9
-    assert manifest["report_store_schema"] == 1
-    assert manifest["store_schema_version"] == 1
+    assert manifest["report_build_version"] == 11
+    assert manifest["report_store_schema"] == 2
+    assert manifest["store_schema_version"] == 2
     assert manifest["dataset_count"] == 2
     assert manifest["run_count"] == 2
     assert manifest["aggregate_run_count"] == 1
@@ -91,6 +99,26 @@ def test_bundle_is_atomic_compact_and_collapses_duplicate_aliases(tmp_path: Path
     assert str(tmp_path) not in report
     assert str(tmp_path) not in result.summary_json_path.read_text(encoding="utf-8")
     assert not list(output.parent.glob(f".{output.name}.building-*"))
+
+
+def test_bundle_embeds_portable_paired_parameter_regions(tmp_path: Path) -> None:
+    inputs = tmp_path / "inputs"
+    _experiment(inputs / "left", execution="left", outcome="success", av="av-left")
+    _experiment(inputs / "right", execution="right", outcome="fail", av="av-right")
+    output = tmp_path / "bundle"
+
+    result = build_report_bundle(inputs, output)
+
+    regions = json.loads(
+        (output / "summary" / "paired_parameter_regions.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert regions["schema_version"] == 1
+    assert (output / "summary" / "paired_parameter_regions.csv").is_file()
+    html = result.report_path.read_text(encoding="utf-8")
+    assert "Paired parameter regions" in html
+    assert "derived_parameters_used" in html
 
 
 def test_bundle_overwrite_requires_owned_manifest(tmp_path: Path) -> None:

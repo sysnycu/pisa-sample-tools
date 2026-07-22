@@ -77,7 +77,11 @@ describe('API contract adapters', () => {
         id: 'job-1', kind: 'report_build', status: 'queued', phase: 'queued',
         progress: { current: null, total: null, unit: null }, created_at: '2026-07-14T00:00:00Z',
       }))
-      .mockResolvedValueOnce(json({ id: 'job-2', kind: 'report_rebuild', status: 'queued', phase: 'queued', created_at: '2026-07-14T00:00:00Z' }));
+      .mockResolvedValueOnce(json({ id: 'job-2', kind: 'report_rebuild', status: 'queued', phase: 'queued', created_at: '2026-07-14T00:00:00Z' }))
+      .mockResolvedValueOnce(json({ id: 'job-3', kind: 'report_preview', status: 'queued', phase: 'queued', created_at: '2026-07-14T00:00:00Z' }))
+      .mockResolvedValueOnce(json({ id: 'job-4', kind: 'report_persist', status: 'queued', phase: 'queued', created_at: '2026-07-14T00:00:00Z' }))
+      .mockResolvedValueOnce(json({ id: 'temporary', name: 'Preview', path: '/tmp/preview', storage_kind: 'temporary', expires_at: '2026-07-14T00:10:00Z' }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
     const api = new ApiClient('/api/v1');
 
     await api.datasets.validate({ path: '/opt/sbsvf/outputs/pisa-exp/', deep: true });
@@ -96,6 +100,88 @@ describe('API contract adapters', () => {
     await api.datasets.rebuild('legacy-report', { output_dir: './analysis/rebuilt', sensitivity: true });
     expect(String(fetch.mock.calls[2][0])).toContain('/reports/legacy-report/rebuild');
     expect(bodyOf(fetch.mock.calls[2])).toEqual({ output_dir: './analysis/rebuilt', sensitivity: true });
+
+    await api.datasets.previewBuild({ results_paths: ['/opt/sbsvf/outputs/pisa-exp/'], report_name: 'Quick look', engine: 'normalized' });
+    expect(String(fetch.mock.calls[3][0])).toContain('/reports/previews');
+    expect(bodyOf(fetch.mock.calls[3])).not.toHaveProperty('output_dir');
+    await api.datasets.persist('temporary', { output_dir: './analysis/Quick-look' });
+    expect(bodyOf(fetch.mock.calls[4])).toEqual({ output_dir: './analysis/Quick-look' });
+    expect(await api.datasets.lease('temporary')).toMatchObject({ storage_kind: 'temporary', name: 'Preview' });
+    await api.datasets.discardPreview('temporary');
+    expect((fetch.mock.calls[6][1] as RequestInit).method).toBe('DELETE');
+  });
+
+  it('submits paired parameter analysis without deriving input fields', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(json({
+      schema_version: 1, relation_id: 'pair-1', left: 'a', right: 'b', role: 'paired_policy_intervention',
+      pairing_key: 'parameter_hash unique within each dataset', parameters: ['Ego_Speed', 'Agent_Speed'], metrics: [],
+      selection: { x: 'Ego_Speed', y: 'Agent_Speed', facet: null, view: 'outcome', metric: null, delta_definition: 'right minus left', bin_count: 5, boundaries: {}, minimum_cell_count: 10 },
+      overview: { paired_count: 100, agreement_count: 80, disagreement_count: 20, disagreement_rate: 0.2, direct_reversal_count: 18, invalid_related_count: 2, categories: {}, transitions: {}, metric_eligible_count: 0, metric_missing_count: 0 },
+      marginals: [], heatmaps: [], observations: [], candidates: [], points: [],
+      coverage: { paired_count: 100, complete_parameter_count: 100, included_count: 100, excluded_incomplete_parameters: 0, excluded_by_boundaries: 0, excluded_by_facet: 0, plotted_count: 100, point_limit: 20000, sampled: false },
+      disclosure: { input_scope: 'recorded original parameters only', derived_parameters_used: false },
+    }));
+    const api = new ApiClient('/api/v1');
+
+    const result = await api.datasets.pairedParameterAnalysis('report-1', 'pair-1', {
+      x: 'Ego_Speed', y: 'Agent_Speed', bin_count: 5,
+      boundaries: { Ego_Speed: [10, 15, 20] },
+    });
+
+    expect(result.overview).toMatchObject({ disagreement_count: 20, paired_count: 100 });
+    expect(String(fetch.mock.calls[0][0])).toContain('/comparisons/pair-1/parameter-analysis');
+    expect(bodyOf(fetch.mock.calls[0])).toEqual({ x: 'Ego_Speed', y: 'Agent_Speed', bin_count: 5, boundaries: { Ego_Speed: [10, 15, 20] } });
+  });
+
+  it('submits paired metric agreement with explicit orientation and boundaries', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(json({
+      schema_version: 1, relation_id: 'pair-1', left: 'autoware', right: 'plant', role: 'paired_policy_intervention',
+      pairing_key: 'parameter_hash unique within each dataset', metrics: [{ key: 'distance.min', label: 'distance min', unit: 'm' }],
+      selection: { metric: 'distance.min', unit: 'm', x_side: 'right', x_dataset: 'plant', y_dataset: 'autoware', outcome_scope: 'success', primary_threshold: 5, secondary_threshold: 10, difference_definition: 'y minus x' },
+      summary: { paired_count: 1000, metric_eligible_count: 1000, metric_missing_count: 0, same_outcome_metric_eligible_count: 761, outcome_disagreement_metric_eligible_count: 239, included: { count: 652, thresholds: [] }, categories: {} },
+      points: [], coverage: { included_count: 652, plotted_count: 652, point_limit: 20000, sampled: false }, disclosure: {},
+    }));
+    const api = new ApiClient('/api/v1');
+    const request = { metric: 'distance.min', x_side: 'right' as const, outcome_scope: 'success' as const, primary_threshold: 5, secondary_threshold: 10 };
+
+    const result = await api.datasets.pairedMetricAgreement('report-1', 'pair-1', request);
+
+    expect(result.selection).toMatchObject({ x_dataset: 'plant', y_dataset: 'autoware' });
+    expect(String(fetch.mock.calls[0][0])).toContain('/comparisons/pair-1/metric-agreement');
+    expect(bodyOf(fetch.mock.calls[0])).toEqual(request);
+  });
+
+  it('normalizes quick/deep consistency and submits an explicit optional profile', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({
+        quick: {
+          schema_version: 1, available: true, dataset_count: 2, canonical_dataset_count: 2,
+          group_count: 1, excluded_duplicate_aliases: [],
+          groups: [{
+            id: 'g1', datasets: ['a', 'b'], experiment_count: 2, common_sample_count: 10,
+            union_sample_count: 10, excluded_noncommon_sample_count: 0,
+            information_consistent_count: 8, information_comparable_count: 10,
+            information_agreement_ratio: 0.8,
+            discrete: [{ key: 'outcome', label: 'Outcome', consistent_count: 9, comparable_count: 10, agreement_ratio: 0.9, unavailable_sample_count: 0 }],
+            continuous: [], runtime: [], outcome_patterns: [], pairwise: [], hash_quality: {},
+          }],
+        },
+        deep: {
+          state: 'ready', cache_key: 'cache', artifacts: [{ path: 'consistency/derived/cache/summary.json', download_url: '/summary.json' }],
+          summary: { generated_at: '2026-07-18T00:00:00Z', profile: 'trajectory_outlier_controls', sample_count: 10, position_tolerances_m: [0.01], groups: [{ id: 'g1', datasets: ['a', 'b'], sample_count: 10, trajectory_comparable_count: 9, outcome_agreement_count: 9, strict_exact_count: 8, lengths_equal_count: 9, position_tolerance_counts: { '0.01': 9 }, max_position_error_m: { p95: 0.005, max: 0.02 } }] },
+        },
+      }))
+      .mockResolvedValueOnce(json({ id: 'consistency-job', kind: 'consistency_analysis', status: 'queued', phase: 'queued', created_at: '2026-07-18T00:00:00Z' }));
+    const api = new ApiClient('/api/v1');
+
+    const result = await api.datasets.consistency('report-1');
+    expect(result.quick.groups[0]).toMatchObject({ common_sample_count: 10, information_agreement_ratio: 0.8 });
+    expect(result.deep.summary?.groups[0]).toMatchObject({ trajectory_comparable_count: 9, strict_exact_count: 8 });
+    expect(result.deep.artifacts?.[0]).toEqual({ path: 'consistency/derived/cache/summary.json', download_url: '/summary.json' });
+
+    const request = { profile: 'full_controls' as const, position_tolerances_m: [0.001, 0.01, 0.1], outlier_limit: 50, force: true };
+    expect(await api.datasets.analyzeConsistency('report-1', request)).toMatchObject({ id: 'consistency-job', state: 'queued' });
+    expect(bodyOf(fetch.mock.calls[1])).toEqual(request);
   });
 
   it('previews an existing native sampler without rewriting it as an inline request', async () => {

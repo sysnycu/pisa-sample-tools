@@ -1555,7 +1555,7 @@ def _json_mapping(value: Any) -> dict[str, Any]:
         return value
     try:
         parsed = json.loads(str(value))
-    except TypeError, ValueError, json.JSONDecodeError:
+    except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
 

@@ -1,25 +1,43 @@
-import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Accordion, ActionIcon, Alert, Anchor, Badge, Button, Card, Checkbox, Code, Divider, Group, NumberInput, Popover, Progress, ScrollArea, Select, SimpleGrid, Stack, Tabs, Text, TextInput, ThemeIcon } from '@mantine/core';
+import { type CSSProperties, type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Accordion, ActionIcon, Alert, Anchor, Badge, Button, Card, Checkbox, Code, ColorInput, Divider, Group, Modal, MultiSelect, NumberInput, Popover, Progress, ScrollArea, Select, SimpleGrid, Stack, Tabs, Text, TextInput, ThemeIcon } from '@mantine/core';
 import {
-  IconAlertTriangle, IconArrowLeft, IconCarCrash, IconCheck, IconClock, IconDatabase,
-  IconDownload, IconFileAnalytics, IconFolder, IconMovie, IconPlayerPlay, IconRefresh, IconRoute, IconSearch, IconShieldCheck,
+  IconAlertTriangle, IconArrowDown, IconArrowLeft, IconArrowsSort, IconArrowUp, IconCarCrash, IconCheck, IconClock, IconDatabase,
+  IconDownload, IconFolder, IconFolderPlus, IconMovie, IconPlayerPlay, IconRefresh, IconRoute, IconSearch, IconShieldCheck,
 } from '@tabler/icons-react';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api/client';
-import { useDatasets, useReportCharts, useReportSummary } from '../api/query';
-import type { CaseDetail, ComparisonClass, CrossExperimentComparison, DataHealthFinding, ReportSummary, RunRecord, VisualizationSpec } from '../api/types';
+import { useReportCharts, useReportSummary } from '../api/query';
+import type { CaseDetail, ComparisonClass, ConsistencyAnalyzeRequest, ConsistencyGroup, CrossExperimentComparison, DataHealthFinding, DatasetDescriptor, Job, PairedMetricAgreement as PairedMetricAgreementResult, PairedParameterAnalysis as PairedParameterAnalysisResult, ReportSummary, RunRecord, VisualizationSpec } from '../api/types';
 import { EmptyState, InlineError, PageLoading } from '../components/Feedback';
 import { MetricCard } from '../components/MetricCard';
 import { PageHeader } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
 import { VisualizationCard } from '../components/VisualizationCard';
+import type { SeriesStyleOverride } from '../components/VisualizationCard';
 
 const sections = [
   ['overview', 'Overview'], ['sampling', 'Sampling'], ['outcomes', 'Outcomes & safety'], ['performance', 'Performance'],
-  ['compare', 'Compare'], ['sensitivity', 'Sensitivity'], ['runs', 'Runs'], ['replay', 'Run detail / replay'],
+  ['compare', 'Compare'], ['consistency', 'Consistency'], ['sensitivity', 'Sensitivity'], ['runs', 'Runs'], ['replay', 'Run detail / replay'],
   ['media', 'Media'], ['provenance', 'Provenance & health'], ['exports', 'Exports'],
 ] as const;
+
+const sequentialColorRange: [string, string, string] = ['#dce6ff', '#526ff0', '#c92a2a'];
+const deltaColorRange: [string, string, string] = ['#00a6a6', '#f8fafc', '#7e2f8e'];
+
+export function interpolateColorRange(value: number, minimum: number, maximum: number, colors: [string, string, string]): string {
+  const parse = (color: string) => /^#[0-9a-f]{6}$/i.test(color) ? [1, 3, 5].map((index) => Number.parseInt(color.slice(index, index + 2), 16)) : undefined;
+  const parsed = colors.map(parse);
+  if (parsed.some((color) => !color) || !Number.isFinite(value) || !Number.isFinite(minimum) || !Number.isFinite(maximum)) return '#6b7280';
+  const position = maximum > minimum ? Math.max(0, Math.min(1, (value - minimum) / (maximum - minimum))) : 0.5;
+  const segment = position <= 0.5 ? 0 : 1;
+  const amount = position <= 0.5 ? position * 2 : (position - 0.5) * 2;
+  const left = parsed[segment]!, right = parsed[segment + 1]!;
+  const channel = (index: number) => Math.round(left[index] + (right[index] - left[index]) * amount).toString(16).padStart(2, '0');
+  return `#${channel(0)}${channel(1)}${channel(2)}`;
+}
+
+const ANALYSIS_ROOT = '/home/hcis-s05/ysws/PISA/pisa-sample-tools/analysis';
 
 type ReplayScalar = string | number | boolean | null;
 
@@ -139,6 +157,159 @@ function escapeHtml(value: unknown): string {
 
 function scatterCategory(point: { outcome: string; color?: unknown }, selectedColor: string): string {
   return String(selectedColor === 'outcome' ? point.outcome : point.color ?? 'Missing');
+}
+
+function HorizontalRangeInput({ minimum, maximum, step, value, onChange }: {
+  minimum: number;
+  maximum: number;
+  step: number;
+  value: [number, number];
+  onChange: (value: [number, number]) => void;
+}) {
+  const span = Math.max(1e-12, maximum - minimum);
+  const start = 100 * (value[0] - minimum) / span;
+  const end = 100 * (value[1] - minimum) / span;
+  const style = { '--pisa-range-start': `${start}%`, '--pisa-range-end': `${end}%` } as CSSProperties;
+  return <div className="pisa-dual-range" style={style}>
+    <input className="pisa-horizontal-range pisa-dual-range__input" type="range" aria-label="Filter minimum" min={minimum} max={maximum} step={step} value={value[0]} onChange={(event) => onChange([Math.min(Number(event.currentTarget.value), value[1]), value[1]])} />
+    <input className="pisa-horizontal-range pisa-dual-range__input" type="range" aria-label="Filter maximum" min={minimum} max={maximum} step={step} value={value[1]} onChange={(event) => onChange([value[0], Math.max(Number(event.currentTarget.value), value[0])])} />
+  </div>;
+}
+
+type DisagreementHeatmapPoint = {
+  x: number;
+  y: number;
+  left_outcome?: string;
+  right_outcome?: string;
+};
+
+export function formatHeatmapCellLabel(disagreement: number, total: number, showCounts: boolean, showPercentage: boolean): string {
+  return [
+    showCounts ? `${disagreement}/${total}` : '',
+    showPercentage ? `${(100 * disagreement / Math.max(1, total)).toFixed(1)}%` : '',
+  ].filter(Boolean).join('\n');
+}
+
+export function buildDisagreementHeatmap(
+  points: DisagreementHeatmapPoint[],
+  xBinCount: number,
+  yBinCount: number,
+  bounds: Partial<{ xMin: number; xMax: number; yMin: number; yMax: number }> = {},
+) {
+  const boundedXCount = Math.max(2, Math.min(20, Math.round(xBinCount)));
+  const boundedYCount = Math.max(2, Math.min(20, Math.round(yBinCount)));
+  if (!points.length) return { xLabels: [], yLabels: [], cells: [], disagreementCount: 0, totalCount: 0, excludedCount: 0 };
+  const xs = points.map((point) => point.x), ys = points.map((point) => point.y);
+  const observedXMin = Math.min(...xs), observedXMax = Math.max(...xs), observedYMin = Math.min(...ys), observedYMax = Math.max(...ys);
+  const xMin = bounds.xMin != null && bounds.xMax != null && bounds.xMin < bounds.xMax ? bounds.xMin : observedXMin;
+  const xMax = bounds.xMin != null && bounds.xMax != null && bounds.xMin < bounds.xMax ? bounds.xMax : observedXMax;
+  const yMin = bounds.yMin != null && bounds.yMax != null && bounds.yMin < bounds.yMax ? bounds.yMin : observedYMin;
+  const yMax = bounds.yMin != null && bounds.yMax != null && bounds.yMin < bounds.yMax ? bounds.yMax : observedYMax;
+  const xWidth = Math.max(1e-12, (xMax - xMin) / boundedXCount), yWidth = Math.max(1e-12, (yMax - yMin) / boundedYCount);
+  const label = (minimum: number, width: number, index: number, count: number) => {
+    const lower = Number((minimum + index * width).toPrecision(8));
+    const upper = Number((index === count - 1 ? minimum + count * width : minimum + (index + 1) * width).toPrecision(8));
+    return `${lower.toLocaleString()}–${upper.toLocaleString()}`;
+  };
+  const xLabels = Array.from({ length: boundedXCount }, (_, index) => label(xMin, xWidth, index, boundedXCount));
+  const yLabels = Array.from({ length: boundedYCount }, (_, index) => label(yMin, yWidth, index, boundedYCount));
+  const counts = Array.from({ length: boundedXCount * boundedYCount }, () => ({ total: 0, disagreement: 0 }));
+  const included = points.filter((point) => point.x >= xMin && point.x <= xMax && point.y >= yMin && point.y <= yMax);
+  for (const point of included) {
+    const xIndex = Math.min(boundedXCount - 1, Math.max(0, Math.floor((point.x - xMin) / xWidth)));
+    const yIndex = Math.min(boundedYCount - 1, Math.max(0, Math.floor((point.y - yMin) / yWidth)));
+    const cell = counts[yIndex * boundedXCount + xIndex];
+    cell.total += 1;
+    cell.disagreement += Number(point.left_outcome !== point.right_outcome);
+  }
+  const cells = counts.flatMap((cell, index) => cell.total ? [{
+    value: [index % boundedXCount, Math.floor(index / boundedXCount), cell.disagreement / cell.total, cell.disagreement, cell.total],
+    disagreement_count: cell.disagreement,
+    total_count: cell.total,
+  }] : []);
+  return {
+    xLabels,
+    yLabels,
+    cells,
+    disagreementCount: cells.reduce((total, cell) => total + cell.disagreement_count, 0),
+    totalCount: included.length,
+    excludedCount: points.length - included.length,
+  };
+}
+
+const compareOutcomeOrder = [
+  'all success', 'all pass', 'all fail', 'all invalid', 'all unknown',
+  'success → fail', 'pass → fail', 'success → invalid', 'pass → invalid',
+  'fail → success', 'fail → pass', 'invalid → success', 'invalid → pass',
+  'fail → invalid', 'invalid → fail',
+];
+
+export function compareScatterCategories(selectedColor: string, left: string, right: string): number {
+  const normalizedLeft = left.trim().toLowerCase(), normalizedRight = right.trim().toLowerCase();
+  if (selectedColor === 'outcome') {
+    const leftRank = compareOutcomeOrder.indexOf(normalizedLeft), rightRank = compareOutcomeOrder.indexOf(normalizedRight);
+    const rankedLeft = leftRank < 0 ? (normalizedLeft.includes('unknown') ? 100 : 50) : leftRank;
+    const rankedRight = rightRank < 0 ? (normalizedRight.includes('unknown') ? 100 : 50) : rightRank;
+    if (rankedLeft !== rankedRight) return rankedLeft - rankedRight;
+  } else if (selectedColor === 'stop_reason' || selectedColor === 'stop_condition') {
+    const categoryRank = (value: string) => value.startsWith('same ·') ? 0 : value.includes('→') ? 1 : value === 'missing' ? 3 : 2;
+    const rankDifference = categoryRank(normalizedLeft) - categoryRank(normalizedRight);
+    if (rankDifference) return rankDifference;
+  } else {
+    if (normalizedLeft === 'missing') return normalizedRight === 'missing' ? 0 : 1;
+    if (normalizedRight === 'missing') return -1;
+  }
+  return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function chartRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+export function replayChartWithVisibleAxes(spec: VisualizationSpec, visibility: Record<string, boolean>, colors: Record<string, string>): VisualizationSpec {
+  const rawSeries = Array.isArray(spec.option.series) ? spec.option.series.map(chartRecord).filter((value): value is Record<string, unknown> => Boolean(value)) : [];
+  const rawAxes = Array.isArray(spec.option.yAxis) ? spec.option.yAxis.map(chartRecord).filter((value): value is Record<string, unknown> => Boolean(value)) : [];
+  if (!rawSeries.length || !rawAxes.length) return spec;
+  const visibleAxisIndices = [...new Set(rawSeries.flatMap((series) => {
+    const name = typeof series.name === 'string' ? series.name : '';
+    if (!name || name.startsWith('__') || visibility[name] === false) return [];
+    const index = typeof series.yAxisIndex === 'number' ? series.yAxisIndex : 0;
+    return index >= 0 && index < rawAxes.length ? [index] : [];
+  }))].sort((left, right) => left - right);
+  const axisMap = new Map(visibleAxisIndices.map((original, index) => [original, index]));
+  const sideCounts = { left: 0, right: 0 };
+  const visibleAxes = visibleAxisIndices.map((index) => {
+    const axis = rawAxes[index];
+    const side = axis.position === 'right' ? 'right' : 'left';
+    const offset = sideCounts[side] * 54;
+    sideCounts[side] += 1;
+    return { ...axis, position: side, offset: offset || undefined };
+  });
+  const fallbackAxes = visibleAxes.length ? visibleAxes : [{ type: 'value', show: false }];
+  const series = rawSeries.map((entry) => {
+    const name = typeof entry.name === 'string' ? entry.name : '';
+    const originalAxis = typeof entry.yAxisIndex === 'number' ? entry.yAxisIndex : 0;
+    const customColor = name ? colors[name] : undefined;
+    return {
+      ...entry,
+      yAxisIndex: axisMap.get(originalAxis) ?? 0,
+      ...(customColor ? { lineStyle: { ...(chartRecord(entry.lineStyle) ?? {}), color: customColor }, itemStyle: { ...(chartRecord(entry.itemStyle) ?? {}), color: customColor } } : {}),
+    };
+  });
+  const grid = chartRecord(spec.option.grid) ?? {};
+  return {
+    ...spec,
+    option: {
+      ...spec.option,
+      grid: {
+        ...grid,
+        left: 76 + Math.max(0, sideCounts.left - 1) * 54,
+        right: 76 + Math.max(0, sideCounts.right - 1) * 54,
+      },
+      yAxis: fallbackAxes,
+      series,
+    },
+  };
 }
 
 function formatAxisTick(value: unknown): string {
@@ -309,27 +480,86 @@ function summaryCharts(summary: ReportSummary): VisualizationSpec[] {
   ];
 }
 
-function SelectReport() {
-  const [path, setPath] = useState('');
-  const browser = useQuery({ queryKey: ['report-browser-select', path], queryFn: () => api.datasets.browse(path || undefined), retry: 1 });
-  const reports = useDatasets('', path || browser.data?.path, false);
+function ReportStorage({ report }: { report: DatasetDescriptor }) {
   const navigate = useNavigate();
-  return (
-    <>
-      <PageHeader eyebrow="Evidence explorer" title="Choose a report workspace" description="Open an indexed report to explore sampling, outcomes, concrete runs, comparisons, and publication exports." />
-      <Card p="md" mb="lg"><Group align="flex-end" wrap="nowrap"><Button variant="default" leftSection={<IconArrowLeft size={15} />} disabled={!browser.data?.parent} onClick={() => browser.data?.parent && setPath(browser.data.parent)}>Up</Button><TextInput label="Current report directory" value={path || browser.data?.path || ''} onChange={(event) => setPath(event.currentTarget.value)} leftSection={<IconFolder size={15} />} style={{ flex: 1 }} /><Button variant="default" loading={browser.isFetching} onClick={() => browser.refetch()}>Open</Button></Group>{browser.data && <ScrollArea mt="md" type="auto"><Group wrap="nowrap" gap="xs">{browser.data.entries.filter((entry) => entry.kind === 'directory').map((entry) => <Button key={entry.path} variant="subtle" leftSection={<IconFolder size={14} />} onClick={() => setPath(entry.path)}>{entry.name}</Button>)}</Group></ScrollArea>}</Card>
-      {reports.isLoading ? <PageLoading label="Loading report library…" /> : reports.error ? <InlineError error={reports.error} onRetry={() => reports.refetch()} /> : !reports.data?.items.length ? (
-        <Card><EmptyState title="No report is ready" description="Build a report from the Dashboard first. It will appear here as soon as indexing completes." action={<Button component={Link} to="/">Open Dashboard</Button>} /></Card>
-      ) : (
-        <SimpleGrid cols={{ base: 1, md: 2, xl: 3 }}>{reports.data.items.map((report) => <Card key={report.id} p="lg"><Group justify="space-between"><ThemeIcon variant="light" size={40}><IconFileAnalytics size={20} /></ThemeIcon><StatusBadge value={report.status} /></Group><Text fw={650} mt="md">{report.name}</Text><Text size="xs" c="dimmed" className="pisa-code" lineClamp={1}>{report.path}</Text><Group gap="xs" my="md"><Badge variant="light" color="gray">{report.experiment_count} experiments</Badge><Badge variant="light" color="gray">{report.run_count.toLocaleString()} runs</Badge></Group><Button fullWidth variant="light" onClick={() => navigate(`/reports/${encodeURIComponent(report.id)}/overview`)}>Open workspace</Button></Card>)}</SimpleGrid>
-      )}
-    </>
-  );
+  const queryClient = useQueryClient();
+  const [opened, setOpened] = useState(false);
+  const [browsePath, setBrowsePath] = useState(ANALYSIS_ROOT);
+  const [outputParent, setOutputParent] = useState(ANALYSIS_ROOT);
+  const [reportName, setReportName] = useState(report.name);
+  const [overwrite, setOverwrite] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [showNewFolder, setShowNewFolder] = useState(false);
+  const [saveJob, setSaveJob] = useState<Job>();
+  const browser = useQuery({ queryKey: ['report-persist-browser', browsePath], queryFn: () => api.datasets.browse(browsePath || ANALYSIS_ROOT), enabled: opened, retry: 1 });
+  const createDirectory = useMutation({
+    mutationFn: () => api.datasets.createDirectory(browsePath || ANALYSIS_ROOT, newFolderName.trim()),
+    onSuccess: (data) => {
+      setBrowsePath(data.path); setOutputParent(data.path); setNewFolderName(''); setShowNewFolder(false);
+      void queryClient.invalidateQueries({ queryKey: ['report-persist-browser'] });
+    },
+  });
+  const persist = useMutation({
+    mutationFn: () => api.datasets.persist(report.id, { output_dir: `${outputParent.replace(/[\\/]+$/, '')}/${reportName.trim()}`, overwrite }),
+    onSuccess: setSaveJob,
+  });
+  const job = useQuery({ queryKey: ['job', saveJob?.id], queryFn: () => api.jobs.get(saveJob!.id), enabled: Boolean(saveJob), refetchInterval: (query) => ['queued', 'running'].includes(query.state.data?.state ?? '') ? 750 : false });
+  useEffect(() => {
+    if (job.data?.state !== 'succeeded' || !job.data.report_id) return;
+    void queryClient.invalidateQueries({ queryKey: ['report-browser'] });
+    void queryClient.invalidateQueries({ queryKey: ['report-preview-id'] });
+    void queryClient.invalidateQueries({ queryKey: ['datasets'] });
+    setOpened(false);
+    navigate(`/reports/${encodeURIComponent(job.data.report_id)}/overview`, { replace: true });
+  }, [job.data?.report_id, job.data?.state, navigate, queryClient]);
+  if (report.storage_kind !== 'temporary') {
+    return <Card p="md"><Group justify="space-between" align="center" wrap="wrap"><div><Group gap="xs"><Text fw={650}>Report storage</Text><Badge color="teal" variant="light">Saved report</Badge></Group><Text className="pisa-code" size="sm" c="dimmed" mt={4}>{report.path}</Text></div><Button variant="default" size="compact-sm" onClick={() => void navigator.clipboard?.writeText(report.path)}>Copy path</Button></Group></Card>;
+  }
+  const shownJob = job.data ?? saveJob;
+  const invalidName = !reportName.trim() || ['.', '..'].includes(reportName.trim()) || /[\\/]/.test(reportName);
+  return <>
+    <Alert color="indigo" title="Temporary report preview"><Group justify="space-between" align="center" wrap="wrap"><div><Text size="sm">This complete report is currently stored only for preview. Save it before leaving if you want to keep it.</Text><Text size="xs" c="dimmed">The preview stays active while this workspace is open and is discarded after 10 inactive minutes.</Text></div><Button onClick={() => { setBrowsePath(ANALYSIS_ROOT); setOutputParent(ANALYSIS_ROOT); setReportName(report.name); setSaveJob(undefined); persist.reset(); setOpened(true); }}>Save report</Button></Group></Alert>
+    <Modal opened={opened} onClose={() => setOpened(false)} title="Save preview report" size="xl">
+      <Stack>
+        <Alert color="blue" title="No rebuild required">The complete preview bundle will be moved to the selected report location.</Alert>
+        <TextInput label="Report name" value={reportName} onChange={(event) => setReportName(event.currentTarget.value)} error={invalidName ? 'Use one directory name without slashes.' : undefined} />
+        <Card withBorder p="md"><Group align="flex-end" wrap="wrap"><ActionIcon aria-label="Parent directory" variant="default" size="lg" disabled={!browser.data?.parent} onClick={() => { if (browser.data?.parent) { setBrowsePath(browser.data.parent); setOutputParent(browser.data.parent); } }}><IconArrowLeft size={17} /></ActionIcon><TextInput label="Report destination browser" value={browsePath} onChange={(event) => setBrowsePath(event.currentTarget.value)} leftSection={<IconFolder size={16} />} style={{ flex: '1 1 440px' }} /><Button variant="default" loading={browser.isFetching} onClick={() => { setOutputParent(browsePath); void browser.refetch(); }}>Open</Button><Button variant="default" leftSection={<IconFolderPlus size={16} />} onClick={() => setShowNewFolder((value) => !value)}>New folder</Button><Button onClick={() => setOutputParent(browsePath)}>Use this folder</Button></Group>
+        {showNewFolder && <Group mt="sm" align="flex-end" wrap="nowrap"><TextInput label="New directory name" value={newFolderName} onChange={(event) => setNewFolderName(event.currentTarget.value)} style={{ flex: 1 }} /><Button variant="default" onClick={() => setShowNewFolder(false)}>Cancel</Button><Button loading={createDirectory.isPending} disabled={!newFolderName.trim()} onClick={() => createDirectory.mutate()}>Create and open</Button></Group>}
+        {browser.error && <div style={{ marginTop: 12 }}><InlineError error={browser.error} onRetry={() => browser.refetch()} /></div>}
+        {browser.data && <ScrollArea mt="md" h={220}><Stack gap={4}>{browser.data.entries.filter((entry) => entry.kind === 'directory' || entry.kind === 'report').map((entry) => <Button key={entry.path} variant="subtle" color={entry.is_report ? 'indigo' : 'gray'} leftSection={<IconFolder size={15} />} onClick={() => { if (entry.is_report) { setOutputParent(browser.data.path); setReportName(entry.name); } else { setBrowsePath(entry.path); setOutputParent(entry.path); } }} style={{ justifyContent: 'flex-start' }}>{entry.name}{entry.is_report ? ' · existing report' : ''}</Button>)}</Stack></ScrollArea>}</Card>
+        <Alert color="gray" title="Resolved report path">{`${outputParent.replace(/[\\/]+$/, '')}/${reportName.trim()}`}</Alert>
+        <Checkbox label="Replace an existing PISA-owned report" checked={overwrite} onChange={(event) => setOverwrite(event.currentTarget.checked)} />
+        {persist.error && <InlineError error={persist.error} />}
+        {shownJob && <Alert color={shownJob.state === 'failed' ? 'red' : shownJob.state === 'succeeded' ? 'teal' : 'blue'} title={shownJob.state === 'failed' ? 'Save failed' : shownJob.state === 'succeeded' ? 'Report saved' : `Saving report · ${shownJob.phase}`}><Progress value={shownJob.progress?.total ? 100 * shownJob.progress.current / shownJob.progress.total : 100} animated={!shownJob.progress?.total && ['queued', 'running'].includes(shownJob.state)} /><Text size="xs" mt="xs">{shownJob.message ?? shownJob.phase}</Text></Alert>}
+        <Group justify="flex-end"><Button variant="default" onClick={() => setOpened(false)}>Cancel</Button><Button loading={persist.isPending} disabled={invalidName || ['queued', 'running'].includes(shownJob?.state ?? '')} onClick={() => persist.mutate()}>Save report</Button></Group>
+      </Stack>
+    </Modal>
+  </>;
 }
 
-function Overview({ datasetId }: { datasetId: string }) {
+function Overview({ datasetId, report }: { datasetId: string; report?: DatasetDescriptor }) {
+  const navigate = useNavigate();
   const summary = useReportSummary(datasetId);
   const charts = useReportCharts(datasetId, 'overview');
+  type ExperimentSortKey = 'experiment' | 'system' | 'total_samples' | 'success' | 'fail' | 'invalid' | 'unknown' | 'avg_time_seconds' | 'avg_speedup';
+  const [experimentSort, setExperimentSort] = useSessionState<{ key: ExperimentSortKey; direction: 'asc' | 'desc' } | null>(`pisa:overview-experiment-sort:${datasetId}`, null);
+  const experimentRows = useMemo(() => {
+    const rows = [...(summary.data?.experiment_summaries ?? [])];
+    if (!experimentSort) return rows;
+    const value = (item: (typeof rows)[number]): string | number | null | undefined => experimentSort.key === 'system'
+      ? `${item.simulator ?? ''} / ${item.av ?? ''}`
+      : item[experimentSort.key];
+    return rows.sort((left, right) => {
+      const leftValue = value(left), rightValue = value(right);
+      if (leftValue == null && rightValue == null) return left.experiment.localeCompare(right.experiment);
+      if (leftValue == null) return 1;
+      if (rightValue == null) return -1;
+      const comparison = typeof leftValue === 'number' && typeof rightValue === 'number'
+        ? leftValue - rightValue
+        : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: 'base' });
+      return (experimentSort.direction === 'asc' ? comparison : -comparison) || left.experiment.localeCompare(right.experiment);
+    });
+  }, [experimentSort, summary.data?.experiment_summaries]);
   if (summary.isLoading) return <PageLoading label="Loading report overview…" />;
   if (summary.error) return <InlineError error={summary.error} onRetry={() => summary.refetch()} />;
   if (!summary.data) return <EmptyState title="Overview is not ready" description="The report index may still be building. Check Jobs for progress." />;
@@ -339,8 +569,20 @@ function Overview({ datasetId }: { datasetId: string }) {
   const visualizations = generatedCharts ?? summaryCharts(data);
   const healthErrors = data.health?.filter((finding) => finding.severity === 'error') ?? [];
   const healthWarnings = data.health?.filter((finding) => finding.severity !== 'error') ?? [];
+  const sortHeader = (key: ExperimentSortKey, label: string) => {
+    const active = experimentSort?.key === key;
+    const nextDirection = active && experimentSort.direction === 'asc' ? 'descending' : 'ascending';
+    return <th><Group gap={3} wrap="nowrap">{label}<ActionIcon size="compact-sm" variant={active ? 'light' : 'subtle'} color={active ? 'indigo' : 'gray'} aria-label={`Sort ${label} ${nextDirection}`} title={`Sort ${nextDirection}`} onClick={() => setExperimentSort((current) => current?.key === key ? { key, direction: current.direction === 'asc' ? 'desc' : 'asc' } : { key, direction: 'asc' })}>{!active ? <IconArrowsSort size={13} /> : experimentSort.direction === 'asc' ? <IconArrowUp size={13} /> : <IconArrowDown size={13} />}</ActionIcon></Group></th>;
+  };
+  const openExperimentSampling = (experiment: string) => {
+    const storageKey = `pisa:sampling:${datasetId}`;
+    window.sessionStorage.setItem(`${storageKey}:mode`, JSON.stringify('single'));
+    window.sessionStorage.setItem(`${storageKey}:dataset`, JSON.stringify(experiment));
+    navigate(`/reports/${encodeURIComponent(datasetId)}/sampling`);
+  };
   return (
     <Stack gap="lg">
+      {report && <ReportStorage report={report} />}
       <div className="pisa-page-grid">
         <MetricCard label="Runs" value={data.run_count.toLocaleString()} detail={`${data.experiment_count} experiments`} icon={<IconDatabase size={20} />} />
         <MetricCard label="Success" value={data.outcomes.success.toLocaleString()} detail={`${(100 * data.outcomes.success / Math.max(1, data.run_count)).toFixed(1)}% of all runs`} icon={<IconCheck size={20} />} color="teal" />
@@ -349,7 +591,7 @@ function Overview({ datasetId }: { datasetId: string }) {
       </div>
       {healthErrors.length > 0 && <Alert color="red" icon={<IconAlertTriangle size={18} />} title={`${healthErrors.length} blocking data-health error${healthErrors.length === 1 ? '' : 's'}`}><Stack gap="xs">{healthErrors.map((finding) => <div key={finding.id}><Text fw={650} size="sm">{finding.title}</Text><Text size="sm">{finding.detail}</Text>{finding.dataset_id && <Text size="xs" className="pisa-code">Experiment: {finding.dataset_id}</Text>}</div>)}</Stack></Alert>}
       {healthWarnings.length > 0 && <Alert color="yellow" icon={<IconAlertTriangle size={18} />} title={`${healthWarnings.length} non-blocking data-health finding${healthWarnings.length === 1 ? '' : 's'}`}>Warnings remain visible in Provenance & health and do not replace blocking errors shown above.</Alert>}
-      <Card p={0}><Group p="md" justify="space-between"><div><Text fw={650}>Experiment totals</Text><Text size="xs" c="dimmed">Direct numeric summary before visualization.</Text></div><Badge variant="light">{data.experiment_summaries?.length ?? 0} experiments</Badge></Group><ScrollArea><table className="pisa-data-table"><thead><tr><th>Experiment</th><th>Simulator / AV</th><th>Total samples</th><th>Success</th><th>Fail</th><th>Invalid</th><th>Unknown</th><th>Avg time</th><th>Avg speedup</th></tr></thead><tbody>{data.experiment_summaries?.map((item) => <tr key={item.experiment}><td><Text fw={600} size="sm">{item.experiment}</Text><Text size="xs" c="dimmed">{item.sampler ?? 'sampler unknown'}</Text></td><td>{item.simulator ?? '—'} / {item.av ?? '—'}</td><td>{item.total_samples.toLocaleString()}</td><td>{item.success.toLocaleString()}</td><td>{item.fail.toLocaleString()}</td><td>{item.invalid.toLocaleString()}</td><td>{item.unknown.toLocaleString()}</td><td>{item.avg_time_seconds == null ? '—' : `${item.avg_time_seconds.toFixed(3)} s`}</td><td>{item.avg_speedup == null ? '—' : `${item.avg_speedup.toFixed(2)}×`}</td></tr>)}</tbody></table></ScrollArea></Card>
+      <Card p={0}><Group p="md" justify="space-between"><div><Text fw={650}>Experiment totals</Text><Text size="xs" c="dimmed">Sort any column, or select an experiment name to open it in the single-experiment Scatter Explorer. Missing values remain at the end when sorted.</Text></div><Badge variant="light">{data.experiment_summaries?.length ?? 0} experiments</Badge></Group><ScrollArea><table className="pisa-data-table"><thead><tr>{sortHeader('experiment', 'Experiment')}{sortHeader('system', 'Simulator / AV')}{sortHeader('total_samples', 'Total samples')}{sortHeader('success', 'Success')}{sortHeader('fail', 'Fail')}{sortHeader('invalid', 'Invalid')}{sortHeader('unknown', 'Unknown')}{sortHeader('avg_time_seconds', 'Avg time')}{sortHeader('avg_speedup', 'Avg speedup')}</tr></thead><tbody>{experimentRows.map((item) => <tr key={item.experiment}><td><button type="button" className="pisa-table-link" onClick={() => openExperimentSampling(item.experiment)} title={`Open ${item.experiment} in Scatter Explorer`}><Text fw={600} size="sm">{item.experiment}</Text><Text size="xs" c="dimmed">{item.sampler ?? 'sampler unknown'}</Text></button></td><td>{item.simulator ?? '—'} / {item.av ?? '—'}</td><td>{item.total_samples.toLocaleString()}</td><td>{item.success.toLocaleString()}</td><td>{item.fail.toLocaleString()}</td><td>{item.invalid.toLocaleString()}</td><td>{item.unknown.toLocaleString()}</td><td>{item.avg_time_seconds == null ? '—' : `${item.avg_time_seconds.toFixed(3)} s`}</td><td>{item.avg_speedup == null ? '—' : `${item.avg_speedup.toFixed(2)}×`}</td></tr>)}</tbody></table></ScrollArea></Card>
       <SimpleGrid cols={{ base: 1, lg: 2 }}>{visualizations.map((chart) => <VisualizationCard key={chart.id} spec={chart} datasetId={generatedCharts ? datasetId : undefined} />)}</SimpleGrid>
     </Stack>
   );
@@ -358,6 +600,13 @@ function Overview({ datasetId }: { datasetId: string }) {
 function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id: string, experiments?: string[]) => void }) {
   const storageKey = `pisa:sampling:${datasetId}`;
   const [mode, setMode] = useSessionState<string | null>(`${storageKey}:mode`, 'single');
+  const [plotView, setPlotView] = useSessionState<string | null>(`${storageKey}:plot-view`, 'scatter');
+  const [xBinCount, setXBinCount] = useSessionState<number | string>(`${storageKey}:x-bin-count`, 5);
+  const [yBinCount, setYBinCount] = useSessionState<number | string>(`${storageKey}:y-bin-count`, 5);
+  const [heatmapXMin, setHeatmapXMin] = useSessionState<number | string>(`${storageKey}:heatmap-x-min`, '');
+  const [heatmapXMax, setHeatmapXMax] = useSessionState<number | string>(`${storageKey}:heatmap-x-max`, '');
+  const [heatmapYMin, setHeatmapYMin] = useSessionState<number | string>(`${storageKey}:heatmap-y-min`, '');
+  const [heatmapYMax, setHeatmapYMax] = useSessionState<number | string>(`${storageKey}:heatmap-y-max`, '');
   const [x, setX] = useSessionState<string | null>(`${storageKey}:x`, null);
   const [y, setY] = useSessionState<string | null>(`${storageKey}:y`, null);
   const [color, setColor] = useSessionState<string | null>(`${storageKey}:color`, 'outcome');
@@ -372,15 +621,31 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
   const [durationSeconds, setDurationSeconds] = useSessionState<number | string>(`${storageKey}:duration`, 5);
   const [durationMode, setDurationMode] = useSessionState<string | null>(`${storageKey}:duration-mode`, 'duration');
   const [exportAxes, setExportAxes] = useSessionState(`${storageKey}:axes`, true);
+  const [exportAxisValues, setExportAxisValues] = useSessionState(`${storageKey}:axis-values`, true);
+  const [exportAxisEndValues, setExportAxisEndValues] = useSessionState(`${storageKey}:axis-end-values`, true);
   const [exportGrid, setExportGrid] = useSessionState(`${storageKey}:grid`, false);
+  const [showNumericColorRange, setShowNumericColorRange] = useSessionState(`${storageKey}:numeric-color-range-visible`, true);
+  const [numericColorRangeOverrides, setNumericColorRangeOverrides] = useSessionState<Record<string, [string, string, string]>>(`${storageKey}:numeric-color-ranges-v1`, {});
+  const [axesLocked, setAxesLocked] = useSessionState(`${storageKey}:axes-locked`, false);
+  const [lockedAxes, setLockedAxes] = useSessionState<{ xMin: number; xMax: number; yMin: number; yMax: number } | null>(`${storageKey}:locked-axes`, null);
+  const [axisTitleFontSize, setAxisTitleFontSize] = useSessionState<number | string>(`${storageKey}:axis-title-font-size`, 14);
+  const [axisTickFontSize, setAxisTickFontSize] = useSessionState<number | string>(`${storageKey}:axis-tick-font-size`, 12);
+  const [heatmapCellFontSize, setHeatmapCellFontSize] = useSessionState<number | string>(`${storageKey}:heatmap-cell-font-size`, 12);
+  const [showHeatmapCounts, setShowHeatmapCounts] = useSessionState(`${storageKey}:heatmap-show-counts`, true);
+  const [showHeatmapPercentage, setShowHeatmapPercentage] = useSessionState(`${storageKey}:heatmap-show-percentage`, true);
   const [distinctShapes, setDistinctShapes] = useSessionState(`${storageKey}:distinct-shapes-v2`, false);
   const [pointSize, setPointSize] = useSessionState<number | string>(`${storageKey}:point-size`, 10);
   const [exportFormat, setExportFormat] = useSessionState<string | null>(`${storageKey}:format`, 'gif');
+  const [filterSource, setFilterSource] = useSessionState<string | null>(`${storageKey}:filter-source`, null);
+  const [filterField, setFilterField] = useSessionState<string | null>(`${storageKey}:filter-field`, null);
+  const [filterRange, setFilterRange] = useSessionState<[number, number] | null>(`${storageKey}:filter-range`, null);
+  const [filterRangeField, setFilterRangeField] = useSessionState<string | null>(`${storageKey}:filter-range-field`, null);
+  const [filterValues, setFilterValues] = useSessionState<string[]>(`${storageKey}:filter-values`, []);
   const [exportError, setExportError] = useState<string>();
   const [exporting, setExporting] = useState(false);
   const scatter = useQuery({
-    queryKey: ['scatter-explorer', datasetId, x, y, color],
-    queryFn: () => api.datasets.scatter(datasetId, { x: x ?? undefined, y: y ?? undefined, color: color ?? 'outcome' }),
+    queryKey: ['scatter-explorer', datasetId, x, y, color, filterField],
+    queryFn: () => api.datasets.scatter(datasetId, { x: x ?? undefined, y: y ?? undefined, color: color ?? 'outcome', filter_field: filterField ?? undefined }),
     retry: 1,
   });
   useEffect(() => {
@@ -392,7 +657,10 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
     if (!leftDataset || !datasets.includes(leftDataset)) setLeftDataset(datasets[0] ?? null);
     if (!rightDataset || !datasets.includes(rightDataset) || rightDataset === (leftDataset ?? datasets[0])) setRightDataset(datasets.find((value) => value !== (leftDataset ?? datasets[0])) ?? null);
   }, [dataset, leftDataset, rightDataset, scatter.data, x, y]);
-  const axisFields = useMemo(() => (scatter.data?.fields ?? []).filter((field) => field.source !== 'outcome' && field.source !== 'run'), [scatter.data?.fields]);
+  useEffect(() => {
+    if (mode !== 'compare' && plotView === 'disagreement_heatmap') setPlotView('scatter');
+  }, [mode, plotView, setPlotView]);
+  const axisFields = useMemo(() => (scatter.data?.fields ?? []).filter((field) => field.source !== 'outcome' && field.source !== 'run' && (field.numeric_count == null || field.numeric_count > 0)), [scatter.data?.fields]);
   const fieldSource = (key: string) => axisFields.find((field) => field.key === key)?.source ?? 'order';
   const [xSource, setXSource] = useSessionState<string | null>(`${storageKey}:x-source`, 'order');
   const [ySource, setYSource] = useSessionState<string | null>(`${storageKey}:y-source`, 'order');
@@ -403,6 +671,8 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
   const colorFields = scatter.data?.fields ?? [];
   const colorSourceOptions = [...new Set(colorFields.map((field) => field.source))].map((source) => ({ value: source, label: source === 'outcome' ? 'Outcome' : source === 'run' ? 'Run result' : source === 'order' ? 'Recorded order' : source === 'parameter' ? 'Parameters' : source === 'metric' ? 'Metrics' : source === 'control' ? 'Control' : source }));
   const colorFieldOptions = colorFields.filter((field) => field.source === colorSource).map((field) => ({ value: field.key, label: field.label }));
+  const filterSourceOptions = [...new Set(colorFields.map((field) => field.source))].map((source) => ({ value: source, label: source === 'outcome' ? 'Outcome' : source === 'run' ? 'Run result' : source === 'order' ? 'Recorded order' : source === 'parameter' ? 'Parameters' : source === 'metric' ? 'Metrics' : source === 'control' ? 'Control' : source }));
+  const filterFieldOptions = colorFields.filter((field) => field.source === filterSource).map((field) => ({ value: field.key, label: field.label }));
   useEffect(() => {
     const source = colorFields.find((field) => field.key === color)?.source;
     if (source && source !== colorSource) setColorSource(source);
@@ -410,6 +680,11 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
   const selectedX = x ?? scatter.data?.selection.x ?? 'sample_order';
   const selectedY = y ?? scatter.data?.selection.y ?? 'scenario_order';
   const selectedColor = color ?? 'outcome';
+  const rawFilterDescription = scatter.data?.filter;
+  const [categoryVisibilityContexts, setCategoryVisibilityContexts] = useSessionState<Record<string, Record<string, boolean>>>(`${storageKey}:category-visibility-v1`, {});
+  const [categoryColorOverrides, setCategoryColorOverrides] = useSessionState<Record<string, string>>(`${storageKey}:category-colors-v1`, {});
+  const [categoryBorderOverrides, setCategoryBorderOverrides] = useSessionState<Record<string, boolean>>(`${storageKey}:category-borders-v1`, {});
+  const [categorySymbolOverrides, setCategorySymbolOverrides] = useSessionState<Record<string, string>>(`${storageKey}:category-symbols-v1`, {});
   const rawPoints = scatter.data?.points ?? [];
   const pairedPoints = useMemo(() => {
     if (mode !== 'compare' || !leftDataset || !rightDataset) return [];
@@ -418,17 +693,113 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
     return rawPoints.filter((point) => point.dataset_id === rightDataset).flatMap((right) => { const leftPoint = left.get(key(right)); if (!leftPoint) return []; const leftValue = Number(leftPoint.color), rightValue = Number(right.color), numeric = Number.isFinite(leftValue) && Number.isFinite(rightValue) && !['outcome', 'stop_condition', 'stop_reason'].includes(selectedColor); const transition = leftPoint.outcome === right.outcome ? `All ${leftPoint.outcome}` : `${leftPoint.outcome} → ${right.outcome}`; const categoricalColor = selectedColor === 'stop_reason' ? (leftPoint.stop_reason === right.stop_reason ? `Same · ${leftPoint.stop_reason ?? 'Missing'}` : `${leftPoint.stop_reason ?? 'Missing'} → ${right.stop_reason ?? 'Missing'}`) : selectedColor === 'stop_condition' ? (leftPoint.stop_condition === right.stop_condition ? `Same · ${leftPoint.stop_condition ?? 'Missing'}` : `${leftPoint.stop_condition ?? 'Missing'} → ${right.stop_condition ?? 'Missing'}`) : transition; return [{ ...leftPoint, run_id: leftPoint.run_id, left_run_id: leftPoint.run_id, right_run_id: right.run_id, left_outcome: leftPoint.outcome, right_outcome: right.outcome, left_stop_condition: leftPoint.stop_condition, right_stop_condition: right.stop_condition, left_stop_reason: leftPoint.stop_reason, right_stop_reason: right.stop_reason, left_value: numeric ? leftValue : undefined, right_value: numeric ? rightValue : undefined, dataset_id: `${leftDataset} vs ${rightDataset}`, outcome: numeric ? 'delta' : transition, color: numeric ? rightValue - leftValue : categoricalColor }]; });
   }, [leftDataset, mode, rawPoints, rightDataset, selectedColor]);
   const colorDomainPoints = mode === 'compare' ? pairedPoints : rawPoints.filter((point) => !dataset || point.dataset_id === dataset);
-  const allPoints = colorDomainPoints;
+  const filterDescription = useMemo(() => {
+    if (!rawFilterDescription || rawFilterDescription.field !== filterField) return undefined;
+    const present = colorDomainPoints.map((point) => point.filter).filter((value) => value != null);
+    if (rawFilterDescription.kind === 'continuous') {
+      const values = present.map(Number).filter(Number.isFinite);
+      const minimum = values.length ? Math.min(...values) : null;
+      const maximum = values.length ? Math.max(...values) : null;
+      const span = minimum != null && maximum != null ? maximum - minimum : 0;
+      const step = values.length && values.every(Number.isInteger) ? 1 : Math.max(span / 1000, 1e-9);
+      return { ...rawFilterDescription, minimum, maximum, step, present_count: values.length, missing_count: colorDomainPoints.length - values.length };
+    }
+    return { ...rawFilterDescription, values: [...new Set(present.map(String))].sort(), present_count: present.length, missing_count: colorDomainPoints.length - present.length };
+  }, [colorDomainPoints, filterField, rawFilterDescription]);
+  useEffect(() => {
+    if (!filterField || filterDescription?.field !== filterField) return;
+    if (filterDescription.kind === 'continuous' && filterDescription.minimum != null && filterDescription.maximum != null) {
+      if (filterRangeField !== filterField) {
+        setFilterRange([filterDescription.minimum, filterDescription.maximum]);
+        setFilterRangeField(filterField);
+      } else if (!filterRange) setFilterRange([filterDescription.minimum, filterDescription.maximum]);
+    }
+  }, [filterDescription, filterField, filterRange, filterRangeField, setFilterRange, setFilterRangeField]);
+  const allPoints = useMemo(() => {
+    if (!filterField || filterDescription?.field !== filterField) return colorDomainPoints;
+    if (filterDescription.kind === 'continuous') {
+      if (!filterRange) return colorDomainPoints;
+      return colorDomainPoints.filter((point) => {
+        const value = Number(point.filter);
+        return Number.isFinite(value) && value >= filterRange[0] && value <= filterRange[1];
+      });
+    }
+    if (!filterValues.length) return colorDomainPoints;
+    return colorDomainPoints.filter((point) => filterValues.includes(point.filter == null ? '__missing__' : String(point.filter)));
+  }, [colorDomainPoints, filterDescription, filterField, filterRange, filterValues]);
+  const heatmap = useMemo(() => buildDisagreementHeatmap(allPoints, Number(xBinCount) || 5, Number(yBinCount) || 5, {
+    xMin: typeof heatmapXMin === 'number' ? heatmapXMin : undefined,
+    xMax: typeof heatmapXMax === 'number' ? heatmapXMax : undefined,
+    yMin: typeof heatmapYMin === 'number' ? heatmapYMin : undefined,
+    yMax: typeof heatmapYMax === 'number' ? heatmapYMax : undefined,
+  }), [allPoints, heatmapXMax, heatmapXMin, heatmapYMax, heatmapYMin, xBinCount, yBinCount]);
+  const colorField = scatter.data?.fields.find((field) => field.key === selectedColor);
+  const numericColor = colorField?.source === 'metric' || colorField?.source === 'control' || colorField?.source === 'order' || (colorField?.source === 'parameter' && (colorField.numeric_count ?? 0) > 0);
+  const numericColorRangeContext = JSON.stringify([mode, selectedColor]);
+  const defaultNumericColorRange = mode === 'compare' ? deltaColorRange : sequentialColorRange;
+  const numericColorRange = numericColorRangeOverrides[numericColorRangeContext] ?? defaultNumericColorRange;
+  const resolvedNumericColorRange = numericColorRange.map((value, index) => /^#[0-9a-f]{6}$/i.test(value) ? value : defaultNumericColorRange[index]) as [string, string, string];
+  const setNumericColorRangeValue = (index: number, value: string) => setNumericColorRangeOverrides((current) => {
+    const base = current[numericColorRangeContext] ?? defaultNumericColorRange;
+    return { ...current, [numericColorRangeContext]: base.map((color, colorIndex) => colorIndex === index ? value : color) as [string, string, string] };
+  });
+  const resetNumericColorRange = () => setNumericColorRangeOverrides((current) => {
+    const next = { ...current };
+    delete next[numericColorRangeContext];
+    return next;
+  });
+  const categoryNames = useMemo(() => numericColor ? [] : [...new Set(allPoints.map((point) => scatterCategory(point, selectedColor)))].sort((left, right) => compareScatterCategories(selectedColor, left, right)), [allPoints, numericColor, selectedColor]);
+  const visibilityContext = JSON.stringify([mode, selectedColor, mode === 'single' ? dataset : leftDataset, mode === 'compare' ? rightDataset : null]);
+  const categoryVisibility = categoryVisibilityContexts[visibilityContext] ?? {};
+  const colorOverridePrefix = `${JSON.stringify([mode, selectedColor]).slice(0, -1)},`;
+  const colorOverrideKey = (name: string) => `${colorOverridePrefix}${JSON.stringify(name)}]`;
+  const activeCategoryStyleOverrides = useMemo(() => Object.fromEntries(categoryNames.flatMap((name) => {
+    const key = colorOverrideKey(name);
+    const custom: SeriesStyleOverride = {};
+    if (categoryColorOverrides[key]) custom.color = categoryColorOverrides[key];
+    if (Object.prototype.hasOwnProperty.call(categoryBorderOverrides, key)) custom.border = categoryBorderOverrides[key];
+    if (categorySymbolOverrides[key]) custom.symbol = categorySymbolOverrides[key];
+    return Object.keys(custom).length ? [[name, custom]] : [];
+  })), [categoryBorderOverrides, categoryColorOverrides, categoryNames, categorySymbolOverrides, mode, selectedColor]);
+  const hasCategoryStyleOverrides = Object.keys(categoryColorOverrides).some((key) => key.startsWith(colorOverridePrefix))
+    || Object.keys(categoryBorderOverrides).some((key) => key.startsWith(colorOverridePrefix))
+    || Object.keys(categorySymbolOverrides).some((key) => key.startsWith(colorOverridePrefix));
   const categoryStyles = useMemo(() => Object.fromEntries(
-    [...new Set(colorDomainPoints.map((point) => scatterCategory(point, selectedColor)))].sort().map((name, index) => [name, {
-      color: outcomeColors[name.toLowerCase()] ?? categoricalContrastPalette[index % categoricalContrastPalette.length],
-      symbol: categoricalSymbols[index % categoricalSymbols.length],
-    }]),
-  ), [colorDomainPoints, selectedColor]);
+    categoryNames.map((name, index) => {
+      const custom = activeCategoryStyleOverrides[name];
+      return [name, {
+        color: custom?.color ?? outcomeColors[name.toLowerCase()] ?? categoricalContrastPalette[index % categoricalContrastPalette.length],
+        border: custom?.border ?? true,
+        symbol: custom?.symbol ?? (distinctShapes ? categoricalSymbols[index % categoricalSymbols.length] : 'circle'),
+      }];
+    }),
+  ), [activeCategoryStyleOverrides, categoryNames, distinctShapes]);
   const shownCount = Math.max(0, Math.min(allPoints.length, visibleCount ?? allPoints.length));
   const shownPoints = allPoints.slice(0, shownCount);
+  const dynamicAxes = useMemo(() => {
+    if (!shownPoints.length) return null;
+    const xs = shownPoints.map((point) => point.x), ys = shownPoints.map((point) => point.y);
+    const xMinimum = Math.min(...xs), xMaximum = Math.max(...xs), yMinimum = Math.min(...ys), yMaximum = Math.max(...ys);
+    const xPadding = Math.max(1e-9, xMaximum - xMinimum) * 0.04;
+    const yPadding = Math.max(1e-9, yMaximum - yMinimum) * 0.04;
+    return { xMin: xMinimum - xPadding, xMax: xMaximum + xPadding, yMin: yMinimum - yPadding, yMax: yMaximum + yPadding };
+  }, [shownPoints]);
+  const activeAxes = axesLocked && lockedAxes ? lockedAxes : dynamicAxes;
+  const resolvedAxisTitleFontSize = Math.max(8, Math.min(40, Number(axisTitleFontSize) || 14));
+  const resolvedAxisTickFontSize = Math.max(8, Math.min(32, Number(axisTickFontSize) || 12));
+  const resolvedHeatmapCellFontSize = Math.max(8, Math.min(32, Number(heatmapCellFontSize) || 12));
+  const shownCategoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    if (!numericColor) for (const point of shownPoints) {
+      const name = scatterCategory(point, selectedColor);
+      counts[name] = (counts[name] ?? 0) + 1;
+    }
+    return counts;
+  }, [numericColor, selectedColor, shownPoints]);
+  const categoryLabels = useMemo(() => Object.fromEntries(categoryNames.map((name) => [name, `${name}(${(shownCategoryCounts[name] ?? 0).toLocaleString()})`])), [categoryNames, shownCategoryCounts]);
+  const visiblePointCount = numericColor ? shownPoints.length : shownPoints.reduce((count, point) => count + Number(categoryVisibility[scatterCategory(point, selectedColor)] !== false), 0);
   useEffect(() => {
-    if (!playing || !allPoints.length) return;
+    if (!playing || !allPoints.length || plotView !== 'scatter') return;
     const rate = durationMode === 'duration' ? allPoints.length / Math.max(0.1, Number(durationSeconds) || 10) : Math.max(0.1, Number(pointsPerSecond) || 20);
     const started = performance.now();
     const initial = shownCount >= allPoints.length ? 0 : shownCount;
@@ -439,11 +810,30 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
       if (count >= allPoints.length) { window.clearInterval(timer); setPlaying(false); }
     }, 33);
     return () => window.clearInterval(timer);
-  }, [allPoints.length, durationMode, durationSeconds, playing, pointsPerSecond]);
+  }, [allPoints.length, durationMode, durationSeconds, playing, plotView, pointsPerSecond]);
   const spec = useMemo<VisualizationSpec>(() => {
+    if (plotView === 'disagreement_heatmap') {
+      return {
+        id: `paired-disagreement-heatmap-${selectedX}-${selectedY}`,
+        title: 'Paired outcome disagreement rate',
+        subtitle: `${heatmap.disagreementCount.toLocaleString()} / ${heatmap.totalCount.toLocaleString()} included paired samples disagree · equal-width bins in the selected original parameter axes${heatmap.excludedCount ? ` · ${heatmap.excludedCount.toLocaleString()} outside the fixed bin domain` : ''}.`,
+        kind: 'heatmap',
+        option: heatmap.totalCount ? {
+          animation: false,
+          tooltip: { trigger: 'item', formatter: (params: { data?: { value?: unknown[] } }) => { const value = params.data?.value ?? []; return `${escapeHtml(selectedX)}: ${escapeHtml(heatmap.xLabels[Number(value[0])])}<br/>${escapeHtml(selectedY)}: ${escapeHtml(heatmap.yLabels[Number(value[1])])}<br/>Disagreement: ${escapeHtml(value[3])} / ${escapeHtml(value[4])}<br/>Rate: ${(100 * Number(value[2] ?? 0)).toFixed(1)}%`; } },
+          grid: { top: 28, right: 112, bottom: 100, left: 112 },
+          xAxis: { type: 'category', show: true, name: exportAxes ? selectedX : '', nameLocation: 'middle', nameGap: 70, nameTextStyle: { fontSize: resolvedAxisTitleFontSize }, data: heatmap.xLabels, splitArea: { show: exportGrid }, axisLine: { show: exportAxes }, axisTick: { show: exportAxes }, axisLabel: { show: exportAxisValues, rotate: heatmap.xLabels.length > 7 ? 35 : 0, fontSize: resolvedAxisTickFontSize } },
+          yAxis: { type: 'category', show: true, name: exportAxes ? selectedY : '', nameLocation: 'middle', nameGap: 86, nameTextStyle: { fontSize: resolvedAxisTitleFontSize }, data: heatmap.yLabels, splitArea: { show: exportGrid }, axisLine: { show: exportAxes }, axisTick: { show: exportAxes }, axisLabel: { show: exportAxisValues, fontSize: resolvedAxisTickFontSize } },
+          visualMap: { min: 0, max: 1, dimension: 2, calculable: true, orient: 'vertical', right: 12, top: 'middle', formatter: (value: number) => `${(100 * value).toFixed(0)}%`, inRange: { color: ['#f1f3f5', '#74c0fc', '#f59f00', '#c92a2a'] } },
+          series: [{
+            type: 'heatmap', name: 'Outcome disagreement rate', data: heatmap.cells,
+            label: { show: showHeatmapCounts || showHeatmapPercentage, fontSize: resolvedHeatmapCellFontSize, formatter: (params: { data?: { value?: unknown[] } }) => { const value = params.data?.value ?? []; return formatHeatmapCellLabel(Number(value[3] ?? 0), Number(value[4] ?? 0), showHeatmapCounts, showHeatmapPercentage); } },
+            itemStyle: { borderColor: '#ffffff', borderWidth: 2 }, emphasis: { itemStyle: { shadowBlur: 8, shadowColor: 'rgba(0,0,0,0.25)' } },
+          }],
+        } : {},
+      };
+    }
     const points = shownPoints;
-    const colorField = scatter.data?.fields.find((field) => field.key === selectedColor);
-    const numericColor = colorField?.source === 'metric' || colorField?.source === 'control' || colorField?.source === 'parameter' || selectedColor === 'collision';
     const series: Array<Record<string, unknown>> = [];
     const datum = (point: (typeof points)[number], value: unknown[]) => ({
       value, run_id: point.run_id, ordinal: point.ordinal, dataset_id: point.dataset_id,
@@ -465,25 +855,25 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
         const key = scatterCategory(point, selectedColor);
         groups.set(key, [...(groups.get(key) ?? []), point]);
       }
-      for (const [name, values] of groups) series.push({ type: 'scatter', name, symbol: distinctShapes ? (categoryStyles[name]?.symbol ?? 'circle') : 'circle', symbolSize: Math.max(3, Number(pointSize) || 10), z: 3, itemStyle: { color: categoryStyles[name]?.color ?? '#6b7280', borderColor: '#17202a', borderWidth: 1 }, data: values.map((point) => datum(point, [point.x, point.y])) });
+      for (const name of categoryNames) {
+        const values = groups.get(name);
+        if (values?.length) series.push({ type: 'scatter', name, symbol: categoryStyles[name]?.symbol ?? 'circle', symbolSize: Math.max(3, Number(pointSize) || 10), z: 3, itemStyle: { color: categoryStyles[name]?.color ?? '#6b7280', borderColor: '#17202a', borderWidth: categoryStyles[name]?.border ? 1 : 0 }, data: values.map((point) => datum(point, [point.x, point.y])) });
+      }
     }
     const numericValues = allPoints.map((point) => Number(point.color ?? point.collision)).filter(Number.isFinite);
     const deltaExtent = mode === 'compare' && numericValues.length ? Math.max(...numericValues.map(Math.abs), 1e-9) : undefined;
-    const allX = allPoints.map((point) => point.x), allY = allPoints.map((point) => point.y);
-    const xPadding = allX.length ? Math.max(1e-9, Math.max(...allX) - Math.min(...allX)) * 0.04 : 0;
-    const yPadding = allY.length ? Math.max(1e-9, Math.max(...allY) - Math.min(...allY)) * 0.04 : 0;
     return {
       id: `scatter-explorer-${selectedX}-${selectedY}`, title: 'Scatter explorer',
-      subtitle: `${points.length.toLocaleString()} / ${allPoints.length.toLocaleString()} ${mode === 'compare' ? 'paired samples' : 'concrete samples'} · axes stay fixed to the final filtered extent.`, kind: 'scatter',
+      subtitle: `${visiblePointCount.toLocaleString()} visible · ${points.length.toLocaleString()} in current prefix · ${allPoints.length.toLocaleString()} total ${mode === 'compare' ? 'paired samples' : 'concrete samples'} · ${axesLocked ? 'axes locked to the captured scale' : 'axes follow the currently filtered points'}.`, kind: 'scatter',
       option: points.length ? {
         animation: false, legend: numericColor ? undefined : { type: 'scroll', top: 0 }, tooltip: { trigger: 'item', appendTo: 'body', confine: false, className: 'pisa-scatter-tooltip', formatter: (params: { data?: Record<string, unknown> }) => { const item = params.data ?? {}; const value = Array.isArray(item.value) ? item.value : []; const paired = item.left_stop_reason !== undefined || item.right_stop_reason !== undefined; return `Sample ${escapeHtml(item.ordinal)}<br/>${escapeHtml(selectedX)}: ${escapeHtml(value[0])}<br/>${escapeHtml(selectedY)}: ${escapeHtml(value[1])}<br/>Outcome: ${escapeHtml(item.outcome)}<br/>${paired ? `Left stop: ${escapeHtml(item.left_stop_condition)} · ${escapeHtml(item.left_stop_reason)}<br/>Right stop: ${escapeHtml(item.right_stop_condition)} · ${escapeHtml(item.right_stop_reason)}<br/>` : `Stop condition: ${escapeHtml(item.stop_condition)}<br/>Stop reason: ${escapeHtml(item.stop_reason)}<br/>`}Run: ${escapeHtml(item.run_id)}`; } },
-        grid: { top: 54, right: numericColor ? 90 : 36, bottom: 76, left: 76 },
-        xAxis: { type: 'value', show: exportAxes, name: selectedX, nameLocation: 'middle', nameGap: 42, scale: true, min: allX.length ? Math.min(...allX) - xPadding : undefined, max: allX.length ? Math.max(...allX) + xPadding : undefined, axisLabel: { formatter: formatAxisTick }, splitLine: { show: exportGrid } }, yAxis: { type: 'value', show: exportAxes, name: selectedY, nameLocation: 'middle', nameGap: 54, scale: true, min: allY.length ? Math.min(...allY) - yPadding : undefined, max: allY.length ? Math.max(...allY) + yPadding : undefined, axisLabel: { formatter: formatAxisTick }, splitLine: { show: exportGrid } },
-        visualMap: numericColor && numericValues.length ? { min: deltaExtent ? -deltaExtent : Math.min(...numericValues), max: deltaExtent ?? Math.max(...numericValues), dimension: 2, seriesIndex: 0, right: 8, top: 65, calculable: true, inRange: { color: deltaExtent ? ['#00a6a6', '#f8fafc', '#7e2f8e'] : ['#dce6ff', '#526ff0', '#c92a2a'] } } : undefined,
+        grid: { top: 54, right: numericColor && showNumericColorRange ? 90 : 36, bottom: 76, left: 76 },
+        xAxis: { type: 'value', show: true, name: exportAxes ? selectedX : '', nameLocation: 'middle', nameGap: 42, nameTextStyle: { fontSize: resolvedAxisTitleFontSize }, scale: true, min: activeAxes?.xMin, max: activeAxes?.xMax, axisLine: { show: exportAxes }, axisTick: { show: exportAxes }, axisLabel: { show: exportAxisValues, showMinLabel: exportAxisEndValues, showMaxLabel: exportAxisEndValues, formatter: formatAxisTick, fontSize: resolvedAxisTickFontSize }, splitLine: { show: exportGrid } }, yAxis: { type: 'value', show: true, name: exportAxes ? selectedY : '', nameLocation: 'middle', nameGap: 54, nameTextStyle: { fontSize: resolvedAxisTitleFontSize }, scale: true, min: activeAxes?.yMin, max: activeAxes?.yMax, axisLine: { show: exportAxes }, axisTick: { show: exportAxes }, axisLabel: { show: exportAxisValues, showMinLabel: exportAxisEndValues, showMaxLabel: exportAxisEndValues, formatter: formatAxisTick, fontSize: resolvedAxisTickFontSize }, splitLine: { show: exportGrid } },
+        visualMap: numericColor && numericValues.length ? { show: showNumericColorRange, min: deltaExtent ? -deltaExtent : Math.min(...numericValues), max: deltaExtent ?? Math.max(...numericValues), dimension: 2, seriesIndex: 0, right: 8, top: 65, calculable: true, inRange: { color: resolvedNumericColorRange } } : undefined,
         series,
       } : {},
     };
-  }, [allPoints, categoryStyles, distinctShapes, exportAxes, exportGrid, mode, pointSize, scatter.data, selectedColor, selectedX, selectedY, shownPoints]);
+  }, [activeAxes, allPoints, axesLocked, categoryNames, categoryStyles, colorField, exportAxes, exportAxisEndValues, exportAxisValues, exportGrid, heatmap, mode, numericColor, plotView, pointSize, resolvedAxisTickFontSize, resolvedAxisTitleFontSize, resolvedHeatmapCellFontSize, resolvedNumericColorRange, selectedColor, selectedX, selectedY, showHeatmapCounts, showHeatmapPercentage, showNumericColorRange, shownPoints, visiblePointCount]);
   const handlePoint = useCallback((value: unknown) => {
     if (value && typeof value === 'object' && 'run_id' in value && typeof value.run_id === 'string') onOpen(value.run_id, mode === 'compare' ? [leftDataset, rightDataset].filter((item): item is string => Boolean(item)) : 'dataset_id' in value && typeof value.dataset_id === 'string' ? [value.dataset_id] : undefined);
   }, [leftDataset, mode, onOpen, rightDataset]);
@@ -533,6 +923,36 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
     for (const [label, point] of [['minimum X', allPoints.reduce((best, item) => item.x < best.x ? item : best)], ['maximum X', allPoints.reduce((best, item) => item.x > best.x ? item : best)]] as const) if (!selected.some((item) => item.point.run_id === point.run_id)) selected.push({ label, reason: `${selectedX} boundary case`, point });
     return selected.slice(0, 9);
   }, [allPoints, leftDataset, mode, rightDataset, scatter.data?.fields, selectedColor, selectedX]);
+  const setCategoryVisible = useCallback((name: string, visible: boolean) => {
+    setCategoryVisibilityContexts((current) => ({ ...current, [visibilityContext]: { ...(current[visibilityContext] ?? {}), [name]: visible } }));
+  }, [setCategoryVisibilityContexts, visibilityContext]);
+  const setCategoryStyle = useCallback((name: string, custom?: SeriesStyleOverride) => {
+    const key = colorOverrideKey(name);
+    setCategoryColorOverrides((current) => {
+      const next = { ...current };
+      if (custom?.color) next[key] = custom.color;
+      else delete next[key];
+      return next;
+    });
+    setCategoryBorderOverrides((current) => {
+      const next = { ...current };
+      if (custom?.border !== undefined) next[key] = custom.border;
+      else delete next[key];
+      return next;
+    });
+    setCategorySymbolOverrides((current) => {
+      const next = { ...current };
+      if (custom?.symbol) next[key] = custom.symbol;
+      else delete next[key];
+      return next;
+    });
+  }, [mode, selectedColor, setCategoryBorderOverrides, setCategoryColorOverrides, setCategorySymbolOverrides]);
+  const resetCategoryStyles = useCallback(() => {
+    setCategoryColorOverrides((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(colorOverridePrefix))));
+    setCategoryBorderOverrides((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(colorOverridePrefix))));
+    setCategorySymbolOverrides((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(colorOverridePrefix))));
+  }, [colorOverridePrefix, setCategoryBorderOverrides, setCategoryColorOverrides, setCategorySymbolOverrides]);
+  const visibleCategoryCount = categoryNames.filter((name) => categoryVisibility[name] !== false).length;
   async function exportAnimation() {
     const targetPoints = allPoints.slice(0, shownCount);
     if (!targetPoints.length || exporting) return;
@@ -547,17 +967,37 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
       const recorder = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm' });
       const chunks: Blob[] = []; recorder.ondataavailable = (event) => event.data.size && chunks.push(event.data);
       const duration = durationMode === 'duration' ? Math.max(0.25, Number(durationSeconds) || 5) : targetPoints.length / Math.max(0.1, Number(pointsPerSecond) || 20);
-      const xs = allPoints.map((point) => point.x), ys = allPoints.map((point) => point.y), pad = exportAxes ? 88 : 24;
-      const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+      const xs = allPoints.map((point) => point.x), ys = allPoints.map((point) => point.y), pad = exportAxes || exportAxisValues ? 88 : 24;
+      const minX = activeAxes?.xMin ?? Math.min(...xs), maxX = activeAxes?.xMax ?? Math.max(...xs), minY = activeAxes?.yMin ?? Math.min(...ys), maxY = activeAxes?.yMax ?? Math.max(...ys);
+      const exportNumericValues = allPoints.map((point) => Number(point.color ?? point.collision)).filter(Number.isFinite);
+      const exportDeltaExtent = mode === 'compare' && exportNumericValues.length ? Math.max(...exportNumericValues.map(Math.abs), 1e-9) : undefined;
+      const exportColorMinimum = exportDeltaExtent ? -exportDeltaExtent : Math.min(...exportNumericValues);
+      const exportColorMaximum = exportDeltaExtent ?? Math.max(...exportNumericValues);
       const sx = (value: number) => pad + (value - minX) / Math.max(1e-9, maxX - minX) * (width - 2 * pad);
       const sy = (value: number) => height - pad - (value - minY) / Math.max(1e-9, maxY - minY) * (height - 2 * pad);
       const drawFrame = (count: number) => {
         context.fillStyle = '#fff'; context.fillRect(0, 0, width, height);
         if (exportGrid) { context.strokeStyle = '#e2e8f0'; context.lineWidth = 1; for (let index = 1; index < 6; index += 1) { const px = pad + index * (width - 2 * pad) / 6, py = pad + index * (height - 2 * pad) / 6; context.beginPath(); context.moveTo(px, pad); context.lineTo(px, height - pad); context.moveTo(pad, py); context.lineTo(width - pad, py); context.stroke(); } }
-        if (exportAxes) { context.strokeStyle = '#17202a'; context.lineWidth = 2; context.beginPath(); context.moveTo(pad, pad); context.lineTo(pad, height - pad); context.lineTo(width - pad, height - pad); context.stroke(); context.fillStyle = '#17202a'; context.font = '24px Arial'; context.textAlign = 'center'; context.fillText(selectedX, width / 2, height - 25); context.save(); context.translate(28, height / 2); context.rotate(-Math.PI / 2); context.fillText(selectedY, 0, 0); context.restore(); }
+        if (exportAxes) {
+          context.strokeStyle = '#17202a'; context.lineWidth = 2; context.beginPath(); context.moveTo(pad, pad); context.lineTo(pad, height - pad); context.lineTo(width - pad, height - pad); context.stroke();
+          context.fillStyle = '#17202a'; context.font = `${resolvedAxisTitleFontSize * 2}px Arial`; context.textAlign = 'center'; context.fillText(selectedX, width / 2, height - 20); context.save(); context.translate(24, height / 2); context.rotate(-Math.PI / 2); context.fillText(selectedY, 0, 0); context.restore();
+        }
+        if (exportAxisValues) {
+          context.fillStyle = '#17202a'; context.font = `${resolvedAxisTickFontSize * 2}px Arial`;
+          for (let index = exportAxisEndValues ? 0 : 1; index <= (exportAxisEndValues ? 5 : 4); index += 1) {
+            const fraction = index / 5, px = pad + fraction * (width - 2 * pad), py = height - pad - fraction * (height - 2 * pad);
+            context.textAlign = 'center'; context.fillText(formatAxisTick(minX + fraction * (maxX - minX)), px, height - pad + resolvedAxisTickFontSize * 2.4);
+            context.textAlign = 'right'; context.fillText(formatAxisTick(minY + fraction * (maxY - minY)), pad - 10, py + resolvedAxisTickFontSize * 0.7);
+          }
+        }
         for (const point of targetPoints.slice(0, count)) {
-          const px = sx(point.x), py = sy(point.y), style = categoryStyles[scatterCategory(point, selectedColor)] ?? { color: '#6b7280', symbol: 'circle' };
-          const symbol = distinctShapes ? style.symbol : 'circle';
+          const category = scatterCategory(point, selectedColor);
+          if (!numericColor && categoryVisibility[category] === false) continue;
+          const numericValue = Number(point.color ?? point.collision);
+          const px = sx(point.x), py = sy(point.y), style = numericColor
+            ? { color: interpolateColorRange(numericValue, exportColorMinimum, exportColorMaximum, resolvedNumericColorRange), border: false, symbol: 'circle' }
+            : categoryStyles[category] ?? { color: '#6b7280', border: true, symbol: 'circle' };
+          const symbol = style.symbol;
           const radius = Math.max(1.5, (Number(pointSize) || 10) / 2);
           context.beginPath();
           if (symbol === 'rect' || symbol === 'roundRect') context.rect(px - radius, py - radius, radius * 2, radius * 2);
@@ -565,7 +1005,8 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
           else if (symbol === 'diamond') { context.moveTo(px, py - radius * 1.35); context.lineTo(px + radius * 1.2, py); context.lineTo(px, py + radius * 1.35); context.lineTo(px - radius * 1.2, py); context.closePath(); }
           else if (symbol === 'pin') { context.arc(px, py - radius * 0.4, radius, 0, Math.PI * 2); context.moveTo(px - radius * 0.6, py + radius * 0.4); context.lineTo(px, py + radius * 1.6); context.lineTo(px + radius * 0.6, py + radius * 0.4); }
           else context.arc(px, py, radius, 0, Math.PI * 2);
-          context.fillStyle = style.color; context.fill(); context.strokeStyle = '#17202a'; context.lineWidth = 1; context.stroke();
+          context.fillStyle = style.color; context.fill();
+          if (style.border) { context.strokeStyle = '#17202a'; context.lineWidth = 1; context.stroke(); }
         }
       };
       if (exportFormat === 'png') { drawFrame(targetPoints.length); const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('PNG encoding failed')), 'image/png')); const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `sampling-${selectedX}-${selectedY}.png`; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000); return; }
@@ -579,14 +1020,73 @@ function ScatterExplorer({ datasetId, onOpen }: { datasetId: string; onOpen: (id
     } catch (error) { setExportError(error instanceof Error ? error.message : 'Animation export failed.'); } finally { setExporting(false); }
   }
   return <Stack gap="md">
-    <Card p="lg"><SimpleGrid cols={{ base: 1, sm: 2, lg: mode === 'single' ? 5 : 6 }} verticalSpacing="sm">
+    <Card p="lg"><SimpleGrid cols={{ base: 1, sm: 2, lg: mode === 'single' ? 6 : 7 }} verticalSpacing="sm">
       <Select label="Mode" value={mode} onChange={setMode} allowDeselect={false} data={[{ value: 'single', label: 'Single experiment' }, { value: 'compare', label: 'Compare paired experiments' }]} />
-      <Group wrap="nowrap" style={{ gridColumn: 'span 2' }}><Select label="Color type" data={colorSourceOptions} value={colorSource} onChange={(value) => { setColorSource(value); setColor(colorFields.find((field) => field.source === value)?.key ?? 'outcome'); }} allowDeselect={false} w="32%" /><Select label="Color field" searchable data={colorFieldOptions} value={selectedColor} onChange={setColor} allowDeselect={false} style={{ flex: 1, minWidth: 0 }} /></Group>
+      <Select label="Display" value={plotView} onChange={setPlotView} allowDeselect={false} data={[{ value: 'scatter', label: 'Concrete-sample scatter' }, { value: 'disagreement_heatmap', label: 'Binned disagreement heatmap', disabled: mode !== 'compare' }]} />
+      {plotView === 'disagreement_heatmap' ? <Group wrap="nowrap" style={{ gridColumn: 'span 2' }}><NumberInput label="X bins" min={2} max={20} value={xBinCount} onChange={setXBinCount} w="50%" /><NumberInput label="Y bins" min={2} max={20} value={yBinCount} onChange={setYBinCount} w="50%" /></Group> : <Group wrap="nowrap" style={{ gridColumn: 'span 2' }}><Select label="Color type" data={colorSourceOptions} value={colorSource} onChange={(value) => { setColorSource(value); setColor(colorFields.find((field) => field.source === value)?.key ?? 'outcome'); }} allowDeselect={false} w="32%" /><Select label="Color field" searchable data={colorFieldOptions} value={selectedColor} onChange={setColor} allowDeselect={false} style={{ flex: 1, minWidth: 0 }} /></Group>}
       {mode === 'single' ? <Select label="Experiment" data={(scatter.data?.datasets ?? []).map((value) => ({ value, label: value }))} value={dataset} onChange={setDataset} allowDeselect={false} /> : <><Select label="Left experiment" data={(scatter.data?.datasets ?? []).map((value) => ({ value, label: value, disabled: value === rightDataset }))} value={leftDataset} onChange={setLeftDataset} allowDeselect={false} /><Select label="Right experiment" data={(scatter.data?.datasets ?? []).map((value) => ({ value, label: value, disabled: value === leftDataset }))} value={rightDataset} onChange={setRightDataset} allowDeselect={false} /></>}
       <Select label="Plot ratio" value={aspect} onChange={setAspect} allowDeselect={false} data={[{ value: 'fit', label: 'Fit window' }, { value: '1 / 1', label: '1:1 · square' }, { value: '4 / 3', label: '4:3' }, { value: '16 / 9', label: '16:9' }]} />
-    </SimpleGrid><SimpleGrid cols={{ base: 1, md: 2 }} mt="md"><Card withBorder p="sm"><Text fw={600} size="sm" mb="xs">X axis</Text><Group wrap="nowrap"><Select label="Type" data={sourceOptions} value={xSource} onChange={(value) => { setXSource(value); setX(axisFields.find((field) => field.source === value)?.key ?? null); }} allowDeselect={false} w="32%" /><Select label="Field" searchable data={xFieldOptions} value={selectedX} onChange={setX} allowDeselect={false} style={{ flex: 1, minWidth: 0 }} /></Group></Card><Card withBorder p="sm"><Text fw={600} size="sm" mb="xs">Y axis</Text><Group wrap="nowrap"><Select label="Type" data={sourceOptions} value={ySource} onChange={(value) => { setYSource(value); setY(axisFields.find((field) => field.source === value)?.key ?? null); }} allowDeselect={false} w="32%" /><Select label="Field" searchable data={yFieldOptions} value={selectedY} onChange={setY} allowDeselect={false} style={{ flex: 1, minWidth: 0 }} /></Group></Card></SimpleGrid><Divider my="md" label="Visible sample prefix" /><Group justify="space-between" mb="xs"><Text size="sm" fw={600}>First {shownCount.toLocaleString()} samples</Text><Text size="xs" c="dimmed">{allPoints.length.toLocaleString()} total · fixed final axes</Text></Group><input className="pisa-horizontal-range pisa-sample-count-range" type="range" aria-label="Visible sample count" value={shownCount} onChange={(event) => { setPlaying(false); setVisibleCount(Number(event.currentTarget.value)); }} min={0} max={Math.max(1, allPoints.length)} step={1} /><Group justify="space-between" align="flex-end" mt="md" wrap="wrap"><Group><Button size="sm" variant={playing ? 'filled' : 'light'} onClick={() => setPlaying((value) => !value)} leftSection={<IconPlayerPlay size={16} />}>{playing ? 'Pause sequence' : 'Play sample sequence'}</Button><Button size="sm" variant="default" onClick={() => { setPlaying(false); setVisibleCount(allPoints.length); }}>Show all</Button></Group><Group justify="flex-end" align="flex-end" wrap="wrap"><Checkbox label="Axes" checked={exportAxes} onChange={(event) => setExportAxes(event.currentTarget.checked)} /><Checkbox label="Grid" checked={exportGrid} onChange={(event) => setExportGrid(event.currentTarget.checked)} /><Checkbox label="Distinct shapes" checked={distinctShapes} onChange={(event) => setDistinctShapes(event.currentTarget.checked)} /><NumberInput label="Point size" value={pointSize} onChange={setPointSize} min={3} max={30} step={1} clampBehavior="strict" w={96} /><Select label="Format" value={exportFormat} onChange={setExportFormat} allowDeselect={false} data={[{ value: 'png', label: 'PNG · current frame' }, { value: 'gif', label: 'GIF animation' }, { value: 'mp4', label: 'MP4 animation' }, { value: 'webm', label: 'WebM animation' }]} />{exportFormat !== 'png' && <Select label="Timing" value={durationMode} onChange={setDurationMode} allowDeselect={false} data={[{ value: 'duration', label: 'Total duration' }, { value: 'rate', label: 'Points per second' }]} />}{exportFormat !== 'png' && (durationMode === 'rate' ? <NumberInput label="Points / second" value={pointsPerSecond} onChange={setPointsPerSecond} min={0.1} /> : <NumberInput label="Total seconds" value={durationSeconds} onChange={setDurationSeconds} min={0.25} />)}<Button loading={exporting} onClick={() => void exportAnimation()} leftSection={<IconDownload size={16} />}>Export first {shownCount}</Button></Group></Group>{exportError && <Text role="alert" c="red" size="xs" mt="sm">{exportError}</Text>}</Card>
-    {scatter.isLoading ? <PageLoading label="Loading concrete sample space…" /> : scatter.error ? <InlineError error={scatter.error} onRetry={() => scatter.refetch()} /> : <VisualizationCard spec={spec} aspectRatio={aspect === 'fit' ? undefined : aspect ?? '1 / 1'} onPointClick={handlePoint} emptyDescription="No concrete samples contain both selected numeric fields." />}
-    {representatives.length > 0 && <Card p="lg"><Group justify="space-between" mb="md"><div><Text fw={650}>Representative concrete cases</Text><Text size="xs" c="dimmed">{mode === 'compare' ? 'Paired outcome differences or the largest selected-metric deltas.' : 'Outcome, center, and boundary representatives from the complete selected experiment set.'}</Text></div><Badge variant="light">{representatives.length} cases</Badge></Group><SimpleGrid cols={{ base: 1, md: 2, xl: 3 }}>{representatives.map(({ label, reason, point }) => <Card key={`${label}-${point.run_id}`} withBorder p="md"><Group justify="space-between"><Text fw={600} size="sm">{label}</Text><StatusBadge value={point.outcome} /></Group><Text size="xs" c="dimmed" mt={4}>{reason}</Text><Text size="xs" className="pisa-code" mt="sm">sample {point.ordinal} · ({point.x.toPrecision(5)}, {point.y.toPrecision(5)})</Text><Button mt="sm" size="compact-sm" variant="light" onClick={() => onOpen(point.run_id, mode === 'compare' ? [leftDataset, rightDataset].filter((item): item is string => Boolean(item)) : [point.dataset_id])}>{mode === 'compare' ? 'Open paired replay' : 'Open in replay'}</Button></Card>)}</SimpleGrid></Card>}
+    </SimpleGrid><SimpleGrid cols={{ base: 1, md: 2 }} mt="md"><Card withBorder p="sm"><Text fw={600} size="sm" mb="xs">X axis</Text><Group wrap="nowrap"><Select label="Type" data={sourceOptions} value={xSource} onChange={(value) => { setXSource(value); setX(axisFields.find((field) => field.source === value)?.key ?? null); }} allowDeselect={false} w="32%" /><Select label="Field" searchable data={xFieldOptions} value={selectedX} onChange={setX} allowDeselect={false} style={{ flex: 1, minWidth: 0 }} /></Group></Card><Card withBorder p="sm"><Text fw={600} size="sm" mb="xs">Y axis</Text><Group wrap="nowrap"><Select label="Type" data={sourceOptions} value={ySource} onChange={(value) => { setYSource(value); setY(axisFields.find((field) => field.source === value)?.key ?? null); }} allowDeselect={false} w="32%" /><Select label="Field" searchable data={yFieldOptions} value={selectedY} onChange={setY} allowDeselect={false} style={{ flex: 1, minWidth: 0 }} /></Group></Card></SimpleGrid>
+    {plotView === 'disagreement_heatmap' && <Accordion mt="md" variant="contained"><Accordion.Item value="heatmap-domain"><Accordion.Control><Text fw={600} size="sm">Optional fixed bin domain</Text></Accordion.Control><Accordion.Panel><Text size="xs" c="dimmed" mb="sm">Leave blank to use the observed filtered range. Set both limits on an axis to reproduce fixed publication intervals, such as 5–30 with five bins.</Text><SimpleGrid cols={{ base: 2, md: 4 }}><NumberInput label="X minimum" value={heatmapXMin} onChange={setHeatmapXMin} /><NumberInput label="X maximum" value={heatmapXMax} onChange={setHeatmapXMax} /><NumberInput label="Y minimum" value={heatmapYMin} onChange={setHeatmapYMin} /><NumberInput label="Y maximum" value={heatmapYMax} onChange={setHeatmapYMax} /></SimpleGrid><Button mt="sm" size="compact-xs" variant="default" onClick={() => { setHeatmapXMin(''); setHeatmapXMax(''); setHeatmapYMin(''); setHeatmapYMax(''); }}>Use observed range</Button></Accordion.Panel></Accordion.Item></Accordion>}
+    <Accordion mt="md" variant="contained"><Accordion.Item value="scatter-filter"><Accordion.Control><Group gap="xs"><Text fw={600} size="sm">Filter</Text>{filterField && <Badge variant="light">{colorFields.find((field) => field.key === filterField)?.label ?? filterField} · {allPoints.length.toLocaleString()} / {colorDomainPoints.length.toLocaleString()}</Badge>}</Group></Accordion.Control><Accordion.Panel>
+      <Group justify="space-between" align="flex-start" wrap="wrap"><Text size="xs" c="dimmed">Restrict the plotted and exported samples by one recorded field.</Text>{filterField && <Button size="compact-xs" variant="subtle" onClick={() => { setFilterSource(null); setFilterField(null); setFilterRange(null); setFilterRangeField(null); setFilterValues([]); }}>Clear filter</Button>}</Group>
+      <Group wrap="nowrap" align="flex-end" mt="xs">
+        <Select label="Type" placeholder="No filter" clearable data={filterSourceOptions} value={filterSource} onChange={(value) => { setFilterSource(value); const next = colorFields.find((field) => field.source === value)?.key ?? null; setFilterField(next); setFilterRange(null); setFilterRangeField(null); setFilterValues([]); }} w="20%" />
+        <Select label="Field" placeholder="Select a type first" searchable disabled={!filterSource} data={filterFieldOptions} value={filterField} onChange={(value) => { setFilterField(value); setFilterRange(null); setFilterRangeField(null); setFilterValues([]); }} allowDeselect={false} w="30%" />
+        {filterDescription?.kind === 'continuous' && filterDescription.minimum != null && filterDescription.maximum != null && filterRange && <>
+          <div style={{ flex: 1, minWidth: 180 }}>
+            <Text size="xs" fw={500} mb={8}>Included range</Text>
+            {filterDescription.minimum < filterDescription.maximum ? <HorizontalRangeInput minimum={Math.min(filterDescription.minimum, filterRange[0])} maximum={Math.max(filterDescription.maximum, filterRange[1])} step={filterDescription.step ?? 1} value={filterRange} onChange={setFilterRange} /> : <Text size="sm" c="dimmed">Only {filterDescription.minimum.toLocaleString()} is present.</Text>}
+          </div>
+          <Group wrap="nowrap" gap="xs">
+            <NumberInput label="Min" value={filterRange[0]} step={filterDescription.step ?? 1} onChange={(value) => { if (typeof value === 'number') setFilterRange([Math.min(value, filterRange[1]), filterRange[1]]); }} w={120} />
+            <NumberInput label="Max" value={filterRange[1]} step={filterDescription.step ?? 1} onChange={(value) => { if (typeof value === 'number') setFilterRange([filterRange[0], Math.max(value, filterRange[0])]); }} w={120} />
+          </Group>
+        </>}
+        {filterDescription?.kind === 'discrete' && <MultiSelect label="Included values" placeholder="All values" searchable clearable data={[...(filterDescription.values ?? []).map((value) => ({ value, label: value })), ...(filterDescription.missing_count ? [{ value: '__missing__', label: `Missing (${filterDescription.missing_count.toLocaleString()})` }] : [])]} value={filterValues} onChange={setFilterValues} style={{ flex: 1, minWidth: 240 }} />}
+      </Group>
+      {filterField && filterDescription && <Text size="xs" c="dimmed" mt="xs">{allPoints.length.toLocaleString()} / {colorDomainPoints.length.toLocaleString()} samples remain. {filterDescription.missing_count.toLocaleString()} samples have no value for this field.{mode === 'compare' && !filterField.startsWith('param:') ? ' Paired output fields are filtered using the Left execution; paired parameter values are shared.' : ''}</Text>}
+    </Accordion.Panel></Accordion.Item></Accordion>
+    <Divider my="md" label="Display options" />
+    <Group align="center" wrap="wrap">
+      <Checkbox label="Axes" checked={exportAxes} onChange={(event) => setExportAxes(event.currentTarget.checked)} />
+      <Checkbox label="Axis values" checked={exportAxisValues} onChange={(event) => setExportAxisValues(event.currentTarget.checked)} />
+      {plotView === 'scatter' && <Checkbox label="Axis end values" checked={exportAxisEndValues} disabled={!exportAxisValues} onChange={(event) => setExportAxisEndValues(event.currentTarget.checked)} />}
+      <Checkbox label="Grid" checked={exportGrid} onChange={(event) => setExportGrid(event.currentTarget.checked)} />
+      {plotView === 'scatter' && <Checkbox label="Fix coordinate axes" checked={axesLocked} disabled={!dynamicAxes} onChange={(event) => { const checked = event.currentTarget.checked; if (checked && dynamicAxes) setLockedAxes(dynamicAxes); setAxesLocked(checked); }} />}
+      {plotView === 'scatter' && <Checkbox label="Distinct shapes" checked={distinctShapes} onChange={(event) => setDistinctShapes(event.currentTarget.checked)} />}
+      {plotView === 'scatter' && numericColor && <Checkbox label="Color range legend" checked={showNumericColorRange} onChange={(event) => setShowNumericColorRange(event.currentTarget.checked)} />}
+      {plotView === 'disagreement_heatmap' && <Checkbox label="Show d/n" checked={showHeatmapCounts} onChange={(event) => setShowHeatmapCounts(event.currentTarget.checked)} />}
+      {plotView === 'disagreement_heatmap' && <Checkbox label="Show percentage" checked={showHeatmapPercentage} onChange={(event) => setShowHeatmapPercentage(event.currentTarget.checked)} />}
+    </Group>
+    <Group align="flex-end" wrap="wrap" mt="sm">
+      <NumberInput label="Axis title size" value={axisTitleFontSize} onChange={setAxisTitleFontSize} min={8} max={40} step={1} clampBehavior="strict" w={122} />
+      <NumberInput label="Axis tick size" value={axisTickFontSize} onChange={setAxisTickFontSize} min={8} max={32} step={1} clampBehavior="strict" w={116} />
+      {plotView === 'scatter' && <NumberInput label="Point size" value={pointSize} onChange={setPointSize} min={3} max={30} step={1} clampBehavior="strict" w={96} />}
+      {plotView === 'scatter' && numericColor && <>
+        <ColorInput label={mode === 'compare' ? 'Negative color' : 'Low color'} format="hex" value={numericColorRange[0]} onChange={(value) => setNumericColorRangeValue(0, value)} w={132} />
+        <ColorInput label={mode === 'compare' ? 'Zero color' : 'Middle color'} format="hex" value={numericColorRange[1]} onChange={(value) => setNumericColorRangeValue(1, value)} w={132} />
+        <ColorInput label={mode === 'compare' ? 'Positive color' : 'High color'} format="hex" value={numericColorRange[2]} onChange={(value) => setNumericColorRangeValue(2, value)} w={132} />
+        <Button variant="default" onClick={resetNumericColorRange}>Reset color range</Button>
+      </>}
+      {plotView === 'disagreement_heatmap' && <NumberInput label="Cell text size" value={heatmapCellFontSize} onChange={setHeatmapCellFontSize} min={8} max={32} step={1} clampBehavior="strict" w={116} />}
+      <Button variant="default" onClick={() => {
+        setExportAxes(true); setExportAxisValues(true); setExportAxisEndValues(true); setExportGrid(false); setShowNumericColorRange(true); setAxesLocked(false); setLockedAxes(null); setDistinctShapes(false); setPointSize(10); resetNumericColorRange();
+        setAxisTitleFontSize(14); setAxisTickFontSize(12); setHeatmapCellFontSize(12); setShowHeatmapCounts(true); setShowHeatmapPercentage(true);
+      }}>Reset display</Button>
+      {plotView === 'scatter' && axesLocked && lockedAxes && <Text size="xs" c="dimmed">Locked at X {formatAxisTick(lockedAxes.xMin)}–{formatAxisTick(lockedAxes.xMax)}, Y {formatAxisTick(lockedAxes.yMin)}–{formatAxisTick(lockedAxes.yMax)}</Text>}
+    </Group>
+    {plotView === 'scatter' && <Accordion mt="md" variant="contained"><Accordion.Item value="sample-sequence"><Accordion.Control><Group gap="xs"><Text fw={600} size="sm">Sample sequence and animation export</Text><Badge variant="light">First {shownCount.toLocaleString()} / {allPoints.length.toLocaleString()}</Badge></Group></Accordion.Control><Accordion.Panel>
+      <Group justify="space-between" mb="xs"><Text size="sm" fw={600}>First {shownCount.toLocaleString()} samples</Text><Text size="xs" c="dimmed">{allPoints.length.toLocaleString()} filtered samples</Text></Group>
+      <input className="pisa-horizontal-range pisa-sample-count-range" type="range" aria-label="Visible sample count" value={shownCount} onChange={(event) => { setPlaying(false); setVisibleCount(Number(event.currentTarget.value)); }} min={0} max={Math.max(1, allPoints.length)} step={1} />
+      <Group justify="space-between" align="flex-end" mt="md" wrap="wrap"><Group><Button size="sm" variant={playing ? 'filled' : 'light'} onClick={() => setPlaying((value) => !value)} leftSection={<IconPlayerPlay size={16} />}>{playing ? 'Pause sequence' : 'Play sample sequence'}</Button><Button size="sm" variant="default" onClick={() => { setPlaying(false); setVisibleCount(allPoints.length); }}>Show all</Button></Group><Group justify="flex-end" align="flex-end" wrap="wrap"><Select label="Format" value={exportFormat} onChange={setExportFormat} allowDeselect={false} data={[{ value: 'png', label: 'PNG · current frame' }, { value: 'gif', label: 'GIF animation' }, { value: 'mp4', label: 'MP4 animation' }, { value: 'webm', label: 'WebM animation' }]} />{exportFormat !== 'png' && <Select label="Timing" value={durationMode} onChange={setDurationMode} allowDeselect={false} data={[{ value: 'duration', label: 'Total duration' }, { value: 'rate', label: 'Points per second' }]} />}{exportFormat !== 'png' && (durationMode === 'rate' ? <NumberInput label="Points / second" value={pointsPerSecond} onChange={setPointsPerSecond} min={0.1} /> : <NumberInput label="Total seconds" value={durationSeconds} onChange={setDurationSeconds} min={0.25} />)}<Button loading={exporting} onClick={() => void exportAnimation()} leftSection={<IconDownload size={16} />}>Export first {shownCount}</Button></Group></Group>
+      {exportError && <Text role="alert" c="red" size="xs" mt="sm">{exportError}</Text>}
+    </Accordion.Panel></Accordion.Item></Accordion>}
+    {plotView === 'disagreement_heatmap' && <Text size="xs" c="dimmed" mt="md">The chart export menu provides PNG, SVG, CSV, and JSON for the complete filtered heatmap.</Text>}
+    </Card>
+    {plotView === 'scatter' && !numericColor && categoryNames.length > 0 && <Group justify="space-between" align="center" wrap="wrap"><Text size="xs" c="dimmed">{visiblePointCount.toLocaleString()} / {shownPoints.length.toLocaleString()} points visible · {visibleCategoryCount} / {categoryNames.length} categories shown · click a style marker to change its color, border, or shape</Text><Group gap="xs"><Button size="compact-xs" variant="default" disabled={visibleCategoryCount === categoryNames.length} onClick={() => setCategoryVisibilityContexts((current) => ({ ...current, [visibilityContext]: {} }))}>Reset filters</Button><Button size="compact-xs" variant="default" disabled={!hasCategoryStyleOverrides} onClick={resetCategoryStyles}>Reset category styles</Button></Group></Group>}
+    {scatter.isLoading ? <PageLoading label="Loading concrete sample space…" /> : scatter.error ? <InlineError error={scatter.error} onRetry={() => scatter.refetch()} /> : <VisualizationCard spec={spec} aspectRatio={aspect === 'fit' ? undefined : aspect ?? '1 / 1'} onPointClick={plotView === 'scatter' ? handlePoint : undefined} seriesVisibility={plotView === 'scatter' ? categoryVisibility : undefined} onSeriesVisibilityChange={plotView === 'scatter' ? setCategoryVisible : undefined} seriesStyleOverrides={plotView === 'scatter' && !numericColor ? activeCategoryStyleOverrides : undefined} onSeriesStyleChange={plotView === 'scatter' && !numericColor ? setCategoryStyle : undefined} seriesLabels={plotView === 'scatter' && !numericColor ? categoryLabels : undefined} emptyDescription="No concrete samples contain both selected numeric fields." />}
+    {plotView === 'scatter' && representatives.length > 0 && <Card p="lg"><Group justify="space-between" mb="md"><div><Text fw={650}>Representative concrete cases</Text><Text size="xs" c="dimmed">{mode === 'compare' ? 'Paired outcome differences or the largest selected-metric deltas.' : 'Outcome, center, and boundary representatives from the complete selected experiment set.'}</Text></div><Badge variant="light">{representatives.length} cases</Badge></Group><SimpleGrid cols={{ base: 1, md: 2, xl: 3 }}>{representatives.map(({ label, reason, point }) => <Card key={`${label}-${point.run_id}`} withBorder p="md"><Group justify="space-between"><Text fw={600} size="sm">{label}</Text><StatusBadge value={point.outcome} /></Group><Text size="xs" c="dimmed" mt={4}>{reason}</Text><Text size="xs" className="pisa-code" mt="sm">sample {point.ordinal} · ({point.x.toPrecision(5)}, {point.y.toPrecision(5)})</Text><Button mt="sm" size="compact-sm" variant="light" onClick={() => onOpen(point.run_id, mode === 'compare' ? [leftDataset, rightDataset].filter((item): item is string => Boolean(item)) : [point.dataset_id])}>{mode === 'compare' ? 'Open paired replay' : 'Open in replay'}</Button></Card>)}</SimpleGrid></Card>}
   </Stack>;
 }
 
@@ -610,7 +1110,7 @@ function comparisonValue(value: number | null | undefined, unit?: string | null)
   return unit ? `${formatted} ${unit}` : formatted;
 }
 
-function CrossExperimentOverview({ summary, onOpen }: { summary?: CrossExperimentComparison; onOpen: (id: string, experiments?: string[]) => void }) {
+function CrossExperimentOverview({ datasetId, summary, onOpen }: { datasetId: string; summary?: CrossExperimentComparison; onOpen: (id: string, experiments?: string[]) => void }) {
   if (!summary) return <Alert color="yellow" icon={<IconAlertTriangle size={17} />} title="Workbench server update required">The comparisons API did not return a cross-experiment summary. This does not mean the report is incompatible. Restart the Workbench server, then reload this page.</Alert>;
   if (!summary.available) return <Alert color="gray" title="Cross-experiment summary unavailable">{summary.reason?.replaceAll('_', ' ') ?? 'The normalized index does not contain at least two safely pairable canonical experiments.'}</Alert>;
   return <Card p="lg">
@@ -634,7 +1134,7 @@ function CrossExperimentOverview({ summary, onOpen }: { summary?: CrossExperimen
 
     <Text fw={650} mb="xs">Ego trajectory disagreement</Text>
     <Text size="xs" c="dimmed" mb="sm">For each common sample, every experiment pair is compared and the largest pairwise ADE/FDE becomes that sample's trajectory variation. Recorded timestamps are intersected exactly; no states are interpolated.</Text>
-    {!summary.trajectory?.available ? <Alert color="gray" mb="xl">Trajectory comparison unavailable: {summary.trajectory?.reason?.replaceAll('_', ' ') ?? 'ego trajectory paths were not indexed'}.</Alert> : <ScrollArea mb="xl" type="auto"><table className="pisa-data-table"><thead><tr><th>Measure</th><th>Eligible samples</th><th>Max</th><th>Min</th><th>Mean</th><th>Population std</th><th>Median</th></tr></thead><tbody>{[summary.trajectory.ade, summary.trajectory.fde].filter((value): value is NonNullable<typeof value> => Boolean(value)).map((metric) => {
+    {!summary.trajectory?.available ? <Alert color="gray" mb="xl">Trajectory comparison unavailable: {summary.trajectory?.reason?.replaceAll('_', ' ') ?? 'ego trajectory paths were not indexed'}.{summary.trajectory?.reason === 'deep_consistency_required' && <> Generate the trace-level result from the <Anchor component={Link} to={`/reports/${encodeURIComponent(datasetId)}/consistency`}>Consistency tab</Anchor>.</>}</Alert> : <ScrollArea mb="xl" type="auto"><table className="pisa-data-table"><thead><tr><th>Measure</th><th>Eligible samples</th><th>Max</th><th>Min</th><th>Mean</th><th>Population std</th><th>Median</th></tr></thead><tbody>{[summary.trajectory.ade, summary.trajectory.fde].filter((value): value is NonNullable<typeof value> => Boolean(value)).map((metric) => {
       const cell = (key: 'max' | 'min' | 'mean' | 'std' | 'median') => {
         const value = metric[key];
         const representative = metric.representatives[key];
@@ -664,19 +1164,421 @@ function CrossExperimentOverview({ summary, onOpen }: { summary?: CrossExperimen
   </Card>;
 }
 
+const pairedCategoryLabels: Record<string, string> = {
+  same_outcome: 'Same outcome',
+  left_success_right_fail: 'Left Success / Right Fail',
+  left_fail_right_success: 'Left Fail / Right Success',
+  other_disagreement: 'Other disagreement',
+};
+
+const pairedCategoryColors: Record<string, string> = {
+  same_outcome: '#a9b1bd',
+  left_success_right_fail: '#d9485f',
+  left_fail_right_success: '#168f77',
+  other_disagreement: '#d68b18',
+};
+
+const agreementCategoryStyles: Record<string, Required<SeriesStyleOverride>> = {
+  'Success / Success': { color: '#20a486', border: true, symbol: 'circle' },
+  'Fail / Fail': { color: '#e25555', border: true, symbol: 'triangle' },
+  'Invalid / Invalid': { color: '#f59f00', border: true, symbol: 'diamond' },
+  'Unknown / Unknown': { color: '#8b95a5', border: true, symbol: 'rect' },
+};
+
+const agreementCategoryLabels: Record<string, string> = {
+  success_success: 'Success / Success',
+  fail_fail: 'Fail / Fail',
+  invalid_invalid: 'Invalid / Invalid',
+  unknown_unknown: 'Unknown / Unknown',
+};
+
+export function pairedAgreementBoundarySegment(minimum: number, maximum: number, offset: number): [[number, number], [number, number]] | undefined {
+  const start = Math.max(minimum, minimum - offset);
+  const end = Math.min(maximum, maximum - offset);
+  return start <= end ? [[start, start + offset], [end, end + offset]] : undefined;
+}
+
+function pairedExperimentLabel(dataset: string): string {
+  const lowered = dataset.toLowerCase();
+  if (lowered.includes('autoware')) return 'Autoware';
+  if (lowered.includes('plant')) return 'PlanT';
+  if (lowered.includes('carla_agent') || lowered.includes('behavior')) return 'Behavior Agent';
+  if (lowered.includes('simple')) return 'Simple Agent';
+  return dataset;
+}
+
+function PairedMetricAgreementView({ datasetId, comparison, onOpen }: { datasetId: string; comparison: ComparisonClass; onOpen: (id: string, experiments?: string[]) => void }) {
+  const storageKey = `pisa:paired-metric-agreement:${datasetId}:${comparison.id}`;
+  const [metric, setMetric] = useSessionState<string | null>(`${storageKey}:metric`, null);
+  const [xSide, setXSide] = useSessionState<string | null>(`${storageKey}:x-side`, 'right');
+  const [outcomeScope, setOutcomeScope] = useSessionState<string | null>(`${storageKey}:outcome-scope`, 'all_same');
+  const [primaryThreshold, setPrimaryThreshold] = useSessionState<number | string>(`${storageKey}:primary-threshold`, 5);
+  const [secondaryThreshold, setSecondaryThreshold] = useSessionState<number | string>(`${storageKey}:secondary-threshold`, 10);
+  const [showEquality, setShowEquality] = useSessionState(`${storageKey}:show-equality`, true);
+  const [showPrimary, setShowPrimary] = useSessionState(`${storageKey}:show-primary`, true);
+  const [showSecondary, setShowSecondary] = useSessionState(`${storageKey}:show-secondary`, true);
+  const [styleOverrides, setStyleOverrides] = useSessionState<Record<string, SeriesStyleOverride>>(`${storageKey}:category-styles-v1`, {});
+  const primary = Number(primaryThreshold), secondary = Number(secondaryThreshold);
+  const thresholdsValid = Number.isFinite(primary) && primary > 0 && Number.isFinite(secondary) && secondary > primary;
+  const request = useMemo(() => ({
+    ...(metric ? { metric } : {}),
+    x_side: xSide === 'left' ? 'left' as const : 'right' as const,
+    outcome_scope: ['success', 'fail', 'invalid', 'unknown'].includes(outcomeScope ?? '') ? outcomeScope as 'success' | 'fail' | 'invalid' | 'unknown' : 'all_same' as const,
+    primary_threshold: primary,
+    secondary_threshold: secondary,
+  }), [metric, outcomeScope, primary, secondary, xSide]);
+  const analysis = useQuery({
+    queryKey: ['paired-metric-agreement', datasetId, comparison.id, request],
+    queryFn: () => api.datasets.pairedMetricAgreement(datasetId, comparison.id, request),
+    enabled: thresholdsValid,
+    retry: 1,
+  });
+  useEffect(() => {
+    if (!metric && analysis.data?.selection.metric) setMetric(analysis.data.selection.metric);
+  }, [analysis.data?.selection.metric, metric, setMetric]);
+  const setCategoryStyle = useCallback((name: string, style?: SeriesStyleOverride) => {
+    setStyleOverrides((current) => {
+      const next = { ...current };
+      if (style && Object.keys(style).length) next[name] = style;
+      else delete next[name];
+      return next;
+    });
+  }, [setStyleOverrides]);
+  const exportData = (format: 'csv' | 'json', data: PairedMetricAgreementResult) => {
+    const csvCell = (value: unknown) => { const text = String(value ?? ''); return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; };
+    const content = format === 'json'
+      ? `${JSON.stringify({ schema: 'pisa.paired-metric-agreement/v1', request, result: data }, null, 2)}\n`
+      : [
+        ['parameter_hash', 'left_run_id', 'right_run_id', 'left_outcome', 'right_outcome', 'left_value', 'right_value', 'x', 'y', 'y_minus_x', 'absolute_difference'],
+        ...data.points.map((point) => [point.parameter_hash, point.left_run_id, point.right_run_id, point.left_outcome, point.right_outcome, point.left_value, point.right_value, point.x, point.y, point.y_minus_x, point.absolute_difference]),
+      ].map((row) => row.map(csvCell).join(',')).join('\r\n');
+    const blob = new Blob([content], { type: format === 'json' ? 'application/json' : 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob), anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `paired-metric-agreement-${comparison.id}.${format}`; anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  if (!thresholdsValid) return <Card withBorder p="md"><Alert color="red" title="Invalid difference boundaries">Primary must be greater than zero, and secondary must be greater than primary.</Alert><Group mt="md"><NumberInput label="Primary difference" value={primaryThreshold} onChange={setPrimaryThreshold} min={0.000001} /><NumberInput label="Secondary difference" value={secondaryThreshold} onChange={setSecondaryThreshold} min={0.000001} /></Group></Card>;
+  if (analysis.isLoading) return <PageLoading label="Computing paired metric agreement…" />;
+  if (analysis.error) return <InlineError error={analysis.error} onRetry={() => analysis.refetch()} />;
+  const data = analysis.data!;
+  const unit = data.selection.unit ? ` ${data.selection.unit}` : '';
+  const metricDescriptor = data.metrics.find((item) => item.key === data.selection.metric);
+  const metricLabel = metricDescriptor?.label ?? data.selection.metric;
+  const values = data.points.flatMap((point) => [point.x, point.y]).filter(Number.isFinite);
+  const observedMinimum = values.length ? Math.min(...values) : 0, observedMaximum = values.length ? Math.max(...values) : 1;
+  const span = Math.max(1e-9, observedMaximum - observedMinimum);
+  const domainMinimum = observedMinimum - span * 0.04, domainMaximum = observedMaximum + span * 0.04;
+  const guide = (offset: number, label: string, color: string, type: 'solid' | 'dashed' | 'dotted', opacity: number, width: number) => {
+    const segment = pairedAgreementBoundarySegment(domainMinimum, domainMaximum, offset);
+    return segment ? [[{ coord: segment[0], name: label, lineStyle: { color, type, opacity, width }, label: { show: true, formatter: label, color } }, { coord: segment[1] }]] : [];
+  };
+  const guideData = [
+    ...(showEquality ? guide(0, 'y = x', '#17202a', 'solid', 0.9, 1.8) : []),
+    ...(showPrimary ? guide(primary, `y = x + ${primary}${unit}`, '#526ff0', 'dashed', 0.85, 1.5) : []),
+    ...(showPrimary ? guide(-primary, `y = x − ${primary}${unit}`, '#526ff0', 'dashed', 0.85, 1.5) : []),
+    ...(showSecondary ? guide(secondary, `y = x + ${secondary}${unit}`, '#8791a5', 'dotted', 0.5, 1.2) : []),
+    ...(showSecondary ? guide(-secondary, `y = x − ${secondary}${unit}`, '#8791a5', 'dotted', 0.5, 1.2) : []),
+  ];
+  const activeCategories = Object.entries(agreementCategoryLabels).filter(([category]) => data.points.some((point) => point.category === category));
+  const resolvedStyles = Object.fromEntries(activeCategories.map(([, label]) => [label, { ...agreementCategoryStyles[label], ...styleOverrides[label] }]));
+  const series = activeCategories.map(([category, label]) => ({
+    type: 'scatter', name: label, symbol: resolvedStyles[label].symbol, symbolSize: 10,
+    itemStyle: { color: resolvedStyles[label].color, borderColor: '#17202a', borderWidth: resolvedStyles[label].border ? 1 : 0, opacity: 0.82 },
+    data: data.points.filter((point) => point.category === category).map((point) => ({ value: [point.x, point.y], ...point })),
+  }));
+  const spec: VisualizationSpec = {
+    id: `paired-metric-agreement-${comparison.id}-${data.selection.metric}`,
+    title: 'Paired metric agreement',
+    subtitle: `${data.summary.included.count.toLocaleString()} same-outcome pairs · shared metric ${data.selection.metric} · exact statistics use the complete eligible population.`,
+    kind: 'scatter',
+    option: data.points.length ? {
+      animation: false,
+      legend: { type: 'scroll', top: 0, data: activeCategories.map(([, label]) => label) },
+      tooltip: { trigger: 'item', formatter: (params: { data?: Record<string, unknown> }) => { const point = params.data ?? {}; return `${escapeHtml(data.selection.x_dataset)}: ${escapeHtml(point.x)}${escapeHtml(unit)}<br/>${escapeHtml(data.selection.y_dataset)}: ${escapeHtml(point.y)}${escapeHtml(unit)}<br/>y − x: ${escapeHtml(point.y_minus_x)}${escapeHtml(unit)}<br/>|Δ|: ${escapeHtml(point.absolute_difference)}${escapeHtml(unit)}<br/>Outcome: ${escapeHtml(point.left_outcome)} / ${escapeHtml(point.right_outcome)}<br/>Pair: ${escapeHtml(point.parameter_hash)}`; } },
+      grid: { left: '15%', top: '12%', width: '70%', height: '70%' },
+      xAxis: { type: 'value', min: domainMinimum, max: domainMaximum, scale: true, name: `${pairedExperimentLabel(data.selection.x_dataset)} · ${metricLabel}${unit}`, nameLocation: 'middle', nameGap: 44 },
+      yAxis: { type: 'value', min: domainMinimum, max: domainMaximum, scale: true, name: `${pairedExperimentLabel(data.selection.y_dataset)} · ${metricLabel}${unit}`, nameLocation: 'middle', nameGap: 58 },
+      series: [{ type: 'line', name: '__agreement_guides', data: [], silent: true, symbol: 'none', markLine: { silent: true, symbol: 'none', data: guideData } }, ...series],
+    } : {},
+  };
+  const primarySummary = data.summary.included.thresholds[0], secondarySummary = data.summary.included.thresholds[1];
+  return <Stack gap="lg">
+    <Alert color="blue" icon={<IconShieldCheck size={17} />} title="Recorded paired output metric">Only uniquely paired executions with equal outcomes and finite values on both sides are plotted. No derived scenario parameters are introduced.</Alert>
+    <Card withBorder p="md"><SimpleGrid cols={{ base: 1, sm: 2, xl: 5 }}>
+      <Select label="Shared metric" searchable data={data.metrics.map((item) => ({ value: item.key, label: `${item.label}${item.unit ? ` (${item.unit})` : ''}` }))} value={data.selection.metric} onChange={setMetric} />
+      <Select label="X experiment" data={[{ value: 'left', label: pairedExperimentLabel(data.left) }, { value: 'right', label: pairedExperimentLabel(data.right) }]} value={data.selection.x_side} onChange={setXSide} allowDeselect={false} />
+      <Select label="Outcome scope" data={[{ value: 'all_same', label: 'All same outcomes' }, { value: 'success', label: 'Success / Success' }, { value: 'fail', label: 'Fail / Fail' }, { value: 'invalid', label: 'Invalid / Invalid' }, { value: 'unknown', label: 'Unknown / Unknown' }]} value={data.selection.outcome_scope} onChange={setOutcomeScope} allowDeselect={false} />
+      <NumberInput label={`Primary difference${unit ? ` (${unit.trim()})` : ''}`} value={primaryThreshold} onChange={setPrimaryThreshold} min={0.000001} />
+      <NumberInput label={`Secondary difference${unit ? ` (${unit.trim()})` : ''}`} value={secondaryThreshold} onChange={setSecondaryThreshold} min={0.000001} />
+    </SimpleGrid><Group mt="md"><Checkbox label="Equality line" checked={showEquality} onChange={(event) => setShowEquality(event.currentTarget.checked)} /><Checkbox label="Primary boundaries" checked={showPrimary} onChange={(event) => setShowPrimary(event.currentTarget.checked)} /><Checkbox label="Secondary boundaries" checked={showSecondary} onChange={(event) => setShowSecondary(event.currentTarget.checked)} /></Group></Card>
+    <SimpleGrid cols={{ base: 2, md: 4 }}>
+      <MetricCard label="Included pairs" value={data.summary.included.count.toLocaleString()} detail={data.selection.outcome_scope.replaceAll('_', ' ')} icon={<IconDatabase size={18} />} />
+      <MetricCard label={`|Δ| ≥ ${primary}${unit}`} value={primarySummary.count.toLocaleString()} detail={`${((primarySummary.rate ?? 0) * 100).toFixed(1)}% of included`} icon={<IconArrowsSort size={18} />} color="yellow" />
+      <MetricCard label={`|Δ| ≥ ${secondary}${unit}`} value={secondarySummary.count.toLocaleString()} detail={`${((secondarySummary.rate ?? 0) * 100).toFixed(1)}% of included`} icon={<IconArrowsSort size={18} />} color="red" />
+      <MetricCard label="Metric missing" value={data.summary.metric_missing_count.toLocaleString()} detail={`${data.summary.outcome_disagreement_metric_eligible_count.toLocaleString()} eligible outcome disagreements excluded`} icon={<IconAlertTriangle size={18} />} color="gray" />
+    </SimpleGrid>
+    <Card withBorder p="md"><Group justify="space-between" wrap="wrap"><Text size="sm">{primarySummary.count.toLocaleString()} of {data.summary.included.count.toLocaleString()} pairs differ by at least {primary}{unit}; {secondarySummary.count.toLocaleString()} differ by at least {secondary}{unit}.</Text><Group gap="xs"><Button size="compact-xs" variant="default" disabled={!Object.keys(styleOverrides).length} onClick={() => setStyleOverrides({})}>Reset category styles</Button><Button size="compact-xs" variant="default" leftSection={<IconDownload size={14} />} onClick={() => exportData('csv', data)}>Paired CSV</Button><Button size="compact-xs" variant="default" leftSection={<IconDownload size={14} />} onClick={() => exportData('json', data)}>Analysis JSON</Button></Group></Group></Card>
+    <VisualizationCard spec={spec} aspectRatio="1 / 1" seriesStyleOverrides={styleOverrides} onSeriesStyleChange={setCategoryStyle} onPointClick={(value) => { const record = chartRecord(value); if (typeof record?.left_run_id === 'string') onOpen(record.left_run_id, [data.left, data.right]); }} emptyDescription="No same-outcome pair has finite values for the selected metric." />
+    <Card p={0}><Group p="md" justify="space-between"><div><Text fw={650}>Same-outcome metric differences</Text><Text size="xs" c="dimmed">Counts use the complete eligible population, including points omitted by any plot limit.</Text></div><Badge variant="light">{data.summary.same_outcome_metric_eligible_count.toLocaleString()} eligible</Badge></Group><ScrollArea><table className="pisa-data-table"><thead><tr><th>Outcome pair</th><th>Pairs</th><th>≥ {primary}{unit}</th><th>≥ {secondary}{unit}</th></tr></thead><tbody>{['success', 'fail', 'invalid', 'unknown'].filter((name) => data.summary.categories[name]?.count).map((name) => { const summary = data.summary.categories[name]; return <tr key={name}><td>{agreementCategoryLabels[`${name}_${name}`]}</td><td>{summary.count.toLocaleString()}</td><td>{summary.thresholds[0].count.toLocaleString()} · {((summary.thresholds[0].rate ?? 0) * 100).toFixed(1)}%</td><td>{summary.thresholds[1].count.toLocaleString()} · {((summary.thresholds[1].rate ?? 0) * 100).toFixed(1)}%</td></tr>; })}</tbody></table></ScrollArea></Card>
+  </Stack>;
+}
+
+function intervalLabel(lower: number, upper: number, inclusive: boolean): string {
+  return `[${lower.toLocaleString(undefined, { maximumSignificantDigits: 5 })}, ${upper.toLocaleString(undefined, { maximumSignificantDigits: 5 })}${inclusive ? ']' : ')'}`;
+}
+
+function PairedParameterAnalysis({ datasetId, comparison, onOpen }: { datasetId: string; comparison: ComparisonClass; onOpen: (id: string, experiments?: string[]) => void }) {
+  const storageKey = `pisa:paired-parameters:${datasetId}:${comparison.id}`;
+  const [x, setX] = useSessionState<string | null>(`${storageKey}:x`, null);
+  const [y, setY] = useSessionState<string | null>(`${storageKey}:y`, null);
+  const [facet, setFacet] = useSessionState<string | null>(`${storageKey}:facet`, null);
+  const [view, setView] = useSessionState<string | null>(`${storageKey}:view`, 'outcome');
+  const [metric, setMetric] = useSessionState<string | null>(`${storageKey}:metric`, null);
+  const [binCount, setBinCount] = useSessionState<number | string>(`${storageKey}:bins`, 5);
+  const [minimumCellCount, setMinimumCellCount] = useSessionState<number | string>(`${storageKey}:minimum-cell`, Math.max(10, Math.ceil(comparison.matched * 0.01)));
+  const [boundaryDrafts, setBoundaryDrafts] = useState<Record<string, string>>({});
+  const [boundaries, setBoundaries] = useSessionState<Record<string, number[]>>(`${storageKey}:boundaries`, {});
+  const [boundaryError, setBoundaryError] = useState<string>();
+  const request = useMemo(() => ({
+    ...(x ? { x } : {}), ...(y ? { y } : {}), ...(facet !== null ? { facet } : {}),
+    view: view === 'metric_delta' ? 'metric_delta' as const : 'outcome' as const,
+    ...(view === 'metric_delta' && metric ? { metric } : {}),
+    bin_count: Math.max(2, Math.min(20, Number(binCount) || 5)),
+    minimum_cell_count: Math.max(1, Number(minimumCellCount) || 10),
+    boundaries,
+  }), [binCount, boundaries, facet, metric, minimumCellCount, view, x, y]);
+  const analysis = useQuery({
+    queryKey: ['paired-parameter-analysis', datasetId, comparison.id, request],
+    queryFn: () => api.datasets.pairedParameterAnalysis(datasetId, comparison.id, request),
+    enabled: view !== 'metric_agreement',
+    retry: 1,
+  });
+  useEffect(() => {
+    const data = analysis.data;
+    if (!data) return;
+    if (!x) setX(data.selection.x);
+    if (!y) setY(data.selection.y);
+    if (facet === null && data.selection.facet) setFacet(data.selection.facet);
+    if (view === 'metric_delta' && !metric && data.selection.metric) setMetric(data.selection.metric);
+  }, [analysis.data, facet, metric, setFacet, setMetric, setX, setY, view, x, y]);
+  if (view === 'metric_agreement') return <Stack gap="lg" mt="md">
+    <Group justify="space-between"><Text fw={700}>Paired analysis</Text></Group>
+    <Card withBorder p="md"><Select label="View" data={[{ value: 'outcome', label: 'Outcome disagreement in parameter space' }, { value: 'metric_delta', label: 'Metric delta in parameter space' }, { value: 'metric_agreement', label: 'Paired metric agreement' }]} value={view} onChange={setView} allowDeselect={false} /></Card>
+    <PairedMetricAgreementView datasetId={datasetId} comparison={comparison} onOpen={onOpen} />
+  </Stack>;
+  if (analysis.isLoading) return <PageLoading label="Computing paired parameter regions…" />;
+  if (analysis.error) return <InlineError error={analysis.error} onRetry={() => analysis.refetch()} />;
+  const data = analysis.data!;
+  const parameterOptions = data.parameters.map((name) => ({ value: name, label: name }));
+  const availableY = parameterOptions.filter((item) => item.value !== (x ?? data.selection.x));
+  const availableFacets = [{ value: '', label: 'No facet' }, ...parameterOptions.filter((item) => ![x ?? data.selection.x, y ?? data.selection.y].includes(item.value))];
+  const activeParameters = [...new Set([data.selection.x, data.selection.y, data.selection.facet].filter((value): value is string => Boolean(value)))];
+  const outcomeSpec: VisualizationSpec = {
+    id: `paired-parameter-points-${comparison.id}`,
+    title: view === 'metric_delta' ? `Paired Δ ${data.selection.metric}` : 'Outcome disagreement map',
+    subtitle: `${data.coverage.plotted_count.toLocaleString()} plotted / ${data.coverage.included_count.toLocaleString()} included pairs · axes use recorded original parameters only.`,
+    kind: 'scatter',
+    option: view === 'metric_delta' ? (() => {
+      const eligible = data.points.filter((point) => point.delta != null && Number.isFinite(point.delta));
+      const extent = Math.max(...eligible.map((point) => Math.abs(point.delta!)), 1e-9);
+      return { animation: false, tooltip: { trigger: 'item' }, grid: { top: 32, right: 96, bottom: 68, left: 76 }, xAxis: { type: 'value', name: data.selection.x, nameLocation: 'middle', nameGap: 40 }, yAxis: { type: 'value', name: data.selection.y, nameLocation: 'middle', nameGap: 52 }, visualMap: { min: -extent, max: extent, dimension: 2, right: 8, top: 40, calculable: true, inRange: { color: ['#0796a5', '#f8fafc', '#8e3b9d'] } }, series: [{ type: 'scatter', symbolSize: 10, data: eligible.map((point) => ({ value: [point.x, point.y, point.delta], left_run_id: point.left_run_id, right_run_id: point.right_run_id, category: point.category })) }] };
+    })() : {
+      animation: false, legend: { type: 'scroll', top: 0 }, tooltip: { trigger: 'item' }, grid: { top: 52, right: 32, bottom: 68, left: 76 }, xAxis: { type: 'value', name: data.selection.x, nameLocation: 'middle', nameGap: 40 }, yAxis: { type: 'value', name: data.selection.y, nameLocation: 'middle', nameGap: 52 }, series: Object.keys(pairedCategoryLabels).map((category) => ({ type: 'scatter', name: pairedCategoryLabels[category], symbolSize: category === 'same_outcome' ? 7 : 11, itemStyle: { color: pairedCategoryColors[category], opacity: category === 'same_outcome' ? 0.45 : 0.9 }, data: data.points.filter((point) => point.category === category).map((point) => ({ value: [point.x, point.y], left_run_id: point.left_run_id, right_run_id: point.right_run_id, category })) })),
+    },
+  };
+  const heatmapSpecs: VisualizationSpec[] = data.heatmaps.map((heatmap, index) => {
+    const metricMode = view === 'metric_delta';
+    const values = heatmap.cells.flatMap((cell) => {
+      const value = metricMode ? cell.delta_median : cell.disagreement_rate == null ? null : 100 * cell.disagreement_rate;
+      return value == null ? [] : [{ value: [cell.x_index, cell.y_index, value, cell.total, cell.disagreement_count, cell.metric_eligible_count, cell.sparse ? 1 : 0], itemStyle: { opacity: cell.sparse ? 0.35 : 1 } }];
+    });
+    const extent = metricMode ? Math.max(...values.map((item) => Math.abs(Number(item.value[2]))), 1e-9) : 100;
+    const facetText = heatmap.facet_interval ? `${heatmap.facet} ${intervalLabel(heatmap.facet_interval.lower, heatmap.facet_interval.upper, heatmap.facet_interval.upper_inclusive)}` : 'All paired samples';
+    const labels = (edges: number[]) => edges.slice(0, -1).map((lower, edgeIndex) => intervalLabel(lower, edges[edgeIndex + 1], edgeIndex === edges.length - 2));
+    return {
+      id: `paired-parameter-heatmap-${comparison.id}-${index}`,
+      title: metricMode ? `Median Δ ${data.selection.metric} · ${facetText}` : `Disagreement rate · ${facetText}`,
+      subtitle: `Cells with n < ${data.selection.minimum_cell_count} remain visible with reduced opacity and are excluded from observations.`,
+      kind: 'heatmap',
+      option: { animation: false, tooltip: { formatter: (params: { value?: unknown[] }) => { const value = params.value ?? []; return `${data.selection.x}: ${labels(heatmap.x_boundaries)[Number(value[0])]}<br/>${data.selection.y}: ${labels(heatmap.y_boundaries)[Number(value[1])]}<br/>${metricMode ? `Median Δ: ${Number(value[2]).toPrecision(5)}<br/>Metric coverage: ${value[5]}/${value[3]}` : `Disagreement: ${value[4]}/${value[3]} (${Number(value[2]).toFixed(1)}%)`}<br/>${Number(value[6]) ? 'Sparse cell' : 'Eligible cell'}`; } }, grid: { top: 32, right: 96, bottom: 92, left: 128 }, xAxis: { type: 'category', name: data.selection.x, nameLocation: 'middle', nameGap: 66, data: labels(heatmap.x_boundaries), axisLabel: { rotate: 25 } }, yAxis: { type: 'category', name: data.selection.y, nameLocation: 'middle', nameGap: 102, data: labels(heatmap.y_boundaries) }, visualMap: { min: metricMode ? -extent : 0, max: extent, right: 8, top: 40, calculable: true, inRange: { color: metricMode ? ['#0796a5', '#f8fafc', '#8e3b9d'] : ['#f4f6f8', '#f1ae54', '#c53c4d'] } }, series: [{ type: 'heatmap', data: values, itemStyle: { borderColor: '#fff', borderWidth: 2 }, emphasis: { itemStyle: { borderColor: '#17202a', borderWidth: 2 } } }] },
+    };
+  });
+  const applyBoundaries = () => {
+    try {
+      const next: Record<string, number[]> = {};
+      for (const [name, raw] of Object.entries(boundaryDrafts)) {
+        if (!raw.trim()) continue;
+        const edges = raw.split(',').map((value) => Number(value.trim()));
+        if (edges.length < 3 || edges.some((value) => !Number.isFinite(value)) || edges.some((value, index) => index > 0 && value <= edges[index - 1])) throw new Error(`${name}: enter at least three increasing comma-separated edges.`);
+        next[name] = edges;
+      }
+      setBoundaryError(undefined); setBoundaries(next);
+    } catch (error) { setBoundaryError(error instanceof Error ? error.message : 'Invalid boundaries.'); }
+  };
+  const exportRegionalData = (format: 'csv' | 'json') => {
+    const csvCell = (value: unknown) => { const text = String(value ?? ''); return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; };
+    const content = format === 'json'
+      ? `${JSON.stringify({ schema: 'pisa.paired-parameter-analysis/v1', request, result: data }, null, 2)}\n`
+      : [
+        ['left', 'right', 'parameter', 'lower', 'upper', 'upper_inclusive', 'paired_count', 'disagreement_count', 'disagreement_rate', 'left_success_right_fail', 'left_fail_right_success', 'other_disagreement', 'metric', 'metric_eligible_count', 'metric_missing_count', 'delta_mean', 'delta_median', 'sparse'],
+        ...data.marginals.flatMap((marginal) => marginal.bins.map((cell) => [data.left, data.right, marginal.parameter, cell.lower, cell.upper, cell.upper_inclusive, cell.total, cell.disagreement_count, cell.disagreement_rate, cell.categories.left_success_right_fail ?? 0, cell.categories.left_fail_right_success ?? 0, cell.categories.other_disagreement ?? 0, data.selection.metric ?? '', cell.metric_eligible_count, cell.metric_missing_count, cell.delta_mean, cell.delta_median, cell.sparse])),
+      ].map((row) => row.map(csvCell).join(',')).join('\r\n');
+    const blob = new Blob([content], { type: format === 'json' ? 'application/json' : 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob), anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `paired-parameter-${comparison.id}.${format}`; anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  return <Stack gap="lg" mt="md">
+    <Group justify="space-between"><Text fw={700}>Paired parameter analysis</Text><Group gap="xs"><Button size="compact-xs" variant="default" leftSection={<IconDownload size={14} />} onClick={() => exportRegionalData('csv')}>Regional CSV</Button><Button size="compact-xs" variant="default" leftSection={<IconDownload size={14} />} onClick={() => exportRegionalData('json')}>Analysis JSON</Button></Group></Group>
+    <Alert color="blue" icon={<IconShieldCheck size={17} />} title="Original parameter space only">Axes and facets come only from recorded sampled parameters. Regional statistics use every uniquely paired sample; derived inputs are not introduced.</Alert>
+    <Card withBorder p="md"><SimpleGrid cols={{ base: 1, sm: 2, xl: 4 }}>
+      <Select label="X parameter" searchable data={parameterOptions} value={data.selection.x} onChange={setX} />
+      <Select label="Y parameter" searchable data={availableY} value={data.selection.y} onChange={setY} />
+      <Select label="Facet parameter" data={availableFacets} value={data.selection.facet ?? ''} onChange={(value) => setFacet(value || '')} />
+      <Select label="View" data={[{ value: 'outcome', label: 'Outcome disagreement in parameter space' }, { value: 'metric_delta', label: 'Metric delta in parameter space' }, { value: 'metric_agreement', label: 'Paired metric agreement' }]} value={view ?? 'outcome'} onChange={setView} />
+      {view === 'metric_delta' && <Select label="Shared metric" searchable data={data.metrics.map((name) => ({ value: name, label: name }))} value={data.selection.metric ?? metric} onChange={setMetric} />}
+      <NumberInput label="Equal-width bins" min={2} max={20} value={binCount} onChange={setBinCount} />
+      <NumberInput label="Minimum eligible n" min={1} max={data.overview.paired_count} value={minimumCellCount} onChange={setMinimumCellCount} />
+    </SimpleGrid><Accordion mt="md" variant="contained"><Accordion.Item value="boundaries"><Accordion.Control>Optional fixed boundaries</Accordion.Control><Accordion.Panel><Text size="xs" c="dimmed" mb="sm">Comma-separated edges override equal-width bins. Samples outside the edges are reported as excluded.</Text><SimpleGrid cols={{ base: 1, md: 3 }}>{activeParameters.map((name) => <TextInput key={name} label={name} placeholder={(data.selection.boundaries[name] ?? []).map((value) => Number(value.toPrecision(5))).join(', ')} value={boundaryDrafts[name] ?? ''} onChange={(event) => setBoundaryDrafts((current) => ({ ...current, [name]: event.currentTarget.value }))} />)}</SimpleGrid><Group mt="sm"><Button size="xs" onClick={applyBoundaries}>Apply boundaries</Button><Button size="xs" variant="default" onClick={() => { setBoundaryDrafts({}); setBoundaries({}); setBoundaryError(undefined); }}>Reset to equal width</Button></Group>{boundaryError && <Text size="xs" c="red" mt="xs">{boundaryError}</Text>}</Accordion.Panel></Accordion.Item></Accordion></Card>
+    <SimpleGrid cols={{ base: 2, md: 5 }}>
+      <MetricCard label="Paired" value={data.overview.paired_count.toLocaleString()} detail="Unique parameter hashes" icon={<IconDatabase size={18} />} />
+      <MetricCard label="Disagreement" value={data.overview.disagreement_count.toLocaleString()} detail={`${((data.overview.disagreement_rate ?? 0) * 100).toFixed(1)}% of pairs`} icon={<IconAlertTriangle size={18} />} color="yellow" />
+      <MetricCard label="Direct reversals" value={data.overview.direct_reversal_count.toLocaleString()} detail="Success / Fail only" icon={<IconArrowsSort size={18} />} color="red" />
+      <MetricCard label="Invalid-related" value={data.overview.invalid_related_count.toLocaleString()} detail="Reported separately" icon={<IconAlertTriangle size={18} />} color="gray" />
+      <MetricCard label={data.selection.metric ? 'Metric coverage' : 'Included'} value={(data.selection.metric ? data.overview.metric_eligible_count : data.coverage.included_count).toLocaleString()} detail={data.selection.metric ? `${data.overview.metric_missing_count} missing pairs` : `${data.coverage.excluded_by_boundaries + data.coverage.excluded_by_facet} filtered`} icon={<IconCheck size={18} />} color="teal" />
+    </SimpleGrid>
+    {data.observations.length > 0 && <Card withBorder p="md"><Text fw={650} mb="xs">Observed regional differences</Text><Stack gap="xs">{data.observations.map((item, index) => <Text key={`${item.kind}-${index}`} size="sm">• {item.text}</Text>)}</Stack><Text size="xs" c="dimmed" mt="sm">Only cells meeting n ≥ {data.selection.minimum_cell_count} are summarized. These are descriptive observations, not causal explanations.</Text></Card>}
+    <VisualizationCard spec={outcomeSpec} onPointClick={(value) => { const record = chartRecord(value); if (typeof record?.left_run_id === 'string') onOpen(record.left_run_id, [data.left, data.right]); }} />
+    <SimpleGrid cols={{ base: 1, xl: 2 }}>{heatmapSpecs.map((spec) => <VisualizationCard key={spec.id} spec={spec} />)}</SimpleGrid>
+    <Card p={0}><Group p="md" justify="space-between"><div><Text fw={650}>Marginal parameter intervals</Text><Text size="xs" c="dimmed">Exact numerator and denominator are retained beside each percentage.</Text></div><Badge variant="light">{data.marginals.length} parameters</Badge></Group><ScrollArea><table className="pisa-data-table"><thead><tr><th>Parameter</th><th>Interval</th><th>Disagreement</th><th>Directions</th><th>Metric delta</th><th>Eligibility</th></tr></thead><tbody>{data.marginals.flatMap((marginal) => marginal.bins.map((cell) => <tr key={`${marginal.parameter}-${cell.index}`} style={{ opacity: cell.sparse ? 0.48 : 1 }}><td>{marginal.parameter}</td><td>{intervalLabel(cell.lower, cell.upper, cell.upper_inclusive)}</td><td>{cell.disagreement_count}/{cell.total} · {cell.disagreement_rate == null ? '—' : `${(100 * cell.disagreement_rate).toFixed(1)}%`}</td><td><Text size="xs">L✓/R✕ {cell.categories.left_success_right_fail ?? 0} · L✕/R✓ {cell.categories.left_fail_right_success ?? 0} · other {cell.categories.other_disagreement ?? 0}</Text></td><td>{cell.delta_median == null ? '—' : `median ${cell.delta_median.toPrecision(5)} · ${cell.metric_eligible_count}/${cell.total}`}</td><td>{cell.sparse ? `Sparse (n < ${data.selection.minimum_cell_count})` : 'Eligible'}</td></tr>))}</tbody></table></ScrollArea></Card>
+    {data.candidates.length > 0 && <Card p="md"><Text fw={650}>Candidate paired executions</Text><Text size="xs" c="dimmed" mb="md">Candidates support screening and drill-down; the report does not claim repeatability without reruns.</Text><SimpleGrid cols={{ base: 1, md: 3 }}>{data.candidates.map((candidate) => <Card key={candidate.kind} withBorder p="md"><Badge variant="light" mb="xs">{candidate.kind.replaceAll('_', ' ')}</Badge><Text size="sm" fw={600}>{candidate.left_outcome} → {candidate.right_outcome}</Text><Text size="xs" c="dimmed">{candidate.reason}</Text><Text size="xs" className="pisa-code" mt="xs">{Object.entries(candidate.parameters).map(([name, value]) => `${name}=${value?.toPrecision(5) ?? '—'}`).join(' · ')}</Text><Button size="compact-xs" variant="light" mt="sm" onClick={() => onOpen(candidate.left_run_id, [data.left, data.right])}>Open paired detail</Button></Card>)}</SimpleGrid></Card>}
+  </Stack>;
+}
+
 function Compare({ datasetId, onOpen }: { datasetId: string; onOpen: (id: string, experiments?: string[]) => void }) {
   const comparisons = useQuery({ queryKey: ['comparisons-v2', datasetId], queryFn: () => api.datasets.comparisons(datasetId), retry: 1, refetchOnMount: 'always' });
-  const [selected, setSelected] = useState<ComparisonClass>();
+  const storageKey = `pisa:compare:${datasetId}`;
+  const [leftChoice, setLeftChoice] = useSessionState<string | null>(`${storageKey}:left`, null);
+  const [rightChoice, setRightChoice] = useSessionState<string | null>(`${storageKey}:right`, null);
+  const items = comparisons.data?.items ?? [];
+  const leftOptions = [...new Set(items.map((item) => item.left))];
+  const resolvedLeft = leftChoice && leftOptions.includes(leftChoice) ? leftChoice : leftOptions[0] ?? null;
+  const rightOptions = items.filter((item) => item.left === resolvedLeft).map((item) => item.right);
+  const resolvedRight = rightChoice && rightOptions.includes(rightChoice) ? rightChoice : rightOptions[0] ?? null;
+  const selected = items.find((item) => item.left === resolvedLeft && item.right === resolvedRight);
+  useEffect(() => {
+    if (resolvedLeft !== leftChoice) setLeftChoice(resolvedLeft);
+    if (resolvedRight !== rightChoice) setRightChoice(resolvedRight);
+  }, [leftChoice, resolvedLeft, resolvedRight, rightChoice, setLeftChoice, setRightChoice]);
   if (comparisons.isLoading) return <PageLoading label="Classifying comparisons…" />;
   if (comparisons.error) return <InlineError error={comparisons.error} onRetry={() => comparisons.refetch()} />;
-  const items = comparisons.data?.items ?? [];
   return <Stack gap="xl">
-    <CrossExperimentOverview summary={comparisons.data?.cross_experiment} onOpen={onOpen} />
+    <CrossExperimentOverview datasetId={datasetId} summary={comparisons.data?.cross_experiment} onOpen={onOpen} />
     <div><Text fw={700} size="lg">Pairwise comparisons</Text><Text size="sm" c="dimmed">Inspect the original two-experiment classifications, deltas, and visualizations.</Text></div>
-    {!items.length ? <Card><EmptyState title="No defensible pairwise comparison found" description="A pairwise comparison requires compatible parameter domains and recorded semantics." /></Card> : <SimpleGrid cols={{ base: 1, lg: 5 }}>
-      <Card p="lg" style={{ gridColumn: 'span 2' }}><Text fw={650} mb="md">Available comparisons</Text><Stack gap="xs">{items.map((comparison) => <Card key={comparison.id} withBorder p="md" bg={selected?.id === comparison.id ? 'indigo.0' : undefined} onClick={() => setSelected(comparison)} style={{ cursor: 'pointer' }}><Group justify="space-between" wrap="nowrap"><div><Text size="sm" fw={600}>{comparison.left}</Text><Text size="xs" c="dimmed">vs {comparison.right}</Text></div><StatusBadge value={comparison.role} /></Group><Group gap="xs" mt="xs"><Badge variant="light" color="gray">{comparison.matched.toLocaleString()} paired</Badge>{comparison.information_comparable_count !== undefined && <Badge variant="light" color="teal">{comparison.information_consistent_count?.toLocaleString() ?? 0} / {comparison.information_comparable_count.toLocaleString()} fully consistent</Badge>}{comparison.left_only > 0 && <Badge variant="light" color="yellow">{comparison.left_only} left only</Badge>}{comparison.right_only > 0 && <Badge variant="light" color="yellow">{comparison.right_only} right only</Badge>}</Group></Card>)}</Stack></Card>
-      <Card p="lg" style={{ gridColumn: 'span 3' }}>{selected ? <Stack><Group justify="space-between"><div><Text fw={650}>{selected.left} → {selected.right}</Text><Text size="sm" c="dimmed">{selected.note ?? 'Comparison semantics were classified from recorded provenance.'}</Text></div><StatusBadge value={selected.role} /></Group><Alert color="blue" icon={<IconShieldCheck size={17} />} title="Interpretation guardrail">Complete pairs are used for paired metrics. Missing left/right values and semantic differences are reported separately.</Alert>{selected.information_comparable_count !== undefined && <Card withBorder p="md"><Text size="xs" c="dimmed" tt="uppercase" fw={650}>Fully identical concrete information</Text><Group align="baseline" gap="xs"><Text fz={30} fw={750}>{selected.information_consistent_count?.toLocaleString() ?? 0}</Text><Text c="dimmed">/ {selected.information_comparable_count.toLocaleString()} paired concrete samples · {selected.information_agreement_ratio == null ? '—' : `${(selected.information_agreement_ratio * 100).toFixed(2)}%`}</Text></Group><Text size="xs">Compared: {selected.information_scope}</Text><Text size="xs" c="dimmed">Excluded: {selected.information_exclusions}</Text></Card>}{selected.agreement !== undefined && <div><Text size="xs" c="dimmed">Outcome agreement</Text><Text fz={32} fw={700}>{(selected.agreement <= 1 ? selected.agreement * 100 : selected.agreement).toFixed(1)}%</Text></div>}<ChartSection datasetId={datasetId} section={`compare:${selected.id}`} /></Stack> : <EmptyState title="Select a comparison" description="Classification determines whether the workspace uses paired deltas, agreement, common-domain coverage, or description only." />}</Card>
-    </SimpleGrid>}
+    {!items.length ? <Card><EmptyState title="No defensible pairwise comparison found" description="A pairwise comparison requires compatible parameter domains and recorded semantics." /></Card> : <>
+      <Card p="lg"><SimpleGrid cols={{ base: 1, md: 2 }}><Select label="Left experiment" searchable data={leftOptions.map((value) => ({ value, label: value }))} value={resolvedLeft} onChange={(value) => { setLeftChoice(value); setRightChoice(items.find((item) => item.left === value)?.right ?? null); }} allowDeselect={false} /><Select label="Right experiment" searchable data={rightOptions.map((value) => ({ value, label: value }))} value={resolvedRight} onChange={setRightChoice} allowDeselect={false} /></SimpleGrid><Text size="xs" c="dimmed" mt="xs">Only report-classified relations for the selected Left experiment are offered; unpaired combinations are not synthesized.</Text></Card>
+      <Card p="lg">{selected ? <Stack><Group justify="space-between"><div><Text fw={650}>{selected.left} → {selected.right}</Text><Text size="sm" c="dimmed">{selected.note ?? 'Comparison semantics were classified from recorded provenance.'}</Text></div><StatusBadge value={selected.role} /></Group><Group gap="xs"><Badge variant="light" color="gray">{selected.matched.toLocaleString()} paired</Badge>{selected.information_comparable_count !== undefined && <Badge variant="light" color="teal">{selected.information_consistent_count?.toLocaleString() ?? 0} / {selected.information_comparable_count.toLocaleString()} fully consistent</Badge>}{selected.left_only > 0 && <Badge variant="light" color="yellow">{selected.left_only} left only</Badge>}{selected.right_only > 0 && <Badge variant="light" color="yellow">{selected.right_only} right only</Badge>}</Group><Alert color="blue" icon={<IconShieldCheck size={17} />} title="Interpretation guardrail">Complete pairs are used for paired metrics. Missing left/right values and semantic differences are reported separately.</Alert>{selected.information_comparable_count !== undefined && <Card withBorder p="md"><Text size="xs" c="dimmed" tt="uppercase" fw={650}>Fully identical concrete information</Text><Group align="baseline" gap="xs"><Text fz={30} fw={750}>{selected.information_consistent_count?.toLocaleString() ?? 0}</Text><Text c="dimmed">/ {selected.information_comparable_count.toLocaleString()} paired concrete samples · {selected.information_agreement_ratio == null ? '—' : `${(selected.information_agreement_ratio * 100).toFixed(2)}%`}</Text></Group><Text size="xs">Compared: {selected.information_scope}</Text><Text size="xs" c="dimmed">Excluded: {selected.information_exclusions}</Text></Card>}{selected.agreement !== undefined && <div><Text size="xs" c="dimmed">Outcome agreement</Text><Text fz={32} fw={700}>{(selected.agreement <= 1 ? selected.agreement * 100 : selected.agreement).toFixed(1)}%</Text></div>}<ChartSection datasetId={datasetId} section={`compare:${selected.id}`} />{['paired_replicate', 'paired_system_intervention', 'paired_policy_intervention'].includes(selected.role) && <PairedParameterAnalysis datasetId={datasetId} comparison={selected} onOpen={onOpen} />}</Stack> : <EmptyState title="Select a comparison" description="Classification determines whether the workspace uses paired deltas, agreement, common-domain coverage, or description only." />}</Card>
+    </>}
+  </Stack>;
+}
+
+function consistencyPercent(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? '—' : `${(value * 100).toFixed(2)}%`;
+}
+
+function consistencyMetric(group: ConsistencyGroup, key: string) {
+  return group.discrete.find((item) => item.key === key);
+}
+
+function Consistency({ datasetId }: { datasetId: string }) {
+  const queryClient = useQueryClient();
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [profile, setProfile] = useState<'trajectory_outlier_controls' | 'full_controls'>('trajectory_outlier_controls');
+  const [outlierLimit, setOutlierLimit] = useState<number | string>(25);
+  const resolvedOutlierLimit = typeof outlierLimit === 'number' ? outlierLimit : 25;
+  const consistency = useQuery({
+    queryKey: ['report-consistency', datasetId, profile, resolvedOutlierLimit],
+    queryFn: () => api.datasets.consistency(datasetId, { profile, position_tolerances_m: [0.001, 0.01, 0.1], outlier_limit: resolvedOutlierLimit }),
+    retry: 1,
+    refetchOnMount: 'always',
+  });
+  const analyze = useMutation({
+    mutationFn: (request: ConsistencyAnalyzeRequest) => api.datasets.analyzeConsistency(datasetId, request),
+  });
+  const launchedForCurrentConfig = analyze.variables?.profile === profile
+    && analyze.variables?.outlier_limit === resolvedOutlierLimit
+    && JSON.stringify(analyze.variables?.position_tolerances_m) === JSON.stringify([0.001, 0.01, 0.1]);
+  const activeJobId = (launchedForCurrentConfig ? analyze.data?.id : undefined) ?? consistency.data?.deep.job?.id;
+  const job = useQuery({
+    queryKey: ['job', activeJobId],
+    queryFn: () => api.jobs.get(activeJobId!),
+    enabled: Boolean(activeJobId),
+    refetchInterval: (query) => ['queued', 'running'].includes(query.state.data?.state ?? '') ? 750 : false,
+  });
+  const cancel = useMutation({ mutationFn: () => api.jobs.cancel(activeJobId!) });
+  const jobState = job.data?.state ?? consistency.data?.deep.job?.state;
+  useEffect(() => {
+    if (!jobState || ['queued', 'running'].includes(jobState)) return;
+    void queryClient.invalidateQueries({ queryKey: ['report-consistency', datasetId] });
+  }, [datasetId, jobState, queryClient]);
+  const groups = consistency.data?.quick.groups ?? [];
+  useEffect(() => {
+    if (!groups.length) return setSelectedGroupId(null);
+    setSelectedGroupId((current) => current && groups.some((group) => group.id === current) ? current : groups[0].id);
+  }, [groups]);
+
+  if (consistency.isLoading) return <PageLoading label="Reading consistency summary…" />;
+  if (consistency.error) return <InlineError error={consistency.error} onRetry={() => consistency.refetch()} />;
+  const result = consistency.data!;
+  if (!result.quick.available || !groups.length) return <Stack gap="lg">
+    <Alert color="blue" icon={<IconShieldCheck size={17} />} title="Repeatability is not correctness">This view measures whether compatible replicate settings produce the same recorded evidence. Identical failures are repeatable, but they are not necessarily correct or safe.</Alert>
+    <Card><EmptyState title={result.quick.reason === 'normalized_report_index_required' ? 'Normalized index required' : 'No compatible replicate group'} description={result.quick.reason === 'normalized_report_index_required' ? 'This older report remains fully usable in its original views. Rebuild it with the current report version to add indexed Consistency analysis.' : 'This report remains fully usable for overview, sampling, run inspection, replay, and pairwise comparison. Consistency requires at least two canonical datasets classified as paired replicates with unique parameter hashes.'} /></Card>
+  </Stack>;
+
+  const group = groups.find((item) => item.id === selectedGroupId) ?? groups[0];
+  const deepGroup = result.deep.summary?.groups.find((item) => item.id === group.id);
+  const outcomeScore = consistencyMetric(group, 'outcome');
+  const stopScore = consistencyMetric(group, 'stop_condition');
+  const collisionScore = consistencyMetric(group, 'collision');
+  const stepsScore = group.continuous.find((item) => item.key.toLowerCase().includes('total_steps'));
+  const scoreItems = [
+    { key: 'outcome', label: 'Outcome', ratio: outcomeScore?.agreement_ratio, detail: outcomeScore ? `${outcomeScore.consistent_count.toLocaleString()} / ${outcomeScore.comparable_count.toLocaleString()}` : 'Not indexed' },
+    { key: 'stop_condition', label: 'Stop condition', ratio: stopScore?.agreement_ratio, detail: stopScore ? `${stopScore.consistent_count.toLocaleString()} / ${stopScore.comparable_count.toLocaleString()}` : 'Not indexed' },
+    { key: 'collision', label: 'Collision', ratio: collisionScore?.agreement_ratio, detail: collisionScore ? `${collisionScore.consistent_count.toLocaleString()} / ${collisionScore.comparable_count.toLocaleString()}` : 'Not indexed' },
+    { key: 'total_steps', label: 'Total steps', ratio: stepsScore?.exact_ratio, detail: stepsScore ? `${stepsScore.exact_count.toLocaleString()} / ${stepsScore.eligible_sample_count.toLocaleString()}` : 'Not indexed' },
+  ];
+  const shownJob = job.data ?? result.deep.job;
+  const running = ['queued', 'running'].includes(shownJob?.state ?? '');
+  const progressPercent = shownJob?.progress?.total ? Math.min(100, shownJob.progress.current / shownJob.progress.total * 100) : shownJob?.state === 'running' ? 3 : 0;
+  const artifacts = result.deep.artifacts ?? [];
+
+  return <Stack gap="lg">
+    <Alert color="blue" icon={<IconShieldCheck size={17} />} title="How to read this view">Repeatability is reported only over parameter-hash-matched samples in compatible replicate groups. Agreement does not prove correctness; runtime bookkeeping is separated from behavioral evidence and does not lower the indexed-information score.</Alert>
+    <Card p="lg">
+      <Group justify="space-between" align="flex-end" mb="md" wrap="wrap">
+        <div><Text fw={700} size="lg">Quick indexed consistency</Text><Text size="sm" c="dimmed">Generated during report build without opening trajectory files.</Text></div>
+        <Select label="Replicate group" value={group.id} onChange={setSelectedGroupId} allowDeselect={false} data={groups.map((item, index) => ({ value: item.id, label: `Group ${index + 1} · ${item.datasets.join(' / ')}` }))} maw={560} />
+      </Group>
+      <Group gap="xs" mb="md">{group.datasets.map((dataset) => <Badge key={dataset} variant="outline">{dataset}</Badge>)}</Group>
+      <SimpleGrid cols={{ base: 2, md: 5 }} mb="lg">
+        {scoreItems.map((item) => <Card key={item.key} withBorder p="md"><Text size="xs" c="dimmed" tt="uppercase" fw={650}>{item.label}</Text><Text fz={25} fw={750}>{consistencyPercent(item.ratio)}</Text><Text size="xs" c="dimmed">{item.detail}</Text></Card>)}
+        <Card withBorder p="md"><Text size="xs" c="dimmed" tt="uppercase" fw={650}>All indexed information</Text><Text fz={25} fw={750}>{consistencyPercent(group.information_agreement_ratio)}</Text><Text size="xs" c="dimmed">{group.information_consistent_count.toLocaleString()} / {group.information_comparable_count.toLocaleString()}</Text></Card>
+      </SimpleGrid>
+      <Group justify="space-between" mb="xs"><Text fw={650}>Outcome patterns</Text><Text size="xs" c="dimmed">{group.common_sample_count.toLocaleString()} common · {group.excluded_noncommon_sample_count.toLocaleString()} non-common excluded</Text></Group>
+      <ScrollArea mb="lg"><table className="pisa-data-table"><thead><tr><th>Pattern in dataset order</th><th>Samples</th><th>All replicates agree</th></tr></thead><tbody>{group.outcome_patterns.map((item) => <tr key={item.pattern}><td className="pisa-code">{item.pattern}</td><td>{item.count.toLocaleString()}</td><td><Badge color={item.all_replicates_agree ? 'teal' : 'red'} variant="light">{item.all_replicates_agree ? 'Yes' : 'No'}</Badge></td></tr>)}</tbody></table></ScrollArea>
+      <Text fw={650} mb="xs">Behavioral scalar variation</Text>
+      <Text size="xs" c="dimmed" mb="sm">Variation is max − min across every replicate. Exact means zero recorded difference; partial and unavailable samples never enter the denominator.</Text>
+      <ScrollArea><table className="pisa-data-table"><thead><tr><th>Metric</th><th>Exact</th><th>Eligible</th><th>Median variation</th><th>P95 variation</th><th>Max variation</th><th>Coverage exceptions</th></tr></thead><tbody>{group.continuous.map((item) => <tr key={item.key}><td><Text size="sm" fw={600}>{item.label}</Text><Text size="xs" c="dimmed" className="pisa-code">{item.key}</Text></td><td>{consistencyPercent(item.exact_ratio)}</td><td>{item.eligible_sample_count.toLocaleString()}</td><td>{comparisonValue(item.variation_median, item.unit)}</td><td>{comparisonValue(item.variation_p95, item.unit)}</td><td>{comparisonValue(item.variation_max, item.unit)}</td><td>{item.partial_sample_count.toLocaleString()} partial · {item.unavailable_sample_count.toLocaleString()} unavailable</td></tr>)}</tbody></table></ScrollArea>
+      <Accordion mt="lg" variant="contained"><Accordion.Item value="runtime"><Accordion.Control>Runtime and bookkeeping variation ({group.runtime.length})</Accordion.Control><Accordion.Panel><Text size="xs" c="dimmed" mb="sm">These values help diagnose execution infrastructure but are excluded from behavioral identity.</Text><ScrollArea><table className="pisa-data-table"><thead><tr><th>Metric</th><th>Exact</th><th>Median variation</th><th>P95 variation</th><th>Max variation</th></tr></thead><tbody>{group.runtime.map((item) => <tr key={item.key}><td>{item.label}</td><td>{consistencyPercent(item.exact_ratio)}</td><td>{comparisonValue(item.variation_median, item.unit)}</td><td>{comparisonValue(item.variation_p95, item.unit)}</td><td>{comparisonValue(item.variation_max, item.unit)}</td></tr>)}</tbody></table></ScrollArea>{!group.runtime.length && <Text size="sm" c="dimmed">No runtime metrics were indexed.</Text>}</Accordion.Panel></Accordion.Item></Accordion>
+    </Card>
+
+    <Card p="lg">
+      <Group justify="space-between" align="flex-start" mb="md" wrap="wrap"><div><Text fw={700} size="lg">Deep trajectory and control consistency</Text><Text size="sm" c="dimmed">Generated on demand and cached inside this report. Every actor trajectory is scanned; the default profile limits control-file diagnosis to outcome mismatches and representative outliers.</Text></div><Badge color={result.deep.state === 'ready' ? 'teal' : running ? 'blue' : 'gray'}>{running ? shownJob?.state : result.deep.state.replaceAll('_', ' ')}</Badge></Group>
+      <Group align="flex-end" wrap="wrap" mb="md"><Select label="Analysis profile" value={profile} onChange={(value) => setProfile(value === 'full_controls' ? 'full_controls' : 'trajectory_outlier_controls')} allowDeselect={false} disabled={running} data={[{ value: 'trajectory_outlier_controls', label: 'All trajectories + outlier controls' }, { value: 'full_controls', label: 'All trajectories + all controls (slower)' }]} w={330} /><NumberInput label="Outliers per ranking" min={1} max={1000} value={outlierLimit} onChange={setOutlierLimit} disabled={running} w={180} /><Button leftSection={<IconPlayerPlay size={16} />} loading={analyze.isPending} disabled={running} onClick={() => analyze.mutate({ profile, position_tolerances_m: [0.001, 0.01, 0.1], outlier_limit: resolvedOutlierLimit, force: result.deep.state === 'ready' })}>{result.deep.state === 'ready' ? 'Recompute' : 'Analyze now'}</Button>{running && <Button color="red" variant="light" loading={cancel.isPending} onClick={() => cancel.mutate()}>Cancel</Button>}</Group>
+      {analyze.error && <InlineError error={analyze.error} />}
+      {shownJob && <Alert color={shownJob.state === 'failed' ? 'red' : shownJob.state === 'cancelled' ? 'yellow' : shownJob.state === 'succeeded' ? 'teal' : 'blue'} title={`Analysis ${shownJob.state}`} mb="md"><Stack gap={6}><Progress value={progressPercent} animated={running && !shownJob.progress?.total} /><Group justify="space-between" wrap="wrap"><Text size="sm">{shownJob.message ?? shownJob.phase ?? 'Waiting for analysis worker'}</Text><Text size="xs" fw={650}>{shownJob.progress ? `${shownJob.progress.current.toLocaleString()} / ${shownJob.progress.total?.toLocaleString() ?? '?'} ${shownJob.progress.unit ?? 'items'}` : '0 / ? items'}</Text></Group></Stack></Alert>}
+      {deepGroup ? <><SimpleGrid cols={{ base: 2, md: 4 }} mb="lg"><Card withBorder p="md"><Text size="xs" c="dimmed" tt="uppercase">Strict recorded identity</Text><Text fz={25} fw={750}>{consistencyPercent(deepGroup.strict_exact_count / Math.max(1, deepGroup.trajectory_comparable_count))}</Text><Text size="xs">{deepGroup.strict_exact_count.toLocaleString()} / {deepGroup.trajectory_comparable_count.toLocaleString()} comparable</Text></Card>{result.deep.summary!.position_tolerances_m.map((tolerance) => <Card key={tolerance} withBorder p="md"><Text size="xs" c="dimmed" tt="uppercase">Within {comparisonValue(tolerance, 'm')}</Text><Text fz={25} fw={750}>{consistencyPercent((deepGroup.position_tolerance_counts[String(tolerance)] ?? 0) / Math.max(1, deepGroup.trajectory_comparable_count))}</Text><Text size="xs">{(deepGroup.position_tolerance_counts[String(tolerance)] ?? 0).toLocaleString()} / {deepGroup.trajectory_comparable_count.toLocaleString()} comparable</Text></Card>)}</SimpleGrid>{deepGroup.trajectory_comparable_count < deepGroup.sample_count && <Alert color="yellow" mb="md">{(deepGroup.sample_count - deepGroup.trajectory_comparable_count).toLocaleString()} samples had non-matching semantic actor sets and are excluded from trajectory percentages.</Alert>}<Text fw={650} mb="xs">Distribution of each sample's worst replicate-pair position error</Text><SimpleGrid cols={{ base: 2, md: 4 }}><Card withBorder p="md"><Text size="xs" c="dimmed">Median</Text><Text fw={700}>{comparisonValue(deepGroup.max_position_error_m.median, 'm')}</Text></Card><Card withBorder p="md"><Text size="xs" c="dimmed">P95</Text><Text fw={700}>{comparisonValue(deepGroup.max_position_error_m.p95, 'm')}</Text></Card><Card withBorder p="md"><Text size="xs" c="dimmed">P99</Text><Text fw={700}>{comparisonValue(deepGroup.max_position_error_m.p99, 'm')}</Text></Card><Card withBorder p="md"><Text size="xs" c="dimmed">Maximum</Text><Text fw={700}>{comparisonValue(deepGroup.max_position_error_m.max, 'm')}</Text></Card></SimpleGrid><Text size="xs" c="dimmed" mt="md">Alignment: {result.deep.summary!.alignment_rule}. Strict rule: {result.deep.summary!.strict_rule}. Controls: {result.deep.summary!.control_rule}.</Text>{artifacts.length > 0 && <Group gap="xs" mt="md">{artifacts.map((artifact) => { const path = typeof artifact === 'string' ? artifact : artifact.path; const url = typeof artifact === 'string' ? undefined : artifact.download_url; return url ? <Button key={path} component="a" href={url} target="_blank" size="compact-xs" variant="light" leftSection={<IconDownload size={14} />}>{path.split('/').at(-1)}</Button> : <Code key={path}>{path}</Code>; })}</Group>}</> : <Alert color="gray">No deep result has been generated for the default thresholds and profile. Starting analysis does not rebuild or modify the original report evidence.</Alert>}
+    </Card>
   </Stack>;
 }
 
@@ -769,6 +1671,10 @@ function Replay({ datasetId, runId, onChoose, onOpen }: { datasetId: string; run
   const [includeAgentMetrics, setIncludeAgentMetrics] = useSessionState<boolean>(`pisa:replay-include-agent-metrics:${datasetId}`, false);
   const [activeStateMetrics, setActiveStateMetrics] = useSessionState<MetricKey[]>(`pisa:replay-state-metric-types-v3:${datasetId}`, ['distance']);
   const [activeControlMetrics, setActiveControlMetrics] = useSessionState<ControlKey[]>(`pisa:replay-control-types-v3:${datasetId}`, []);
+  const [metricSeriesVisibility, setMetricSeriesVisibility] = useSessionState<Record<string, boolean>>(`pisa:replay-metric-series-visibility:${datasetId}`, {});
+  const [controlSeriesVisibility, setControlSeriesVisibility] = useSessionState<Record<string, boolean>>(`pisa:replay-control-series-visibility:${datasetId}`, {});
+  const [metricSeriesColors, setMetricSeriesColors] = useSessionState<Record<string, string>>(`pisa:replay-metric-series-colors:${datasetId}`, {});
+  const [controlSeriesColors, setControlSeriesColors] = useSessionState<Record<string, string>>(`pisa:replay-control-series-colors:${datasetId}`, {});
   const [genericChannel, setGenericChannel] = useState<string | null>(null);
   const [genericField, setGenericField] = useState<string | null>(null);
   const [mediaFormat, setMediaFormat] = useState<string | null>('gif');
@@ -1198,6 +2104,18 @@ function Replay({ datasetId, runId, onChoose, onOpen }: { datasetId: string; run
     };
     return { metrics: metricSpec, controls: controlSpec };
   }, [activeControlMetrics, activeStateMetrics, currentTime, replayComparison, runId, timeDomain.maximum, timeDomain.minimum]);
+  const selectedMetricChart = replayAnalysisMode === 'compare' ? comparisonCharts.metrics : metricCharts.metrics;
+  const selectedControlChart = replayAnalysisMode === 'compare' ? comparisonCharts.controls : metricCharts.controls;
+  const visibleMetricChart = useMemo(() => replayChartWithVisibleAxes(selectedMetricChart, metricSeriesVisibility, metricSeriesColors), [metricSeriesColors, metricSeriesVisibility, selectedMetricChart]);
+  const visibleControlChart = useMemo(() => replayChartWithVisibleAxes(selectedControlChart, controlSeriesVisibility, controlSeriesColors), [controlSeriesColors, controlSeriesVisibility, selectedControlChart]);
+  const setStoredSeriesColor = useCallback((setter: Dispatch<SetStateAction<Record<string, string>>>, name: string, color?: string) => {
+    setter((current) => {
+      const next = { ...current };
+      if (color) next[name] = color;
+      else delete next[name];
+      return next;
+    });
+  }, []);
   const reachedEvents = events.filter((event) => event.time <= currentTime).slice(-100);
   const nextEvent = events.find((event) => event.time > currentTime);
   const previousEvent = [...events].reverse().find((event) => event.time < currentTime - 1e-9);
@@ -1242,8 +2160,8 @@ function Replay({ datasetId, runId, onChoose, onOpen }: { datasetId: string; run
         <Stack gap="lg">
           <VisualizationCard spec={trajectory} aspectRatio={trajectoryAspectRatio} animationDurationSeconds={Math.max(0.25, (timeDomain.maximum - timeDomain.minimum) / Math.max(0.01, Number(playbackRate ?? 1)))} animationOptionAtProgress={trajectoryAnimationOptionAtProgress} emptyDescription="No selected actor trace contains both recorded x and y positions." />
           <SimpleGrid cols={{ base: 1, xl: 2 }}>
-            <Stack gap="sm"><Card p="md"><Group justify="space-between" align="flex-start" wrap="wrap"><div><Text fw={650} size="sm">{replayAnalysisMode === 'compare' ? 'Delta metrics' : 'Metrics'}</Text><Text size="xs" c="dimmed">{replayAnalysisMode === 'compare' ? 'Directional ego differences at timestamps recorded by both experiments.' : 'Recorded state and safety values. Speed means measured actor speed, never a control target.'}</Text></div><Group>{replayAnalysisMode !== 'compare' && <Checkbox label="Include selected non-ego actors" checked={includeAgentMetrics} onChange={(event) => setIncludeAgentMetrics(event.currentTarget.checked)} />}<Button size="compact-xs" variant="default" onClick={() => setActiveStateMetrics([])}>Hide all</Button></Group></Group><Group gap="md" mt="md">{stateMetricKeys.map((metric) => <Checkbox key={metric} label={metricDefinitions[metric].label} checked={activeStateMetrics.includes(metric)} onChange={(event) => setActiveStateMetrics((current) => event.currentTarget.checked ? [...current, metric] : current.filter((value) => value !== metric))} />)}</Group></Card><VisualizationCard spec={replayAnalysisMode === 'compare' ? comparisonCharts.metrics : metricCharts.metrics} animationDurationSeconds={Math.max(0.25, (timeDomain.maximum - timeDomain.minimum) / Math.max(0.01, Number(playbackRate ?? 1)))} emptyDescription={replayAnalysisMode === 'compare' ? 'The two experiments have no common recorded timestamps for the enabled metrics.' : 'Enable a metric or select an ego actor with recorded state data. Non-ego actors are hidden by default.'} /></Stack>
-            <Stack gap="sm"><Card p="md"><Group justify="space-between" align="flex-start" wrap="wrap"><div><Text fw={650} size="sm">{replayAnalysisMode === 'compare' ? 'Delta controls' : 'Controls'}</Text><Text size="xs" c="dimmed">{replayAnalysisMode === 'compare' ? 'Directional command differences; T/S/B and Ackermann target semantics remain separate.' : "Options are derived from each experiment's recorded control type; T/S/B and Ackermann target semantics are kept separate."}</Text></div><Button size="compact-xs" variant="default" onClick={() => setActiveControlMetrics([])}>Hide all</Button></Group><Group gap="md" mt="md">{availableControlKeys.map((control) => <Checkbox key={control} label={controlDefinitions[control].label} checked={activeControlMetrics.includes(control)} onChange={(event) => setActiveControlMetrics((current) => event.currentTarget.checked ? [...current, control] : current.filter((value) => value !== control))} />)}{!availableControlKeys.length && <Text size="xs" c="dimmed">No recognized control command fields were recorded.</Text>}</Group></Card><VisualizationCard spec={replayAnalysisMode === 'compare' ? comparisonCharts.controls : metricCharts.controls} animationDurationSeconds={Math.max(0.25, (timeDomain.maximum - timeDomain.minimum) / Math.max(0.01, Number(playbackRate ?? 1)))} emptyDescription={replayAnalysisMode === 'compare' ? 'The two experiments have no common recorded timestamps for the enabled control commands.' : 'Enable a recorded control command. Throttle is preferred for T/S/B; Speed target is preferred for Ackermann.'} /></Stack>
+            <Stack gap="sm"><Card p="md"><Group justify="space-between" align="flex-start" wrap="wrap"><div><Text fw={650} size="sm">{replayAnalysisMode === 'compare' ? 'Delta metrics' : 'Metrics'}</Text><Text size="xs" c="dimmed">{replayAnalysisMode === 'compare' ? 'Directional ego differences at timestamps recorded by both experiments.' : 'Recorded state and safety values. Speed means measured actor speed, never a control target.'}</Text></div><Group>{replayAnalysisMode !== 'compare' && <Checkbox label="Include selected non-ego actors" checked={includeAgentMetrics} onChange={(event) => setIncludeAgentMetrics(event.currentTarget.checked)} />}<Button size="compact-xs" variant="default" onClick={() => setActiveStateMetrics([])}>Hide all</Button></Group></Group><Group gap="md" mt="md">{stateMetricKeys.map((metric) => <Checkbox key={metric} label={metricDefinitions[metric].label} checked={activeStateMetrics.includes(metric)} onChange={(event) => setActiveStateMetrics((current) => event.currentTarget.checked ? [...current, metric] : current.filter((value) => value !== metric))} />)}</Group></Card><VisualizationCard spec={visibleMetricChart} seriesVisibility={metricSeriesVisibility} onSeriesVisibilityChange={(name, visible) => setMetricSeriesVisibility((current) => ({ ...current, [name]: visible }))} seriesColorOverrides={metricSeriesColors} onSeriesColorChange={(name, color) => setStoredSeriesColor(setMetricSeriesColors, name, color)} animationDurationSeconds={Math.max(0.25, (timeDomain.maximum - timeDomain.minimum) / Math.max(0.01, Number(playbackRate ?? 1)))} emptyDescription={replayAnalysisMode === 'compare' ? 'The two experiments have no common recorded timestamps for the enabled metrics.' : 'Enable a metric or select an ego actor with recorded state data. Non-ego actors are hidden by default.'} /></Stack>
+            <Stack gap="sm"><Card p="md"><Group justify="space-between" align="flex-start" wrap="wrap"><div><Text fw={650} size="sm">{replayAnalysisMode === 'compare' ? 'Delta controls' : 'Controls'}</Text><Text size="xs" c="dimmed">{replayAnalysisMode === 'compare' ? 'Directional command differences; T/S/B and Ackermann target semantics remain separate.' : "Options are derived from each experiment's recorded control type; T/S/B and Ackermann target semantics are kept separate."}</Text></div><Button size="compact-xs" variant="default" onClick={() => setActiveControlMetrics([])}>Hide all</Button></Group><Group gap="md" mt="md">{availableControlKeys.map((control) => <Checkbox key={control} label={controlDefinitions[control].label} checked={activeControlMetrics.includes(control)} onChange={(event) => setActiveControlMetrics((current) => event.currentTarget.checked ? [...current, control] : current.filter((value) => value !== control))} />)}{!availableControlKeys.length && <Text size="xs" c="dimmed">No recognized control command fields were recorded.</Text>}</Group></Card><VisualizationCard spec={visibleControlChart} seriesVisibility={controlSeriesVisibility} onSeriesVisibilityChange={(name, visible) => setControlSeriesVisibility((current) => ({ ...current, [name]: visible }))} seriesColorOverrides={controlSeriesColors} onSeriesColorChange={(name, color) => setStoredSeriesColor(setControlSeriesColors, name, color)} animationDurationSeconds={Math.max(0.25, (timeDomain.maximum - timeDomain.minimum) / Math.max(0.01, Number(playbackRate ?? 1)))} emptyDescription={replayAnalysisMode === 'compare' ? 'The two experiments have no common recorded timestamps for the enabled control commands.' : 'Enable a recorded control command. Throttle is preferred for T/S/B; Speed target is preferred for Ackermann.'} /></Stack>
           </SimpleGrid>
           {replayAnalysisMode === 'compare' && replayComparison && <Card p="lg"><Group justify="space-between" align="flex-start" mb="md"><div><Text fw={700}>Detailed two-experiment difference</Text><Text size="sm" c="dimmed">{replayComparison.right} − {replayComparison.left} · exact common recorded timestamps only</Text></div><Badge variant="light" color="indigo">{replayComparisonRows.length} comparable signals</Badge></Group>{replayComparison.trajectorySummary && <SimpleGrid cols={{ base: 2, md: 4 }} mb="lg"><Card withBorder p="md"><Text size="xs" c="dimmed">ADE</Text><Text fz={24} fw={700}>{comparisonValue(replayComparison.trajectorySummary.mean, 'm')}</Text></Card><Card withBorder p="md"><Text size="xs" c="dimmed">FDE</Text><Button variant="subtle" px={0} onClick={() => replayComparison.trajectoryFde && jumpToComparisonTime(replayComparison.trajectoryFde[0])}>{comparisonValue(replayComparison.trajectoryFde?.[1], 'm')}</Button></Card><Card withBorder p="md"><Text size="xs" c="dimmed">Trajectory RMSE</Text><Text fz={24} fw={700}>{comparisonValue(replayComparison.trajectorySummary.rmse, 'm')}</Text></Card><Card withBorder p="md"><Text size="xs" c="dimmed">Aligned trajectory steps</Text><Text fz={24} fw={700}>{replayComparison.trajectorySummary.count.toLocaleString()}</Text><Text size="xs" c="dimmed">left {replayComparison.leftTrajectoryCount.toLocaleString()} · right {replayComparison.rightTrajectoryCount.toLocaleString()}</Text></Card></SimpleGrid>}<Alert color="gray" mb="md" title="How to read the table">Mean Δ preserves direction. MAE, RMSE, and P95 |Δ| describe magnitude. For trajectory distance, ADE equals the mean distance and FDE is shown above. Click any reported time to move the synchronized trajectory to that recorded step.</Alert>{replayComparisonRows.length ? <ScrollArea type="auto"><table className="pisa-data-table"><thead><tr><th>Signal</th><th>Aligned / left / right</th><th>Mean Δ</th><th>MAE</th><th>RMSE</th><th>Minimum Δ · time</th><th>Maximum Δ · time</th><th>P95 |Δ| · nearest time</th></tr></thead><tbody>{replayComparisonRows.map((row) => { const value = (number: number) => comparisonValue(number, row.unit); const at = (rowTime: number) => <Button size="compact-xs" variant="subtle" px={2} onClick={() => jumpToComparisonTime(rowTime)}>{rowTime.toFixed(3)} s</Button>; return <tr key={`${row.category}-${row.key}`}><td><Badge size="xs" variant="light" color={row.category === 'Trajectory' ? 'violet' : row.category === 'Metric' ? 'indigo' : 'cyan'}>{row.category}</Badge><Text size="sm" fw={600}>{row.label}</Text><Text size="xs" c="dimmed">{row.unit || 'unitless'}</Text></td><td>{row.summary.count.toLocaleString()} / {row.leftCount.toLocaleString()} / {row.rightCount.toLocaleString()}</td><td>{value(row.summary.mean)}</td><td>{value(row.summary.mae)}</td><td>{value(row.summary.rmse)}</td><td><Text size="sm">{value(row.summary.minimum[1])}</Text>{at(row.summary.minimum[0])}</td><td><Text size="sm">{value(row.summary.maximum[1])}</Text>{at(row.summary.maximum[0])}</td><td><Text size="sm">{value(row.summary.p95Absolute.value)}</Text><Text size="xs" c="dimmed">signed {value(row.summary.p95Absolute.delta)}</Text>{at(row.summary.p95Absolute.time)}</td></tr>; })}</tbody></table></ScrollArea> : <EmptyState title="No aligned comparison values" description="The selected experiments do not share recorded timestamps for trajectory, metrics, or compatible control commands." />}</Card>}
         </Stack>
@@ -1302,13 +2220,16 @@ export function ReportWorkspacePage() {
   const { datasetId, section = 'overview', runId } = useParams();
   const navigate = useNavigate();
   const reportPreview = useQuery({ queryKey: ['report-preview-id', datasetId], queryFn: () => api.datasets.previewById(datasetId!), enabled: Boolean(datasetId), staleTime: 300_000, retry: 1 });
+  const temporary = reportPreview.data?.storage_kind === 'temporary';
+  useQuery({ queryKey: ['report-preview-lease', datasetId], queryFn: () => api.datasets.lease(datasetId!), enabled: Boolean(datasetId && temporary), refetchInterval: 30_000, retry: false });
+  const discardPreview = useMutation({ mutationFn: () => api.datasets.discardPreview(datasetId!), onSuccess: () => navigate('/#reports', { replace: true }) });
   const replayStorageKey = datasetId ? `pisa:last-replay:${datasetId}` : '';
   useEffect(() => {
     if (!datasetId || section !== 'replay' || runId) return;
     const remembered = window.sessionStorage.getItem(replayStorageKey);
     if (remembered) navigate(`/reports/${encodeURIComponent(datasetId)}/replay/${encodeURIComponent(remembered)}`, { replace: true });
   }, [datasetId, navigate, replayStorageKey, runId, section]);
-  if (!datasetId) return <SelectReport />;
+  if (!datasetId) return null;
   const selected = reportPreview.data;
   const setSection = (value: string | null) => {
     if (!value) return;
@@ -1325,14 +2246,15 @@ export function ReportWorkspacePage() {
 
   return (
     <>
-      <PageHeader eyebrow="Report workspace" title={selected?.name ?? 'Evidence report'} description={selected ? `${selected.run_count.toLocaleString()} runs across ${selected.experiment_count} experiments · filters and exports retain provenance.` : 'Loading indexed report metadata…'} actions={<Button component={Link} to="/reports" variant="default" leftSection={<IconArrowLeft size={16} />}>All reports</Button>} />
+      <PageHeader eyebrow="Report workspace" title={selected?.name ?? 'Evidence report'} description={selected ? `${selected.run_count.toLocaleString()} runs across ${selected.experiment_count} experiments · filters and exports retain provenance.` : 'Loading indexed report metadata…'} actions={temporary ? <Button variant="default" color="red" loading={discardPreview.isPending} leftSection={<IconArrowLeft size={16} />} onClick={() => discardPreview.mutate()}>Discard preview</Button> : <Button component={Link} to="/#reports" variant="default" leftSection={<IconArrowLeft size={16} />}>Manage reports</Button>} />
       <Tabs value={section} onChange={setSection} variant="outline" mb="lg">
         <ScrollArea type="never"><Tabs.List style={{ flexWrap: 'nowrap' }}>{sections.map(([value, label]) => <Tabs.Tab key={value} value={value}>{label}</Tabs.Tab>)}</Tabs.List></ScrollArea>
       </Tabs>
-      {section === 'overview' && <Overview datasetId={datasetId} />}
+      {section === 'overview' && <Overview datasetId={datasetId} report={selected} />}
       {section === 'sampling' && <Stack gap="lg"><ScatterExplorer datasetId={datasetId} onOpen={openRun} /><ChartSection datasetId={datasetId} section={section} /></Stack>}
       {['outcomes', 'performance', 'sensitivity'].includes(section) && <ChartSection datasetId={datasetId} section={section} />}
       {section === 'compare' && <Compare datasetId={datasetId} onOpen={openRun} />}
+      {section === 'consistency' && <Consistency datasetId={datasetId} />}
       {section === 'runs' && <Runs datasetId={datasetId} onOpen={openRun} />}
       {section === 'replay' && <Replay datasetId={datasetId} runId={runId} onChoose={() => setSection('runs')} onOpen={openRun} />}
       {section === 'media' && <Media datasetId={datasetId} onChoose={() => setSection('runs')} />}

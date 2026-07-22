@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -96,6 +97,25 @@ def _report(root: Path) -> Path:
     return bundle
 
 
+def _record(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "execution_manifest.yaml").write_text(
+        yaml.safe_dump({
+            "execution_id": "preview-source", "scenario_name": "cut-in",
+            "summary": {"finished": 1}, "execution": {"sampler_name": "lhs"},
+            "components": {"simulator": {"component": {"name": "esmini"}}, "av": {"component": {"name": "simple-av"}}},
+        }),
+        encoding="utf-8",
+    )
+    monitor = root / "iteration_1" / "monitor"
+    monitor.mkdir(parents=True)
+    with (monitor / "result.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["run.status", "run.test_outcome", "run.sample_id", "run.params"])
+        writer.writeheader()
+        writer.writerow({"run.status": "finished", "run.test_outcome": "success", "run.sample_id": "1", "run.params": json.dumps({"x": 1})})
+    return root
+
+
 class _Client:
     def __init__(self, app) -> None:
         self.app = app
@@ -179,6 +199,28 @@ def test_health_capabilities_preview_and_standard_error(tmp_path: Path) -> None:
         assert blocked.headers["X-Request-ID"] == blocked.json()["request_id"]
 
 
+def test_legacy_report_keeps_workspace_and_explains_consistency_unavailability(
+    tmp_path: Path,
+) -> None:
+    _report(tmp_path)
+    with _client(tmp_path) as client:
+        descriptor = client.get("/api/v1/reports").json()["items"][0]
+        response = client.get(f"/api/v1/reports/{descriptor['id']}/consistency")
+
+    assert response.status_code == 200
+    assert response.json()["quick"] == {
+        "schema_version": 1,
+        "available": False,
+        "reason": "normalized_report_index_required",
+        "dataset_count": 0,
+        "canonical_dataset_count": 0,
+        "group_count": 0,
+        "groups": [],
+        "excluded_duplicate_aliases": [],
+    }
+    assert response.json()["deep"]["state"] == "not_generated"
+
+
 def test_recursive_report_library_index_pagination_and_artifacts(tmp_path: Path) -> None:
     bundle = _report(tmp_path)
     (bundle / "media" / "recorded.jpg").write_bytes(b"\xff\xd8\xff\xd9")
@@ -232,6 +274,75 @@ def test_recursive_report_library_index_pagination_and_artifacts(tmp_path: Path)
             f"/api/v1/reports/{identifier}/artifacts/../../manifest.yaml"
         )
         assert traversal.status_code in {403, 404}
+
+
+def test_temporary_report_can_be_used_saved_and_discarded(tmp_path: Path) -> None:
+    source = _report(tmp_path)
+    with _client(tmp_path) as client:
+        library = client.app.state.report_library
+        temporary_path = library.temporary_output("Quick preview")
+        shutil.copytree(source, temporary_path)
+        temporary = library.register_temporary(temporary_path, name="Quick preview")
+
+        descriptor = client.get(f"/api/v1/reports/{temporary['id']}/preview")
+        assert descriptor.status_code == 200
+        assert descriptor.json()["storage_kind"] == "temporary"
+        assert descriptor.json()["name"] == "Quick preview"
+        assert client.get(f"/api/v1/reports/{temporary['id']}/overview").status_code == 200
+        assert client.post(f"/api/v1/reports/{temporary['id']}/lease").status_code == 200
+        assert all(item["id"] != temporary["id"] for item in client.get("/api/v1/reports").json()["items"])
+
+        target = tmp_path / "saved-preview"
+        queued = client.post(
+            f"/api/v1/reports/{temporary['id']}/persist",
+            json={"output_dir": str(target)},
+        ).json()
+        deadline = time.monotonic() + 3
+        while True:
+            job = client.get(f"/api/v1/jobs/{queued['id']}").json()
+            if job["status"] in TERMINAL_STATES:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert job["status"] == "succeeded"
+        assert target.is_dir()
+        saved_id = job["result"]["report_id"]
+        assert client.get(f"/api/v1/reports/{saved_id}/preview").json()["storage_kind"] == "saved"
+        assert client.get(f"/api/v1/reports/{temporary['id']}/preview").status_code == 404
+
+        discard_path = library.temporary_output("Discard me")
+        shutil.copytree(source, discard_path)
+        discard = library.register_temporary(discard_path, name="Discard me")
+        assert client.delete(f"/api/v1/reports/{discard['id']}/preview").status_code == 204
+        assert not discard_path.exists()
+
+
+def test_preview_build_creates_complete_unlisted_temporary_report(tmp_path: Path) -> None:
+    record = _record(tmp_path / "record")
+    with _client(tmp_path) as client:
+        queued = client.post(
+            "/api/v1/reports/previews",
+            json={
+                "experiments": [{"id": "demo", "results": str(record)}],
+                "report_name": "Quick look",
+                "engine": "normalized",
+            },
+        )
+        assert queued.status_code == 202
+        deadline = time.monotonic() + 5
+        while True:
+            job = client.get(f"/api/v1/jobs/{queued.json()['id']}").json()
+            if job["status"] in TERMINAL_STATES:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert job["status"] == "succeeded", job.get("error")
+        identifier = job["result"]["report_id"]
+        descriptor = client.get(f"/api/v1/reports/{identifier}/preview").json()
+        assert descriptor["name"] == "Quick look"
+        assert descriptor["storage_kind"] == "temporary"
+        assert descriptor["has_index"] is True
+        assert all(item["id"] != identifier for item in client.get("/api/v1/reports").json()["items"])
 
 
 def test_job_sse_sequence_and_last_event_id(tmp_path: Path) -> None:
@@ -456,7 +567,7 @@ def test_report_browser_inspection_scatter_case_and_management(tmp_path: Path) -
                     "run.status": "finished",
                     "run.test_outcome": "success",
                     "run.sample_id": scenario,
-                    "run.params": json.dumps({"speed": speed, "gap": 5 + scenario}),
+                        "run.params": json.dumps({"speed": speed, "gap": 5 + scenario, "weather": "clear" if scenario == 1 else "rain"}),
                     "run.stop_condition": "scenario_complete",
                     "run.stop_reason": f"completed_{scenario}",
                     "metric.score": speed / 2,
@@ -542,6 +653,36 @@ def test_report_browser_inspection_scatter_case_and_management(tmp_path: Path) -
         assert control_fields["metric:control.max_brake"]["numeric_count"] == 2
         assert scatter["points"][0]["stop_reason"] == "completed_1"
         assert scatter["stop_reasons"] == ["completed_1", "completed_2"]
+        continuous_filter = client.get(
+            f"/api/v1/reports/{identifier}/scatter",
+            params={"filter_field": "param:speed"},
+        ).json()
+        assert continuous_filter["filter"] == {
+            "field": "param:speed",
+            "kind": "continuous",
+            "minimum": 10.0,
+            "maximum": 20.0,
+            "step": 1.0,
+            "present_count": 2,
+            "missing_count": 0,
+        }
+        assert [point["filter"] for point in continuous_filter["points"]] == [10.0, 20.0]
+        discrete_filter = client.get(
+            f"/api/v1/reports/{identifier}/scatter",
+            params={"filter_field": "stop_reason"},
+        ).json()
+        assert discrete_filter["filter"]["kind"] == "discrete"
+        assert discrete_filter["filter"]["values"] == ["completed_1", "completed_2"]
+        assert [point["filter"] for point in discrete_filter["points"]] == [
+            "completed_1",
+            "completed_2",
+        ]
+        categorical_parameter_filter = client.get(
+            f"/api/v1/reports/{identifier}/scatter",
+            params={"filter_field": "param:weather"},
+        ).json()
+        assert categorical_parameter_filter["filter"]["kind"] == "discrete"
+        assert categorical_parameter_filter["filter"]["values"] == ["clear", "rain"]
         filtered_scatter = client.get(
             f"/api/v1/reports/{identifier}/scatter",
             params={"stop_reason": "completed_2"},

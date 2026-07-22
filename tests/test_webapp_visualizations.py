@@ -181,6 +181,14 @@ def test_cross_experiment_summary_uses_complete_valid_metric_samples(tmp_path: P
     assert ttc["representatives"]["std"]["run_id"] == "alpha:0"
     assert ttc["representatives"]["p95"]["run_id"] == "alpha:0"
     trajectory = summary["trajectory"]
+    assert trajectory["available"] is False
+    assert trajectory["reason"] == "deep_consistency_required"
+
+    # The legacy exact-timestamp computation remains available explicitly, but is
+    # no longer paid during every comparison summary request.
+    trajectory = _normalized_cross_experiment_summary(
+        root / "report" / "index.sqlite", include_trajectory=True
+    )["trajectory"]
     assert trajectory["available"] is True
     assert trajectory["eligible_sample_count"] == 3
     assert trajectory["ade"]["max"] == pytest.approx(1.5)

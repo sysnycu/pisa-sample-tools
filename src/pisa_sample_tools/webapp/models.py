@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -140,13 +141,11 @@ class ReportValidateRequest(BaseModel):
         return self
 
 
-class ReportBuildRequest(BaseModel):
+class ReportAnalysisRequest(BaseModel):
     results_paths: list[str] = Field(default_factory=list)
     experiments: list[dict[str, Any]] = Field(default_factory=list)
     campaign_path: str | None = None
-    output_dir: str
     spec_path: str | None = None
-    overwrite: bool = False
     validation_mode: Literal["strict", "permissive"] | None = None
     deep_validation: bool = False
     report_mode: Literal["interactive", "static"] = "interactive"
@@ -154,10 +153,54 @@ class ReportBuildRequest(BaseModel):
     engine: Literal["auto", "normalized", "legacy"] = "auto"
 
     @model_validator(mode="after")
-    def source(self) -> ReportBuildRequest:
+    def source(self) -> ReportAnalysisRequest:
         sources = sum((bool(self.results_paths), bool(self.experiments), bool(self.campaign_path)))
         if sources != 1:
             raise ValueError("provide exactly one of results_paths, experiments, or campaign_path")
+        return self
+
+
+class ReportBuildRequest(ReportAnalysisRequest):
+    output_dir: str
+    overwrite: bool = False
+
+
+class ReportPreviewBuildRequest(ReportAnalysisRequest):
+    report_name: str = Field(min_length=1, max_length=255, pattern=r"^[^/\\]+$")
+
+
+class ReportPersistRequest(BaseModel):
+    output_dir: str = Field(min_length=1, max_length=4096)
+    overwrite: bool = False
+
+
+class PairedParameterAnalysisRequest(BaseModel):
+    x: str | None = Field(default=None, max_length=240)
+    y: str | None = Field(default=None, max_length=240)
+    facet: str | None = Field(default=None, max_length=240)
+    view: Literal["outcome", "metric_delta"] = "outcome"
+    metric: str | None = Field(default=None, max_length=240)
+    bin_count: int = Field(default=5, ge=2, le=20)
+    boundaries: dict[str, list[float]] = Field(default_factory=dict)
+    facet_range: tuple[float, float] | None = None
+    minimum_cell_count: int | None = Field(default=None, ge=1)
+    point_limit: int = Field(default=20_000, ge=100, le=100_000)
+
+
+class PairedMetricAgreementRequest(BaseModel):
+    metric: str | None = Field(default=None, max_length=240)
+    x_side: Literal["left", "right"] = "right"
+    outcome_scope: Literal["all_same", "success", "fail", "invalid", "unknown"] = (
+        "all_same"
+    )
+    primary_threshold: float = Field(default=5.0, gt=0)
+    secondary_threshold: float = Field(default=10.0, gt=0)
+    point_limit: int = Field(default=20_000, ge=100, le=100_000)
+
+    @model_validator(mode="after")
+    def thresholds_are_ordered(self) -> PairedMetricAgreementRequest:
+        if self.secondary_threshold <= self.primary_threshold:
+            raise ValueError("secondary_threshold must be greater than primary_threshold")
         return self
 
 
@@ -291,6 +334,24 @@ class LegacyRebuildRequest(BaseModel):
     output_dir: str | None = None
     sensitivity: bool | None = None
     overwrite: bool = False
+
+
+class ConsistencyAnalyzeRequest(BaseModel):
+    profile: Literal["trajectory_outlier_controls", "full_controls"] = (
+        "trajectory_outlier_controls"
+    )
+    position_tolerances_m: list[float] = Field(
+        default_factory=lambda: [0.001, 0.01, 0.1], min_length=1, max_length=12
+    )
+    outlier_limit: int = Field(default=25, ge=1, le=1_000)
+    force: bool = False
+
+    @model_validator(mode="after")
+    def valid_tolerances(self) -> ConsistencyAnalyzeRequest:
+        if any(not math.isfinite(value) or value < 0 for value in self.position_tolerances_m):
+            raise ValueError("position_tolerances_m must contain finite non-negative values")
+        self.position_tolerances_m = sorted(set(self.position_tolerances_m))
+        return self
 
 
 class ReportRenameRequest(BaseModel):

@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../api/client';
-import { safeVisualizationFilename, VisualizationCard, visualizationToCsv } from '../components/VisualizationCard';
+import { safeVisualizationFilename, VisualizationCard, visualizationToCsv, visualizationWithFloatingTooltip } from '../components/VisualizationCard';
 import { theme } from '../theme';
 
 const chartMocks = vi.hoisted(() => {
@@ -19,7 +19,7 @@ const chartMocks = vi.hoisted(() => {
 });
 
 vi.mock('echarts/core', () => ({ init: chartMocks.init, use: chartMocks.use }));
-vi.mock('echarts/charts', () => ({ BarChart: {}, LineChart: {}, PieChart: {}, ScatterChart: {} }));
+vi.mock('echarts/charts', () => ({ BarChart: {}, HeatmapChart: {}, LineChart: {}, PieChart: {}, ScatterChart: {} }));
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {}, SVGRenderer: {} }));
 vi.mock('echarts/components', () => ({
   DataZoomComponent: {}, DatasetComponent: {}, GridComponent: {}, LegendComponent: {}, MarkLineComponent: {},
@@ -31,6 +31,7 @@ const spec = {
   title: 'Sample coverage',
   kind: 'scatter' as const,
   option: {
+    legend: { type: 'plain', data: ['Samples'] },
     xAxis: { type: 'value' },
     yAxis: { type: 'value' },
     series: [{ name: 'Samples', type: 'scatter', data: [[1, 2], [3, 4]] }],
@@ -86,9 +87,53 @@ describe('VisualizationCard exports', () => {
     expect(link).toHaveAttribute('href', 'http://localhost:3000/api/v1/jobs/export-1/artifacts/coverage.svg');
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
   });
+
+  it('keeps category visibility and color editing as separate controls', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const onVisibilityChange = vi.fn(), onColorChange = vi.fn();
+    render(
+      <MantineProvider theme={theme}>
+        <QueryClientProvider client={client}><VisualizationCard spec={spec} onSeriesVisibilityChange={onVisibilityChange} onSeriesColorChange={onColorChange} /></QueryClientProvider>
+      </MantineProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Samples' }));
+    expect(onVisibilityChange).toHaveBeenCalledWith('Samples', false);
+    fireEvent.click(screen.getByRole('button', { name: 'Customize Samples style' }));
+    fireEvent.change(await screen.findByLabelText('Category color'), { target: { value: '#ff00ff' } });
+    expect(onColorChange).toHaveBeenCalledWith('Samples', '#ff00ff');
+  });
+
+  it('supports per-category border and shape controls', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const onStyleChange = vi.fn();
+    render(
+      <MantineProvider theme={theme}>
+        <QueryClientProvider client={client}><VisualizationCard spec={{ ...spec, option: { ...spec.option, series: [{ ...spec.option.series[0], symbol: 'circle', itemStyle: { color: '#526ff0', borderColor: '#17202a', borderWidth: 1 } }] } }} onSeriesStyleChange={onStyleChange} /></QueryClientProvider>
+      </MantineProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Customize Samples style' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Black border' }));
+    expect(onStyleChange).toHaveBeenCalledWith('Samples', { border: false });
+  });
 });
 
 describe('visualization export serialization', () => {
+  it('moves interactive tooltips outside clipping chart cards', () => {
+    const option = visualizationWithFloatingTooltip({
+      tooltip: { trigger: 'axis', className: 'custom-tooltip' },
+      series: [],
+    });
+
+    expect(option.tooltip).toMatchObject({
+      trigger: 'axis',
+      appendTo: 'body',
+      confine: false,
+      className: 'custom-tooltip pisa-chart-tooltip',
+    });
+  });
+
   it('serializes plotted series in clean long-form CSV', () => {
     expect(visualizationToCsv(spec.option)).toBe(
       'series,index,x,y,name,value\r\nSamples,0,1,2,,2\r\nSamples,1,3,4,,4\r\n',

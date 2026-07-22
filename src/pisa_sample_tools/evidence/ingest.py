@@ -242,7 +242,7 @@ def _json_mapping(value: Any) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(str(value))
-    except json.JSONDecodeError, TypeError:
+    except (json.JSONDecodeError, TypeError):
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
 

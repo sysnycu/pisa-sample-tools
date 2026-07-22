@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from pisa_sample_tools.reporting.index import REPORT_INDEX_SCHEMA_VERSION
+
 DEFAULT_MAXIMUM_POINTS = 20_000
 DEFAULT_MAXIMUM_PARAMETERS = 12
 SUPPORTED_FORMATS = frozenset({"png", "svg", "pdf", "csv", "json"})
@@ -314,7 +316,7 @@ def _report_connection(
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         schema_version = _validate_database(connection)
-        if require_current_schema and schema_version > 1:
+        if require_current_schema and schema_version > REPORT_INDEX_SCHEMA_VERSION:
             raise VisualizationError(
                 "refusing to export into a report with a newer store schema; open it read-only"
             )
@@ -1123,7 +1125,7 @@ def _comparison_charts(
     role = str(relation["role"])
     try:
         decoded_details = json.loads(str(relation["details_json"] or "{}"))
-    except json.JSONDecodeError, TypeError:
+    except (json.JSONDecodeError, TypeError):
         decoded_details = {}
     details = decoded_details if isinstance(decoded_details, dict) else {}
     charts = [

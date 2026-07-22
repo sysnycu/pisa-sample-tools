@@ -16,6 +16,21 @@ from .comparison import (
     semantic_projection,
     structured_diff,
 )
+from .consistency import (
+    QUICK_CONSISTENCY_SCHEMA_VERSION,
+    build_quick_consistency,
+    is_runtime_metric,
+    metric_unit,
+    write_quick_consistency_artifacts,
+)
+from .deep_consistency import (
+    DEEP_CONSISTENCY_ANALYZER_VERSION,
+    DEEP_PROFILES,
+    DEFAULT_POSITION_TOLERANCES_M,
+    DeepConsistencyError,
+    analyze_deep_consistency,
+    deep_consistency_status,
+)
 from .discovery import ExperimentSource, discover_experiments, discovery_fingerprint
 from .index import (
     REPORT_INDEX_BUILD_VERSION,
@@ -41,18 +56,32 @@ from .models import (
     SourceFingerprint,
     StageTiming,
 )
+from .paired_parameters import (
+    PAIRED_RELATION_ROLES,
+    PairedMetricAgreementError,
+    PairedParameterError,
+    analyze_paired_metric_agreement,
+    analyze_paired_parameters,
+    build_portable_paired_parameter_summary,
+)
 
 __all__ = [
     "NON_BEHAVIOR_RUNNER_SPEC_PATHS",
+    "PAIRED_RELATION_ROLES",
     "REPORT_ARTIFACT_TYPE",
     "REPORT_BUILD_VERSION",
     "REPORT_INDEX_BUILD_VERSION",
     "REPORT_INDEX_SCHEMA_VERSION",
     "REPORT_MANIFEST_SCHEMA_VERSION",
     "REPORT_TOOL",
+    "QUICK_CONSISTENCY_SCHEMA_VERSION",
+    "DEEP_CONSISTENCY_ANALYZER_VERSION",
+    "DEEP_PROFILES",
+    "DEFAULT_POSITION_TOLERANCES_M",
     "ComparisonAssessment",
     "ComparisonRole",
     "DataHealthFinding",
+    "DeepConsistencyError",
     "DatasetDescriptor",
     "DatasetRelation",
     "ExperimentSource",
@@ -61,6 +90,8 @@ __all__ = [
     "IndexedAttempt",
     "IndexedRun",
     "OutcomeSummary",
+    "PairedMetricAgreementError",
+    "PairedParameterError",
     "ReportBundleError",
     "ReportBundleResult",
     "ReportIndex",
@@ -71,11 +102,20 @@ __all__ = [
     "StageTiming",
     "build_report_index",
     "build_report_bundle",
+    "build_quick_consistency",
+    "analyze_paired_metric_agreement",
+    "analyze_paired_parameters",
+    "build_portable_paired_parameter_summary",
+    "analyze_deep_consistency",
     "classify_comparison",
     "discover_experiments",
+    "deep_consistency_status",
     "discovery_fingerprint",
     "semantic_compatibility",
     "semantic_projection",
+    "is_runtime_metric",
+    "metric_unit",
     "rebuild_legacy_report",
     "structured_diff",
+    "write_quick_consistency_artifacts",
 ]

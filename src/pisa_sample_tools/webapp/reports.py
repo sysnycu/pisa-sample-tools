@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import sqlite3
 import statistics
 import tempfile
 import threading
+import uuid
 from collections import Counter
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -150,7 +155,7 @@ def ensure_report_index(root: Path) -> Path:
 
 
 class ReportLibrary:
-    def __init__(self, roots: list[Path], policy: PathPolicy) -> None:
+    def __init__(self, roots: list[Path], policy: PathPolicy, *, temporary_root: Path | None = None) -> None:
         self.roots = tuple(Path(root).expanduser().resolve() for root in roots)
         self.policy = policy
         self._reports: dict[str, Path] = {}
@@ -158,11 +163,115 @@ class ReportLibrary:
         self._cross_comparison_cache: dict[
             Path, tuple[tuple[int, int], dict[str, Any]]
         ] = {}
+        if temporary_root is None:
+            self._temporary_root = Path(tempfile.mkdtemp(prefix="pisa-report-previews-"))
+        else:
+            self._temporary_root = temporary_root.expanduser().resolve()
+            shutil.rmtree(self._temporary_root, ignore_errors=True)
+            self._temporary_root.mkdir(parents=True, exist_ok=True)
+        self._temporary_reports: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
+
+    def temporary_output(self, name: str) -> Path:
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip("-.") or "pisa-report"
+        return self._temporary_root / f"{clean}-{uuid.uuid4().hex[:10]}"
+
+    def register_temporary(self, path: Path, *, name: str) -> dict[str, Any]:
+        preview = self.preview(path)
+        expires = datetime.now(UTC) + timedelta(minutes=10)
+        with self._lock:
+            self._temporary_reports[preview["id"]] = {
+                "path": path.resolve(), "name": name.strip(), "expires_at": expires,
+            }
+        return self.preview(path)
+
+    def lease_temporary(self, identifier: str) -> dict[str, Any]:
+        self.cleanup_expired()
+        with self._lock:
+            record = self._temporary_reports.get(identifier)
+            if record is None:
+                raise APIError(409, "report_not_temporary", "the report is not a temporary preview")
+            record["expires_at"] = datetime.now(UTC) + timedelta(minutes=10)
+            path = record["path"]
+        return self.preview(path)
+
+    def discard_temporary(self, identifier: str) -> None:
+        with self._lock:
+            record = self._temporary_reports.pop(identifier, None)
+            path = record["path"] if record else None
+            if path is not None:
+                self._reports.pop(identifier, None)
+                self._preview_cache.pop(path, None)
+        if path is None:
+            raise APIError(409, "report_not_temporary", "the report is not a temporary preview")
+        shutil.rmtree(path, ignore_errors=True)
+
+    def cleanup_expired(self) -> None:
+        now = datetime.now(UTC)
+        with self._lock:
+            expired = [identifier for identifier, record in self._temporary_reports.items() if record["expires_at"] <= now]
+        for identifier in expired:
+            with suppress(APIError):
+                self.discard_temporary(identifier)
+
+    def close(self) -> None:
+        with self._lock:
+            self._temporary_reports.clear()
+        shutil.rmtree(self._temporary_root, ignore_errors=True)
+
+    def persist_temporary(self, identifier: str, target: Path, *, overwrite: bool = False) -> dict[str, Any]:
+        self.cleanup_expired()
+        with self._lock:
+            record = self._temporary_reports.get(identifier)
+            if record is None:
+                raise APIError(409, "report_not_temporary", "only a temporary preview can be saved")
+            source = Path(record["path"])
+        target = target.resolve()
+        if target == source or target.is_relative_to(source):
+            raise APIError(409, "invalid_report_destination", "the saved report must be outside its temporary preview directory", field="output_dir")
+        if target.exists() and not overwrite:
+            raise APIError(409, "report_output_exists", "the selected report destination already exists", field="output_dir")
+        if target.exists() and not is_report_bundle(target):
+            raise APIError(409, "report_overwrite_refused", "only an existing PISA report can be replaced", field="output_dir")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup: Path | None = None
+        try:
+            if not target.exists():
+                try:
+                    source.rename(target)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+                    staging.rmdir()
+                    shutil.copytree(source, staging)
+                    staging.rename(target)
+                    shutil.rmtree(source)
+            else:
+                staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+                staging.rmdir()
+                shutil.copytree(source, staging)
+                backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex[:8]}")
+                target.rename(backup)
+                try:
+                    staging.rename(target)
+                except Exception:
+                    backup.rename(target)
+                    raise
+                shutil.rmtree(backup)
+                shutil.rmtree(source)
+        except OSError as exc:
+            raise APIError(409, "report_persist_failed", str(exc), field="output_dir") from exc
+        with self._lock:
+            self._temporary_reports.pop(identifier, None)
+            self._reports.pop(identifier, None)
+            self._preview_cache.pop(source, None)
+        return self.preview(target)
 
     def scan(
         self, root: str | Path | None = None, *, recursive: bool = True
     ) -> dict[str, Any]:
+        self.cleanup_expired()
         roots = [
             self.policy.resolve(root, field="root", kind="directory")
         ] if root is not None else list(self.roots)
@@ -185,7 +294,11 @@ class ReportLibrary:
                 candidates = []
                 for current, directories, _files in os.walk(scan_root, followlinks=False):
                     current_path = Path(current)
-                    directories[:] = [name for name in directories if not name.startswith(".")]
+                    directories[:] = [
+                        name for name in directories
+                        if not name.startswith(".")
+                        and (current_path / name).resolve() != self._temporary_root
+                    ]
                     if is_report_bundle(current_path):
                         candidates.append(current_path)
                         directories[:] = []
@@ -210,6 +323,7 @@ class ReportLibrary:
         }
 
     def browse(self, value: str | Path | None = None) -> dict[str, Any]:
+        self.cleanup_expired()
         directory = self.policy.resolve(
             value or self.roots[0], field="path", kind="directory"
         )
@@ -373,6 +487,9 @@ class ReportLibrary:
             cached = self._preview_cache.get(path)
             if cached is not None and cached[0] == signature:
                 preview = dict(cached[1])
+                temporary = next((record for record in self._temporary_reports.values() if record["path"] == path), None)
+                if temporary:
+                    preview.update(storage_kind="temporary", expires_at=temporary["expires_at"].isoformat(), name=temporary["name"])
                 self._reports[preview["id"]] = path
                 return preview
         manifest = _load_mapping(path / "manifest.yaml", label="report manifest")
@@ -437,6 +554,7 @@ class ReportLibrary:
             "has_index": (path / "report" / "index.sqlite").is_file(),
             "has_snapshot": (path / "report" / "analysis_report.html").is_file(),
             "status": "ready" if normalized_bundle and not build_version < REPORT_BUILD_VERSION else "legacy",
+            "storage_kind": "saved",
             "health": health,
             "tags": tags,
             "scenario_names": scenario_names,
@@ -455,6 +573,9 @@ class ReportLibrary:
         with self._lock:
             self._preview_cache[path] = (signature, dict(preview))
             self._reports[preview["id"]] = path
+            temporary = next((record for record in self._temporary_reports.values() if record["path"] == path), None)
+            if temporary:
+                preview.update(storage_kind="temporary", expires_at=temporary["expires_at"].isoformat(), name=temporary["name"])
         return preview
 
     def preview_path(self, value: str | Path) -> dict[str, Any]:
@@ -464,6 +585,7 @@ class ReportLibrary:
         return self.preview(path)
 
     def get(self, identifier: str) -> Path:
+        self.cleanup_expired()
         if not identifier or any(character not in "0123456789abcdef" for character in identifier):
             raise APIError(404, "report_not_found", "report was not found")
         with self._lock:
@@ -600,6 +722,48 @@ class ReportLibrary:
                 if key not in {"concrete_scenarios", "parameter_points"}
             },
         }
+
+    def paired_parameter_analysis(
+        self, identifier: str, relation_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        from pisa_sample_tools.reporting.paired_parameters import (
+            PairedParameterError,
+            analyze_paired_parameters,
+        )
+
+        root = self.get(identifier)
+        path = root / "report" / "index.sqlite"
+        if not _is_normalized_index(path):
+            raise APIError(
+                409,
+                "paired_parameter_analysis_requires_current_report",
+                "rebuild this legacy report to analyze paired parameter regions",
+            )
+        try:
+            return analyze_paired_parameters(path, relation_id, request)
+        except PairedParameterError as exc:
+            raise APIError(422, "invalid_paired_parameter_analysis", str(exc)) from exc
+
+    def paired_metric_agreement(
+        self, identifier: str, relation_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        from pisa_sample_tools.reporting.paired_parameters import (
+            PairedMetricAgreementError,
+            analyze_paired_metric_agreement,
+        )
+
+        root = self.get(identifier)
+        path = root / "report" / "index.sqlite"
+        if not _is_normalized_index(path):
+            raise APIError(
+                409,
+                "paired_metric_agreement_requires_current_report",
+                "rebuild this legacy report to compare paired output metrics",
+            )
+        try:
+            return analyze_paired_metric_agreement(path, relation_id, request)
+        except PairedMetricAgreementError as exc:
+            raise APIError(422, "invalid_paired_metric_agreement", str(exc)) from exc
 
     def case_detail(
         self, identifier: str, run_id: str, *, maximum_points: int = 5_000,
@@ -845,6 +1009,9 @@ class ReportLibrary:
         }
 
     def rename(self, identifier: str, new_name: str) -> dict[str, Any]:
+        with self._lock:
+            if identifier in self._temporary_reports:
+                raise APIError(409, "temporary_report_rename_refused", "save the preview to rename it")
         source = self.get(identifier)
         clean_name = new_name.strip()
         if clean_name in {"", ".", ".."} or "/" in clean_name or "\\" in clean_name:
@@ -864,6 +1031,9 @@ class ReportLibrary:
         return preview
 
     def delete(self, identifier: str, confirm_name: str) -> None:
+        with self._lock:
+            if identifier in self._temporary_reports:
+                raise APIError(409, "temporary_report_delete_refused", "discard the temporary preview instead")
         source = self.get(identifier)
         if confirm_name != source.name:
             raise APIError(
@@ -888,6 +1058,7 @@ class ReportLibrary:
         x: str | None,
         y: str | None,
         color: str | None,
+        filter_field: str | None,
         dataset: str | None,
         stop_reason: str | None,
         limit: int | None,
@@ -905,8 +1076,16 @@ class ReportLibrary:
         try:
             fields = _scatter_fields(connection)
             field_keys = {item["key"] for item in fields}
-            parameters = [item["key"] for item in fields if item["source"] == "parameter"]
-            metrics = [item["key"] for item in fields if item["source"] == "metric"]
+            parameters = [
+                item["key"]
+                for item in fields
+                if item["source"] == "parameter" and int(item.get("numeric_count") or 0) > 0
+            ]
+            metrics = [
+                item["key"]
+                for item in fields
+                if item["source"] == "metric" and int(item.get("numeric_count") or 0) > 0
+            ]
             x_key = x or (parameters[0] if parameters else "sample_order")
             y_key = y or (
                 parameters[1]
@@ -917,6 +1096,24 @@ class ReportLibrary:
             for label, key in (("x", x_key), ("y", y_key), ("color", color_key)):
                 if key not in field_keys and not (label == "color" and key == "outcome"):
                     raise APIError(422, "invalid_scatter_field", f"unknown {label} field: {key}")
+                field = next((item for item in fields if item["key"] == key), None)
+                if (
+                    label in {"x", "y"}
+                    and field is not None
+                    and field["source"] != "order"
+                    and int(field.get("numeric_count") or 0) <= 0
+                ):
+                    raise APIError(
+                        422,
+                        "invalid_scatter_field",
+                        f"{label} field is not numeric: {key}",
+                    )
+            if filter_field is not None and filter_field not in field_keys:
+                raise APIError(
+                    422,
+                    "invalid_scatter_field",
+                    f"unknown filter field: {filter_field}",
+                )
             dataset_ids = [
                 str(row[0])
                 for row in connection.execute("SELECT dataset_id FROM datasets ORDER BY dataset_id")
@@ -946,7 +1143,11 @@ class ReportLibrary:
                 query += " LIMIT ?"
                 parameters_sql += (limit,)
             rows = connection.execute(query, parameters_sql).fetchall()
-            requested = {key for key in (x_key, y_key, color_key) if ":" in key}
+            requested = {
+                key
+                for key in (x_key, y_key, color_key, filter_field)
+                if key is not None and ":" in key
+            }
             values = _scatter_values(connection, [str(row["run_id"]) for row in rows], requested)
             points = []
             for ordinal, row in enumerate(rows, start=1):
@@ -979,14 +1180,59 @@ class ReportLibrary:
                         "x": x_value,
                         "y": y_value,
                         "color": context.get(color_key),
+                        "filter": context.get(filter_field) if filter_field else None,
                     }
                 )
+            filter_description = None
+            if filter_field is not None:
+                field = next(item for item in fields if item["key"] == filter_field)
+                continuous = field["source"] == "order" or (
+                    int(field.get("numeric_count") or 0) > 0
+                    and int(field.get("numeric_count") or 0)
+                    == int(field.get("total_count") or 0)
+                )
+                present = [point["filter"] for point in points if point["filter"] is not None]
+                if continuous:
+                    numeric_values = [
+                        value
+                        for item in present
+                        if (value := _first_number(item)) is not None
+                    ]
+                    minimum = min(numeric_values) if numeric_values else None
+                    maximum = max(numeric_values) if numeric_values else None
+                    span = (maximum - minimum) if minimum is not None and maximum is not None else 0.0
+                    all_integral = bool(numeric_values) and all(value.is_integer() for value in numeric_values)
+                    step = 1.0 if all_integral else max(span / 1000.0, 1e-9)
+                    filter_description = {
+                        "field": filter_field,
+                        "kind": "continuous",
+                        "minimum": minimum,
+                        "maximum": maximum,
+                        "step": step,
+                        "present_count": len(numeric_values),
+                        "missing_count": len(points) - len(numeric_values),
+                    }
+                else:
+                    filter_description = {
+                        "field": filter_field,
+                        "kind": "discrete",
+                        "values": sorted({str(item) for item in present}),
+                        "present_count": len(present),
+                        "missing_count": len(points) - len(present),
+                    }
             return {
                 "fields": fields,
                 "datasets": dataset_ids,
                 "stop_reasons": stop_reasons,
                 "stop_conditions": stop_conditions,
-                "selection": {"x": x_key, "y": y_key, "color": color_key, "dataset": dataset},
+                "selection": {
+                    "x": x_key,
+                    "y": y_key,
+                    "color": color_key,
+                    "filter_field": filter_field,
+                    "dataset": dataset,
+                },
+                "filter": filter_description,
                 "points": points,
                 "returned": len(points),
                 "scanned": len(rows),
@@ -1061,7 +1307,7 @@ def _scatter_fields(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             f"SELECT name, COUNT(value_real) AS numeric_count, COUNT(*) AS total_count "
             f"FROM {table} GROUP BY name ORDER BY name"
         ):
-            if int(row[1] or 0) <= 0:
+            if table == "metrics" and int(row[1] or 0) <= 0:
                 continue
             fields.append(
                 {
@@ -1500,7 +1746,7 @@ def _cross_trajectory_summary(
 
 
 def _normalized_cross_experiment_summary(
-    path: Path, policy: PathPolicy | None = None
+    path: Path, policy: PathPolicy | None = None, *, include_trajectory: bool = False
 ) -> dict[str, Any]:
     """Summarize variation across every canonical dataset on common samples.
 
@@ -1841,7 +2087,18 @@ def _normalized_cross_experiment_summary(
             "hash_quality": hash_quality,
             "discrete": discrete,
             "continuous": continuous,
-            "trajectory": _cross_trajectory_summary(sample_runs, datasets, policy),
+            "trajectory": (
+                _cross_trajectory_summary(sample_runs, datasets, policy)
+                if include_trajectory
+                else {
+                    "available": False,
+                    "reason": "deep_consistency_required",
+                    "eligible_sample_count": 0,
+                    "partial_sample_count": 0,
+                    "unavailable_sample_count": common_sample_count,
+                    "experiment_pair_count": len(datasets) * (len(datasets) - 1) // 2,
+                }
+            ),
             "variation_definition": "per-sample maximum minus minimum",
             "std_definition": "population standard deviation across eligible sample variations",
             "missing_value_rule": (

@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -30,6 +30,7 @@ from .errors import APIError
 from .jobs import TERMINAL_STATES, JobContext, JobManager
 from .models import (
     ConfirmationRequest,
+    ConsistencyAnalyzeRequest,
     DirectoryCreateRequest,
     ErrorBody,
     ExportRequest,
@@ -37,11 +38,15 @@ from .models import (
     LegacyRebuildRequest,
     MediaCreateRequest,
     OutcomeEvalRequest,
+    PairedMetricAgreementRequest,
+    PairedParameterAnalysisRequest,
     RepairApplyRequest,
     RepairRestoreRequest,
     RepairScanRequest,
     ReportBuildRequest,
     ReportDeleteRequest,
+    ReportPersistRequest,
+    ReportPreviewBuildRequest,
     ReportRenameRequest,
     ReportValidateRequest,
     RunnerCleanupRequest,
@@ -85,7 +90,8 @@ def create_app(
     results_roots = _normalize_roots(results_roots)
     roots = _deduplicate([*report_roots, *results_roots, Path.cwd().resolve()])
     policy = PathPolicy(roots)
-    reports = ReportLibrary(report_roots or roots, policy)
+    preview_root = Path(state_path).expanduser().resolve().parent / ".report-previews" if state_path is not None else None
+    reports = ReportLibrary(report_roots or roots, policy, temporary_root=preview_root)
     repairs = RepairService(policy)
     jobs = job_manager or JobManager(state_path)
     runner_store, runner_manager = _runner_services(
@@ -108,6 +114,7 @@ def create_app(
     app.state.runner_store = runner_store
     app.state.runner_manager = runner_manager
     app.state.frontend_dir = selected_frontend
+    app.router.add_event_handler("shutdown", reports.close)
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next: Callable[..., Any]):
@@ -414,13 +421,14 @@ def create_app(
         except (OSError, ValueError) as exc:
             raise APIError(400, "report_validation_failed", str(exc)) from exc
 
-    @app.post(
-        f"{API_PREFIX}/reports/build", response_model=Job, status_code=202, tags=["reports"]
-    )
-    async def report_build(payload: ReportBuildRequest) -> Job:
-        output = policy.resolve(
-            payload.output_dir, field="output_dir", must_exist=False, kind="directory"
-        )
+    def submit_report_build(
+        payload: ReportBuildRequest | ReportPreviewBuildRequest,
+        output: Path,
+        *,
+        overwrite: bool,
+        job_kind: str,
+        temporary_name: str | None = None,
+    ) -> Job:
         experiment_paths = [str(item.get("results") or "") for item in payload.experiments]
         results = [
             policy.resolve(path, field=f"results_paths.{index}", kind="directory")
@@ -441,55 +449,84 @@ def create_app(
         )
 
         def run(context: JobContext) -> Any:
-            if normalized:
-                from pisa_sample_tools.reporting import build_report_bundle
-
-                context.progress(
-                    "indexing_report", message="Discovering and indexing experiment results"
-                )
-                result = build_report_bundle(
-                    results, output, overwrite=payload.overwrite,
-                    progress=lambda phase, current, total, message: context.progress(
-                        phase, current=current, total=total, unit="stages", message=message
-                    ),
-                )
-                context.artifact(result.report_path, kind="report")
-                context.artifact(result.index_path, kind="report_index")
-                reports.scan(output)
-                return {
-                    "report_path": str(result.report_path),
-                    "index_path": str(result.index_path),
-                    "report_id": reports.preview(output)["id"],
-                }
             try:
-                from pisa_sample_tools.evidence.service import build_evidence
-            except ImportError as exc:
-                raise RuntimeError("the reporting subsystem is not installed") from exc
+                if normalized:
+                    from pisa_sample_tools.reporting import build_report_bundle
 
-            result = build_evidence(
-                results_paths=results or None,
-                campaign_path=campaign,
-                output_dir=output,
-                spec_path=spec,
-                overwrite=payload.overwrite,
-                progress=lambda message: context.progress("building_report", message=message),
-                validation_mode=payload.validation_mode,
-                deep_validation=payload.deep_validation,
-                report_mode=payload.report_mode,
-                sensitivity=payload.sensitivity,
-            )
-            context.progress("indexing_report", message="Building the paginated report index")
-            index_path = ensure_report_index(result.output_dir)
-            context.artifact(result.report_path, kind="report")
-            context.artifact(index_path, kind="report_index")
-            reports.scan(output if output.is_dir() else None)
-            return {
-                "report_path": str(result.report_path),
-                "index_path": str(index_path),
-                "report_id": reports.preview(result.output_dir)["id"],
-            }
+                    context.progress(
+                        "indexing_report", message="Discovering and indexing experiment results"
+                    )
+                    result = build_report_bundle(
+                        results, output, overwrite=overwrite,
+                        progress=lambda phase, current, total, message: context.progress(
+                            phase, current=current, total=total, unit="stages", message=message
+                        ),
+                    )
+                    report_root = output
+                    report_path = result.report_path
+                    index_path = result.index_path
+                else:
+                    try:
+                        from pisa_sample_tools.evidence.service import build_evidence
+                    except ImportError as exc:
+                        raise RuntimeError("the reporting subsystem is not installed") from exc
+                    result = build_evidence(
+                        results_paths=results or None,
+                        campaign_path=campaign,
+                        output_dir=output,
+                        spec_path=spec,
+                        overwrite=overwrite,
+                        progress=lambda message: context.progress("building_report", message=message),
+                        validation_mode=payload.validation_mode,
+                        deep_validation=payload.deep_validation,
+                        report_mode=payload.report_mode,
+                        sensitivity=payload.sensitivity,
+                    )
+                    context.progress("indexing_report", message="Building the paginated report index")
+                    report_root = result.output_dir
+                    report_path = result.report_path
+                    index_path = ensure_report_index(report_root)
+                context.artifact(report_path, kind="report")
+                context.artifact(index_path, kind="report_index")
+                preview = (
+                    reports.register_temporary(report_root, name=temporary_name)
+                    if temporary_name is not None
+                    else reports.preview(report_root)
+                )
+                if temporary_name is None:
+                    reports.scan(report_root)
+                return {
+                    "report_path": str(report_path),
+                    "index_path": str(index_path),
+                    "report_id": preview["id"],
+                    "storage_kind": preview["storage_kind"],
+                }
+            except Exception:
+                if temporary_name is not None:
+                    shutil.rmtree(output, ignore_errors=True)
+                raise
 
-        return jobs.submit("report_build", payload.model_dump(), run)
+        return jobs.submit(job_kind, payload.model_dump(), run)
+
+    @app.post(
+        f"{API_PREFIX}/reports/build", response_model=Job, status_code=202, tags=["reports"]
+    )
+    async def report_build(payload: ReportBuildRequest) -> Job:
+        output = policy.resolve(
+            payload.output_dir, field="output_dir", must_exist=False, kind="directory"
+        )
+        return submit_report_build(
+            payload, output, overwrite=payload.overwrite, job_kind="report_build"
+        )
+
+    @app.post(
+        f"{API_PREFIX}/reports/previews", response_model=Job, status_code=202, tags=["reports"]
+    )
+    async def report_preview_build(payload: ReportPreviewBuildRequest) -> Job:
+        output = reports.temporary_output(payload.report_name)
+        return submit_report_build(
+            payload, output, overwrite=False, job_kind="report_preview", temporary_name=payload.report_name
+        )
 
     @app.post(
         f"{API_PREFIX}/reports/{{identifier}}/rebuild",
@@ -652,6 +689,44 @@ def create_app(
     async def report_preview_by_id(identifier: str) -> dict[str, Any]:
         return reports.preview(reports.get(identifier))
 
+    @app.post(f"{API_PREFIX}/reports/{{identifier}}/lease", tags=["reports"])
+    async def report_preview_lease(identifier: str) -> dict[str, Any]:
+        return reports.lease_temporary(identifier)
+
+    @app.delete(f"{API_PREFIX}/reports/{{identifier}}/preview", tags=["reports"])
+    async def report_preview_discard(identifier: str) -> Response:
+        reports.discard_temporary(identifier)
+        return Response(status_code=204)
+
+    @app.post(
+        f"{API_PREFIX}/reports/{{identifier}}/persist",
+        response_model=Job,
+        status_code=202,
+        tags=["reports"],
+    )
+    async def report_preview_persist(
+        identifier: str, payload: ReportPersistRequest
+    ) -> Job:
+        reports.get(identifier)
+        target = policy.resolve(
+            payload.output_dir, field="output_dir", must_exist=False, kind="directory"
+        )
+
+        def run(context: JobContext) -> dict[str, Any]:
+            context.progress("saving_report", current=0, total=1, unit="report", message="Moving the preview into the report library")
+            preview = reports.persist_temporary(identifier, target, overwrite=payload.overwrite)
+            context.progress("saving_report", current=1, total=1, unit="report", message="Saved report is ready")
+            context.artifact(target / "report" / "analysis_report.html", kind="report")
+            reports.scan(target)
+            return {
+                "report_path": str(target / "report" / "analysis_report.html"),
+                "index_path": str(target / "report" / "index.sqlite"),
+                "report_id": preview["id"],
+                "storage_kind": "saved",
+            }
+
+        return jobs.submit("report_persist", payload.model_dump(), run)
+
     @app.post(f"{API_PREFIX}/reports/{{identifier}}/rename", tags=["reports"])
     async def report_rename(
         identifier: str, payload: ReportRenameRequest
@@ -671,12 +746,13 @@ def create_app(
         x: str | None = Query(default=None, max_length=240),
         y: str | None = Query(default=None, max_length=240),
         color: str | None = Query(default="outcome", max_length=240),
+        filter_field: str | None = Query(default=None, max_length=240),
         dataset: str | None = Query(default=None, max_length=240),
         stop_reason: str | None = Query(default=None, max_length=500),
         limit: int | None = Query(default=None, ge=100, le=1_000_000),
     ) -> dict[str, Any]:
         return reports.scatter(
-            identifier, x=x, y=y, color=color, dataset=dataset,
+            identifier, x=x, y=y, color=color, filter_field=filter_field, dataset=dataset,
             stop_reason=stop_reason, limit=limit
         )
 
@@ -737,6 +813,199 @@ def create_app(
     @app.get(f"{API_PREFIX}/reports/{{identifier}}/comparisons", tags=["reports"])
     async def report_comparisons(identifier: str) -> dict[str, Any]:
         return reports.comparisons(identifier)
+
+    @app.post(
+        f"{API_PREFIX}/reports/{{identifier}}/comparisons/{{relation_id}}/parameter-analysis",
+        tags=["reports"],
+    )
+    async def report_paired_parameter_analysis(
+        identifier: str,
+        relation_id: str,
+        payload: PairedParameterAnalysisRequest,
+    ) -> dict[str, Any]:
+        return reports.paired_parameter_analysis(
+            identifier, relation_id, payload.model_dump(exclude_none=True)
+        )
+
+    @app.post(
+        f"{API_PREFIX}/reports/{{identifier}}/comparisons/{{relation_id}}/metric-agreement",
+        tags=["reports"],
+    )
+    async def report_paired_metric_agreement(
+        identifier: str,
+        relation_id: str,
+        payload: PairedMetricAgreementRequest,
+    ) -> dict[str, Any]:
+        return reports.paired_metric_agreement(
+            identifier, relation_id, payload.model_dump(exclude_none=True)
+        )
+
+    @app.get(f"{API_PREFIX}/reports/{{identifier}}/consistency", tags=["reports"])
+    async def report_consistency(
+        identifier: str,
+        profile: Annotated[
+            Literal["trajectory_outlier_controls", "full_controls"], Query()
+        ] = "trajectory_outlier_controls",
+        position_tolerances_m: Annotated[list[float] | None, Query()] = None,
+        outlier_limit: Annotated[int, Query(ge=1, le=1_000)] = 25,
+    ) -> dict[str, Any]:
+        from pisa_sample_tools.reporting import (
+            build_quick_consistency,
+            deep_consistency_status,
+        )
+
+        config = ConsistencyAnalyzeRequest(
+            profile=profile,
+            position_tolerances_m=position_tolerances_m or [0.001, 0.01, 0.1],
+            outlier_limit=outlier_limit,
+        )
+        root = reports.get(identifier)
+        index_path = root / "report" / "index.sqlite"
+        quick_path = root / "summary" / "consistency.json"
+        try:
+            quick_value = json.loads(quick_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            quick_value = (
+                build_quick_consistency(index_path)
+                if index_path.is_file()
+                else {
+                    "schema_version": 1,
+                    "available": False,
+                    "reason": "normalized_report_index_required",
+                    "dataset_count": 0,
+                    "canonical_dataset_count": 0,
+                    "group_count": 0,
+                    "groups": [],
+                    "excluded_duplicate_aliases": [],
+                }
+            )
+        quick = quick_value if isinstance(quick_value, dict) else {}
+        if index_path.is_file():
+            try:
+                deep = deep_consistency_status(
+                    root,
+                    profile=config.profile,
+                    position_tolerances_m=config.position_tolerances_m,
+                    outlier_limit=config.outlier_limit,
+                )
+            except (OSError, ValueError):
+                deep = {
+                    "state": "not_generated",
+                    "reason": "report_source_fingerprint_required",
+                    "profile": config.profile,
+                    "position_tolerances_m": config.position_tolerances_m,
+                    "outlier_limit": config.outlier_limit,
+                    "summary": None,
+                    "artifacts": [],
+                }
+        else:
+            deep = {
+                "state": "not_generated",
+                "reason": "normalized_report_index_required",
+                "profile": config.profile,
+                "position_tolerances_m": config.position_tolerances_m,
+                "outlier_limit": config.outlier_limit,
+                "summary": None,
+                "artifacts": [],
+            }
+        if deep.get("state") == "ready":
+            cache_key = str(deep.get("cache_key") or "")
+            deep["artifacts"] = [
+                {
+                    "path": f"consistency/derived/{cache_key}/{artifact}",
+                    "download_url": (
+                        f"{API_PREFIX}/reports/{identifier}/artifacts/"
+                        f"consistency/derived/{cache_key}/{artifact}"
+                    ),
+                }
+                for artifact in deep.get("artifacts", [])
+            ]
+        active = next(
+            (
+                job
+                for job in jobs.list(limit=1_000)
+                if job.kind == "consistency_analysis"
+                and job.request.get("report_id") == identifier
+                and job.request.get("profile") == config.profile
+                and job.request.get("position_tolerances_m")
+                == config.position_tolerances_m
+                and job.request.get("outlier_limit") == config.outlier_limit
+                and job.status in {"queued", "running"}
+            ),
+            None,
+        )
+        if active is not None:
+            deep = {
+                **deep,
+                "state": active.status,
+                "job": active.model_dump(mode="json"),
+            }
+        return {"quick": quick, "deep": deep}
+
+    @app.post(
+        f"{API_PREFIX}/reports/{{identifier}}/consistency/analyze",
+        response_model=Job,
+        status_code=202,
+        tags=["reports"],
+    )
+    async def analyze_report_consistency(
+        identifier: str, payload: ConsistencyAnalyzeRequest
+    ) -> Job:
+        from pisa_sample_tools.reporting import analyze_deep_consistency
+
+        root = reports.get(identifier)
+        request_data = {"report_id": identifier, **payload.model_dump()}
+        existing = next(
+            (
+                job
+                for job in jobs.list(limit=1_000)
+                if job.kind == "consistency_analysis"
+                and job.request == request_data
+                and job.status in {"queued", "running"}
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+
+        def run(context: JobContext) -> dict[str, Any]:
+            result = analyze_deep_consistency(
+                root,
+                profile=payload.profile,
+                position_tolerances_m=payload.position_tolerances_m,
+                outlier_limit=payload.outlier_limit,
+                force=payload.force,
+                progress=lambda phase, current, total, message, stage, stages: context.progress(
+                    phase,
+                    current=current,
+                    total=total,
+                    unit=("files" if "files" in message else "samples" if "samples" in message else "artifacts" if phase == "writing_artifacts" else "items"),
+                    message=f"Phase {stage} / {stages} · {message}",
+                ),
+                check_cancelled=context.check_cancelled,
+                resolve_trace=lambda path: policy.resolve(
+                    path,
+                    field="consistency.trace",
+                    kind="file",
+                    suffixes={".csv"},
+                ),
+            )
+            artifacts = []
+            for raw_path in result.get("artifacts", []):
+                path = Path(str(raw_path)).resolve()
+                context.artifact(path, kind="consistency")
+                relative = path.relative_to(root).as_posix()
+                artifacts.append(
+                    {
+                        "path": relative,
+                        "download_url": (
+                            f"{API_PREFIX}/reports/{identifier}/artifacts/{relative}"
+                        ),
+                    }
+                )
+            return {**result, "artifacts": artifacts, "report_id": identifier}
+
+        return jobs.submit("consistency_analysis", request_data, run)
 
     @app.get(f"{API_PREFIX}/reports/{{identifier}}/cases/{{run_id:path}}", tags=["reports"])
     async def report_case(

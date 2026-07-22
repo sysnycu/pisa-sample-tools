@@ -12,7 +12,7 @@ const nav = [
   { label: 'Dashboard', description: 'Reports and data health', path: '/', icon: IconLayoutDashboard },
   { label: 'Experiments', description: 'Configure and run', path: '/experiments', icon: IconPlayerPlay },
   { label: 'Samples', description: 'Preview, export, analyze', path: '/samples', icon: IconSparkles },
-  { label: 'Report workspace', description: 'Explore and compare', path: '/reports', icon: IconChartDots3 },
+  { label: 'Reports', description: 'Build, manage, and open', path: '/#reports', icon: IconChartDots3 },
   { label: 'Advanced tools', description: 'Trajectory and repair', path: '/advanced', icon: IconSettingsAutomation },
 ];
 
@@ -61,7 +61,11 @@ export function AppLayout() {
           {displayExpanded && <Text size="xs" c="dimmed" fw={700} tt="uppercase" lts="0.08em" px="sm" mb="xs">Workspace</Text>}
           <Stack gap={4}>
             {nav.map((item) => {
-              const active = item.path === '/' ? location.pathname === '/' : location.pathname.startsWith(item.path);
+              const active = item.path === '/'
+                ? location.pathname === '/' && location.hash !== '#reports'
+                : item.path === '/#reports'
+                  ? location.pathname.startsWith('/reports') || (location.pathname === '/' && location.hash === '#reports')
+                  : location.pathname.startsWith(item.path);
               return <Tooltip key={item.path} label={item.label} position="right" disabled={displayExpanded}>
                 <NavLink
                   component={Link}

@@ -16,11 +16,16 @@ from typing import Any
 
 import yaml
 
+from .consistency import build_quick_consistency, write_quick_consistency_artifacts
 from .index import REPORT_INDEX_SCHEMA_VERSION, ReportIndex, build_report_index
 from .models import DatasetDescriptor, OutcomeSummary, ReportBundleResult
+from .paired_parameters import (
+    build_portable_paired_parameter_summary,
+    portable_region_rows,
+)
 
 REPORT_MANIFEST_SCHEMA_VERSION = 3
-REPORT_BUILD_VERSION = 9
+REPORT_BUILD_VERSION = 11
 REPORT_TOOL = "pisa-analysis-tools"
 REPORT_ARTIFACT_TYPE = "normalized-report-bundle"
 
@@ -61,6 +66,18 @@ def build_report_bundle(
             roots, report_dir / "index.sqlite", force=True, progress=notify
         )
         notify("summarize", 9, 11, "Computing report summaries and comparisons")
+        consistency = build_quick_consistency(
+            report_dir / "index.sqlite",
+            progress=lambda phase, current, total, message: notify(
+                phase,
+                9 + current / max(1, total),
+                11,
+                message,
+            ),
+        )
+        paired_parameters = build_portable_paired_parameter_summary(
+            report_dir / "index.sqlite"
+        )
         with ReportIndex(report_dir / "index.sqlite") as index:
             datasets = index.datasets()
             findings = index.findings()
@@ -89,6 +106,8 @@ def build_report_bundle(
                 ],
                 "findings": [_portable_value(finding.as_dict()) for finding in findings],
                 "comparisons": [_portable_value(relation.as_dict()) for relation in relations],
+                "consistency": _portable_value(consistency),
+                "paired_parameter_regions": _portable_value(paired_parameters),
             }
             _write_json(summary_dir / "summary.json", payload)
             _write_outcome_csv(summary_dir / "outcomes.csv", aggregate)
@@ -96,6 +115,14 @@ def build_report_bundle(
             _write_finding_csv(summary_dir / "data_health.csv", payload["findings"])
             _write_json(summary_dir / "data_health.json", payload["findings"])
             _write_comparison_csv(summary_dir / "comparisons.csv", payload["comparisons"])
+            _write_rows_csv(
+                summary_dir / "paired_parameter_regions.csv",
+                portable_region_rows(paired_parameters),
+            )
+            _write_json(
+                summary_dir / "paired_parameter_regions.json", paired_parameters
+            )
+            write_quick_consistency_artifacts(consistency, summary_dir)
             (report_dir / "analysis_report.html").write_text(
                 _portable_html(payload), encoding="utf-8"
             )
@@ -398,6 +425,14 @@ def _write_finding_csv(path: Path, findings: Sequence[dict[str, Any]]) -> None:
             )
 
 
+def _write_rows_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    columns = list(rows[0]) if rows else ["relation_id"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _write_comparison_csv(path: Path, relations: Sequence[dict[str, Any]]) -> None:
     columns = [
         "left_dataset_id",
@@ -439,19 +474,25 @@ def _portable_html(payload: dict[str, Any]) -> str:
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif}}
 main{{max-width:1180px;margin:auto;padding:40px 24px 80px}}header{{margin-bottom:30px}}h1{{font-size:30px;margin:0 0 6px}}h2{{font-size:18px;margin:28px 0 12px}}
 .muted{{color:var(--muted)}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}.card{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;box-shadow:0 1px 2px #1018280d}}.value{{font-size:26px;font-weight:700}}.bar{{height:12px;display:flex;overflow:hidden;border-radius:999px;background:#eaeef4;margin-top:14px}}.bar span{{min-width:1px}}
-.table-wrap{{overflow:auto;background:#fff;border:1px solid var(--line);border-radius:12px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}}th{{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}}tr:last-child td{{border:0}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2f8}}.warn{{color:#9a6700}}.error{{color:#b42318}}@media print{{body{{background:white}}main{{padding:0}}.card,.table-wrap{{box-shadow:none}}}}
+.table-wrap{{overflow:auto;background:#fff;border:1px solid var(--line);border-radius:12px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}}th{{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}}tr:last-child td{{border:0}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2f8}}.warn{{color:#9a6700}}.error{{color:#b42318}}select{{max-width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:white}}.observations{{margin:12px 0;padding:12px 16px;background:#eef5ff;border-radius:10px}}.heat td{{text-align:center;min-width:96px;border:2px solid white}}.sparse{{opacity:.45}}@media print{{body{{background:white}}main{{padding:0}}.card,.table-wrap{{box-shadow:none}}}}
 </style></head><body><main><header><h1>{safe_title}</h1><div class="muted" id="meta"></div></header>
 <section><div class="cards" id="cards"></div><div class="bar" id="bar"></div></section>
 <section><h2>Datasets</h2><div class="table-wrap"><table><thead><tr><th>Dataset</th><th>System</th><th>Sampler</th><th>Runs</th><th>Aggregate</th><th>Health</th></tr></thead><tbody id="datasets"></tbody></table></div></section>
 <section><h2>Data health</h2><div class="table-wrap"><table><thead><tr><th>Severity</th><th>Code</th><th>Dataset</th><th>Finding</th></tr></thead><tbody id="findings"></tbody></table></div></section>
 <section><h2>Comparison classification</h2><p class="muted">Only recorded semantics and canonical input matches justify paired claims.</p><div class="table-wrap"><table><thead><tr><th>Left</th><th>Right</th><th>Role</th><th>Matched</th><th>Interpretation</th></tr></thead><tbody id="comparisons"></tbody></table></div></section>
+<section><h2>Paired parameter regions</h2><p class="muted">Outcome disagreements are mapped only to recorded original parameters. Percentages always retain their paired numerator and denominator.</p><select id="paired-select"></select><div id="paired-observations" class="observations"></div><div id="paired-heatmap" class="table-wrap"></div><div id="paired-marginals" class="table-wrap" style="margin-top:12px"></div></section>
+<section><h2>Replicate consistency</h2><p class="muted" id="consistency-note"></p><div class="table-wrap"><table><thead><tr><th>Group</th><th>Common samples</th><th>Outcome agreement</th><th>Indexed information exact</th></tr></thead><tbody id="consistency"></tbody></table></div></section>
 <p class="muted">Portable aggregate snapshot. Open the server-backed report to browse lazy per-run traces.</p>
 <script>const D={data};const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 document.getElementById('meta').textContent=`${{D.summary.total.toLocaleString()}} aggregate runs · ${{D.dataset_count}} datasets · generated ${{new Date(D.generated_at).toLocaleString()}}`;
 const colors={{success:'#2d9d69',fail:'#d64b45',invalid:'#d98b22',unknown:'#98a2b3'}};for(const k of ['success','fail','invalid','unknown']){{document.getElementById('cards').insertAdjacentHTML('beforeend',`<div class="card"><div class="muted">${{k}}</div><div class="value">${{D.summary[k].toLocaleString()}}</div></div>`);const s=document.createElement('span');s.style.cssText=`width:${{D.summary.total?100*D.summary[k]/D.summary.total:0}}%;background:${{colors[k]}}`;document.getElementById('bar').appendChild(s)}}
 document.getElementById('datasets').innerHTML=D.datasets.map(x=>`<tr><td>${{esc(x.dataset_id)}}${{x.alias_of?` <span class="badge">alias of ${{esc(x.alias_of)}}</span>`:''}}</td><td>${{esc([x.simulator,x.av].filter(Boolean).join(' / '))}}</td><td>${{esc(x.sampler)}}</td><td>${{x.run_count.toLocaleString()}}</td><td>${{x.aggregate_included?'Included':'Collapsed'}}</td><td class="${{x.health_counts.error?'error':x.health_counts.warning?'warn':''}}">${{x.health_counts.error}} errors · ${{x.health_counts.warning}} warnings</td></tr>`).join('');
 document.getElementById('findings').innerHTML=D.findings.map(x=>`<tr><td class="${{esc(x.severity)}}">${{esc(x.severity)}}</td><td>${{esc(x.code)}}</td><td>${{esc(x.dataset_id)}}</td><td style="white-space:normal">${{esc(x.message)}}</td></tr>`).join('');
-document.getElementById('comparisons').innerHTML=D.comparisons.map(x=>{{const d=x.details||{{}};return `<tr><td>${{esc(x.left_dataset_id)}}</td><td>${{esc(x.right_dataset_id)}}</td><td><span class="badge">${{esc(x.role)}}</span></td><td>${{Number(d.matched_count||0).toLocaleString()}}</td><td style="white-space:normal">${{esc(d.reason||'Recorded classification')}}</td></tr>`}}).join('');</script></main></body></html>"""
+document.getElementById('comparisons').innerHTML=D.comparisons.map(x=>{{const d=x.details||{{}};return `<tr><td>${{esc(x.left_dataset_id)}}</td><td>${{esc(x.right_dataset_id)}}</td><td><span class="badge">${{esc(x.role)}}</span></td><td>${{Number(d.matched_count||0).toLocaleString()}}</td><td style="white-space:normal">${{esc(d.reason||'Recorded classification')}}</td></tr>`}}).join('');
+const P=(D.paired_parameter_regions||{{items:[]}}).items||[],PS=document.getElementById('paired-select');PS.innerHTML=P.map((x,i)=>`<option value="${{i}}">${{esc(x.left)}} vs ${{esc(x.right)}}</option>`).join('')||'<option>No paired parameter summary</option>';
+const interval=(a,b,last)=>`[${{Number(a).toPrecision(5)}}, ${{Number(b).toPrecision(5)}}${{last?']':')'}}`;
+function renderPaired(){{const x=P[Number(PS.value)||0];if(!x){{document.getElementById('paired-observations').textContent='Not applicable for this report.';document.getElementById('paired-heatmap').innerHTML='';document.getElementById('paired-marginals').innerHTML='';return}}document.getElementById('paired-observations').innerHTML=(x.observations||[]).map(o=>`<div>• ${{esc(o.text)}}</div>`).join('')||'No region met the minimum sample threshold.';const h=(x.heatmaps||[])[0];if(h){{const xl=h.x_boundaries.slice(0,-1).map((v,i)=>interval(v,h.x_boundaries[i+1],i===h.x_boundaries.length-2)),yl=h.y_boundaries.slice(0,-1).map((v,i)=>interval(v,h.y_boundaries[i+1],i===h.y_boundaries.length-2));let rows=yl.map((label,yi)=>`<tr><th>${{esc(label)}}</th>${{xl.map((_label,xi)=>{{const c=h.cells.find(v=>v.x_index===xi&&v.y_index===yi)||{{total:0,disagreement_count:0}};const rate=c.disagreement_rate==null?0:100*c.disagreement_rate;return `<td class="${{c.sparse?'sparse':''}}" style="background:rgba(197,60,77,${{Math.max(.04,rate/100)}})">${{c.disagreement_count}}/${{c.total}}<br>${{rate.toFixed(1)}}%</td>`}}).join('')}}</tr>`).join('');document.getElementById('paired-heatmap').innerHTML=`<table class="heat"><thead><tr><th>${{esc(h.y)}} ↓ / ${{esc(h.x)}} →</th>${{xl.map(v=>`<th>${{esc(v)}}</th>`).join('')}}</tr></thead><tbody>${{rows}}</tbody></table>`}}document.getElementById('paired-marginals').innerHTML=`<table><thead><tr><th>Parameter</th><th>Interval</th><th>Disagreement</th><th>Eligibility</th></tr></thead><tbody>${{(x.marginals||[]).flatMap(m=>m.bins.map(b=>`<tr class="${{b.sparse?'sparse':''}}"><td>${{esc(m.parameter)}}</td><td>${{esc(interval(b.lower,b.upper,b.upper_inclusive))}}</td><td>${{b.disagreement_count}}/${{b.total}} · ${{b.disagreement_rate==null?'—':(100*b.disagreement_rate).toFixed(1)+'%'}}</td><td>${{b.sparse?'Sparse':'Eligible'}}</td></tr>`)).join('')}}</tbody></table>`}}PS.addEventListener('change',renderPaired);renderPaired();
+const C=D.consistency||{{available:false,groups:[]}};document.getElementById('consistency-note').textContent=C.available?'Repeatability uses only all-pair compatible replicate groups; runtime bookkeeping is excluded from indexed information agreement.':'No compatible replicate group is present. This does not affect the rest of the report.';document.getElementById('consistency').innerHTML=(C.groups||[]).map(g=>{{const o=(g.discrete||[]).find(x=>x.key==='outcome')||{{}};const pct=v=>v==null?'—':`${{(100*v).toFixed(2)}}%`;return `<tr><td>${{esc((g.datasets||[]).join(' / '))}}</td><td>${{Number(g.common_sample_count||0).toLocaleString()}}</td><td>${{pct(o.agreement_ratio)}} · ${{Number(o.consistent_count||0).toLocaleString()}} / ${{Number(o.comparable_count||0).toLocaleString()}}</td><td>${{pct(g.information_agreement_ratio)}} · ${{Number(g.information_consistent_count||0).toLocaleString()}} / ${{Number(g.information_comparable_count||0).toLocaleString()}}</td></tr>`}}).join('')||'<tr><td colspan="4">Not applicable for this report.</td></tr>';</script></main></body></html>"""
 
 
 def _legacy_source_roots(legacy: Path) -> tuple[Path, ...]:

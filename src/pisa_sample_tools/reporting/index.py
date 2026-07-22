@@ -23,6 +23,7 @@ from typing import Any
 import yaml
 
 from .comparison import classify_comparison, semantic_projection
+from .consistency import is_runtime_metric
 from .discovery import (
     ExperimentSource,
     discover_experiments,
@@ -43,8 +44,9 @@ from .models import (
     StageTiming,
 )
 
-REPORT_INDEX_SCHEMA_VERSION = 1
-REPORT_INDEX_BUILD_VERSION = 2
+REPORT_INDEX_SCHEMA_VERSION = 2
+MIN_SUPPORTED_REPORT_INDEX_SCHEMA_VERSION = 1
+REPORT_INDEX_BUILD_VERSION = 3
 
 _CORE_RUN_FIELDS = frozenset(
     {
@@ -238,11 +240,11 @@ class ReportIndex:
         except (KeyError, ValueError) as exc:
             self.close()
             raise ReportIndexError("database is not a versioned PISA report index") from exc
-        if schema_version < REPORT_INDEX_SCHEMA_VERSION:
+        if schema_version < MIN_SUPPORTED_REPORT_INDEX_SCHEMA_VERSION:
             self.close()
             raise ReportIndexError(
                 f"report index schema {schema_version} is older than supported "
-                f"schema {REPORT_INDEX_SCHEMA_VERSION}"
+                f"schema {MIN_SUPPORTED_REPORT_INDEX_SCHEMA_VERSION}"
             )
         self.schema_version = schema_version
         self.is_newer_schema = schema_version > REPORT_INDEX_SCHEMA_VERSION
@@ -506,7 +508,7 @@ def _cached_counts(database_path: Path, fingerprint: str) -> tuple[int, int, int
             int(values[key])
             for key in ("dataset_count", "run_count", "attempt_count", "finding_count")
         )  # type: ignore[return-value]
-    except KeyError, ValueError:
+    except (KeyError, ValueError):
         return None
 
 
@@ -577,6 +579,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             trace_paths_json TEXT NOT NULL,
             provenance_signature TEXT,
             row_digest TEXT NOT NULL,
+            behavior_digest TEXT NOT NULL,
             has_collision INTEGER NOT NULL DEFAULT 0,
             UNIQUE(dataset_id, scenario_id)
         );
@@ -790,14 +793,19 @@ def _index_sources(
                 result_path.parent / "collision_events.csv"
             ) or _row_collision(canonical)
             run_id = f"{source.dataset_id}:{scenario_id}"
+            indexed_metrics = {
+                **_control_summary_metrics(trace_paths),
+                **canonical["metrics"],
+            }
+            behavior_digest = _behavior_digest(canonical, indexed_metrics)
             connection.execute(
                 """
                 INSERT INTO runs(
                     run_id, dataset_id, scenario_id, canonical_attempt_id, attempt,
                     sample_id, parameter_hash, params_json, status, outcome, outcome_class,
                     stop_condition, stop_reason, result_path, trace_paths_json,
-                    provenance_signature, row_digest, has_collision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provenance_signature, row_digest, behavior_digest, has_collision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -817,6 +825,7 @@ def _index_sources(
                     _json(trace_paths),
                     provenance,
                     canonical["row_digest"],
+                    behavior_digest,
                     int(has_collision),
                 ),
             )
@@ -837,10 +846,7 @@ def _index_sources(
                 """,
                 (
                     (run_id, name, *_typed_columns(value))
-                    for name, value in {
-                        **_control_summary_metrics(trace_paths),
-                        **canonical["metrics"],
-                    }.items()
+                    for name, value in indexed_metrics.items()
                 ),
             )
             canonical_rows.append(
@@ -1233,6 +1239,24 @@ def _parse_result_row(row: dict[str, str], row_index: int) -> dict[str, Any]:
     return normalized
 
 
+def _behavior_digest(canonical: dict[str, Any], metrics: dict[str, Any]) -> str:
+    """Digest simulation evidence while excluding task/runtime bookkeeping."""
+
+    value = {
+        "params": canonical.get("params", {}),
+        "status": canonical.get("status"),
+        "outcome": canonical.get("outcome"),
+        "stop_condition": canonical.get("stop_condition"),
+        "stop_reason": canonical.get("stop_reason"),
+        "metrics": {
+            name: metric
+            for name, metric in sorted(metrics.items())
+            if not is_runtime_metric(name)
+        },
+    }
+    return hashlib.sha256(_json(value).encode()).hexdigest()
+
+
 def _scenario_id(result_path: Path) -> str:
     iteration = next(
         (parent for parent in result_path.parents if parent.name.startswith("iteration_")), None
@@ -1340,7 +1364,7 @@ def _first_csv_row(path: Path) -> dict[str, str] | None:
                 ),
                 None,
             )
-    except OSError, UnicodeDecodeError, csv.Error:
+    except (OSError, UnicodeDecodeError, csv.Error):
         return None
     if row is None:
         return None
@@ -1700,7 +1724,7 @@ def _json_mapping(value: Any) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(str(value))
-    except json.JSONDecodeError, TypeError:
+    except (json.JSONDecodeError, TypeError):
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
 
@@ -1712,7 +1736,7 @@ def _mapping(value: Any) -> dict[str, Any]:
 def _nonnegative_int(value: Any) -> int | None:
     try:
         parsed = int(str(value))
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
 
@@ -1728,7 +1752,7 @@ def _json(value: Any) -> str:
 def _load_json(value: str, default: Any) -> Any:
     try:
         return json.loads(value)
-    except TypeError, json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         return default
 
 

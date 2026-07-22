@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import * as echarts from 'echarts/core';
-import { BarChart, LineChart, PieChart, ScatterChart } from 'echarts/charts';
+import { BarChart, HeatmapChart, LineChart, PieChart, ScatterChart } from 'echarts/charts';
 import { CanvasRenderer, SVGRenderer } from 'echarts/renderers';
 import { DataZoomComponent, DatasetComponent, GridComponent, LegendComponent, MarkLineComponent, TitleComponent, TooltipComponent, TransformComponent, VisualMapComponent } from 'echarts/components';
 import type { EChartsOption, EChartsType } from 'echarts';
-import { ActionIcon, Badge, Card, Divider, Group, Menu, Stack, Text, Tooltip } from '@mantine/core';
+import { ActionIcon, Badge, Button, Card, Checkbox, ColorPicker, Divider, Group, Menu, Popover, Select, Stack, Text, Tooltip } from '@mantine/core';
 import { IconChevronDown, IconDownload, IconFileCode, IconFileSpreadsheet, IconMovie, IconPhoto, IconPresentation, IconRefresh } from '@tabler/icons-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
@@ -12,13 +12,14 @@ import type { ExportRequest, Job, VisualizationSpec } from '../api/types';
 import { EmptyState } from './Feedback';
 
 echarts.use([
-  BarChart, LineChart, PieChart, ScatterChart,
+  BarChart, HeatmapChart, LineChart, PieChart, ScatterChart,
   CanvasRenderer, SVGRenderer,
   DataZoomComponent, DatasetComponent, GridComponent, LegendComponent, MarkLineComponent, TitleComponent, TooltipComponent, TransformComponent, VisualMapComponent,
 ]);
 
 type JsonMap = Record<string, unknown>;
 type LocalExportFormat = 'png' | 'svg' | 'csv' | 'json';
+export type SeriesStyleOverride = { color?: string; border?: boolean; symbol?: string };
 
 const EXPORT_POLL_INTERVAL_MS = 1_250;
 const EXPORT_POLL_TIMEOUT_MS = 15 * 60 * 1_000;
@@ -161,7 +162,82 @@ function seriesColor(option: EChartsOption, name: string): string {
   return typeof palette[index % Math.max(1, palette.length)] === 'string' ? String(palette[index % palette.length]) : '#526ff0';
 }
 
-function Chart({ option, compact = false, onReady, onPointClick, aspectRatio }: { option: EChartsOption; compact?: boolean; onReady: (chart?: EChartsType) => void; onPointClick?: (value: unknown) => void; aspectRatio?: string }) {
+function seriesStyle(option: EChartsOption, name: string): Required<SeriesStyleOverride> {
+  const series = asList((option as JsonMap).series).filter(isMap).find((item) => item.name === name);
+  const itemStyle = isMap(series?.itemStyle) ? series.itemStyle : {};
+  return {
+    color: seriesColor(option, name),
+    border: Number(itemStyle.borderWidth ?? 0) > 0,
+    symbol: typeof series?.symbol === 'string' ? series.symbol : 'circle',
+  };
+}
+
+export function visualizationWithFloatingTooltip(option: EChartsOption): EChartsOption {
+  const raw = option as JsonMap;
+  if (!raw.tooltip) return option;
+  const floatTooltip = (value: unknown) => {
+    if (!isMap(value)) return value;
+    const existingClassName = typeof value.className === 'string' ? value.className.trim() : '';
+    return {
+      ...value,
+      appendTo: 'body',
+      confine: false,
+      className: [existingClassName, 'pisa-chart-tooltip'].filter(Boolean).join(' '),
+    };
+  };
+  return {
+    ...option,
+    tooltip: Array.isArray(raw.tooltip) ? raw.tooltip.map(floatTooltip) : floatTooltip(raw.tooltip),
+  } as EChartsOption;
+}
+
+function colorDistance(left: string, right: string): number | undefined {
+  const parse = (value: string) => /^#[0-9a-f]{6}$/i.test(value) ? [1, 3, 5].map((index) => Number.parseInt(value.slice(index, index + 2), 16)) : undefined;
+  const leftRgb = parse(left), rightRgb = parse(right);
+  return leftRgb && rightRgb ? Math.hypot(leftRgb[0] - rightRgb[0], leftRgb[1] - rightRgb[1], leftRgb[2] - rightRgb[2]) : undefined;
+}
+
+function SeriesLegendItem({ name, label, style, styleOverride, otherColors, visible, colorEditable, styleEditable, customized, onToggle, onColorChange, onStyleChange }: {
+  name: string;
+  label?: string;
+  style: Required<SeriesStyleOverride>;
+  styleOverride?: SeriesStyleOverride;
+  otherColors: string[];
+  visible: boolean;
+  colorEditable: boolean;
+  styleEditable: boolean;
+  customized: boolean;
+  onToggle: () => void;
+  onColorChange?: (color?: string) => void;
+  onStyleChange?: (style?: SeriesStyleOverride) => void;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [draftColor, setDraftColor] = useState(style.color);
+  useEffect(() => setDraftColor(style.color), [style.color]);
+  const nearestColorDistance = Math.min(...otherColors.map((other) => colorDistance(draftColor, other) ?? Number.POSITIVE_INFINITY));
+  return <div className={`pisa-chart-legend-item${visible ? '' : ' pisa-chart-legend-item--hidden'}`}>
+    {colorEditable || styleEditable ? <Popover opened={pickerOpen} onChange={setPickerOpen} position="bottom-start" shadow="md" width={270}>
+      <Popover.Target><button type="button" className="pisa-chart-legend-color" style={{ background: style.color, border: style.border ? '2px solid #17202a' : '2px solid transparent' }} aria-label={`Customize ${name} style`} title={`Customize ${name} style`} onClick={() => setPickerOpen((value) => !value)} /></Popover.Target>
+      <Popover.Dropdown><Stack gap="sm"><Text size="xs" fw={650}>{label ?? name}</Text><ColorPicker fullWidth format="hex" value={draftColor} onChange={setDraftColor} onChangeEnd={(value) => styleEditable ? onStyleChange?.({ ...styleOverride, color: value }) : onColorChange?.(value)} /><Group gap="xs" wrap="nowrap"><input type="color" aria-label="Category color" value={draftColor} onChange={(event) => { setDraftColor(event.currentTarget.value); if (styleEditable) onStyleChange?.({ ...styleOverride, color: event.currentTarget.value }); else onColorChange?.(event.currentTarget.value); }} /><Text size="xs" className="pisa-code">{draftColor}</Text></Group>{nearestColorDistance < 80 && <Text size="xs" c="orange">This color is close to another visible category. Choose a more distinct hue or brightness.</Text>}{styleEditable && <Group grow align="flex-end"><Select label="Shape" value={style.symbol} allowDeselect={false} data={[{ value: 'circle', label: 'Circle' }, { value: 'rect', label: 'Square' }, { value: 'triangle', label: 'Triangle' }, { value: 'diamond', label: 'Diamond' }, { value: 'pin', label: 'Pin' }, { value: 'arrow', label: 'Arrow' }]} onChange={(value) => value && onStyleChange?.({ ...styleOverride, symbol: value })} /><Checkbox label="Black border" checked={style.border} onChange={(event) => onStyleChange?.({ ...styleOverride, border: event.currentTarget.checked })} mb={8} /></Group>}<Group justify="space-between" gap="xs"><Button size="compact-xs" variant="default" disabled={!customized} onClick={() => { if (styleEditable) onStyleChange?.(undefined); else onColorChange?.(undefined); setPickerOpen(false); }}>Reset</Button><Button size="compact-xs" onClick={() => setPickerOpen(false)}>Done</Button></Group></Stack></Popover.Dropdown>
+    </Popover> : <span className="pisa-chart-legend-swatch" style={{ background: style.color }} />}
+    <button type="button" className="pisa-chart-legend-toggle" aria-pressed={visible} onClick={onToggle}>{label ?? name}</button>
+  </div>;
+}
+
+function Chart({ option, compact = false, onReady, onPointClick, aspectRatio, seriesVisibility, onSeriesVisibilityChange, seriesColorOverrides, onSeriesColorChange, seriesStyleOverrides, onSeriesStyleChange, seriesLabels }: {
+  option: EChartsOption;
+  compact?: boolean;
+  onReady: (chart?: EChartsType) => void;
+  onPointClick?: (value: unknown) => void;
+  aspectRatio?: string;
+  seriesVisibility?: Record<string, boolean>;
+  onSeriesVisibilityChange?: (name: string, visible: boolean) => void;
+  seriesColorOverrides?: Record<string, string>;
+  onSeriesColorChange?: (name: string, color?: string) => void;
+  seriesStyleOverrides?: Record<string, SeriesStyleOverride>;
+  onSeriesStyleChange?: (name: string, style?: SeriesStyleOverride) => void;
+  seriesLabels?: Record<string, string>;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const instance = useRef<EChartsType | undefined>(undefined);
   const selectionRef = useRef<Record<string, boolean>>({});
@@ -190,23 +266,25 @@ function Chart({ option, compact = false, onReady, onPointClick, aspectRatio }: 
     const legend = raw.legend;
     const names = legendNames(option);
     const previous = selectionRef.current;
-    selectionRef.current = Object.fromEntries(names.map((name) => [name, previous[name] ?? true]));
+    selectionRef.current = Object.fromEntries(names.map((name) => [name, seriesVisibility?.[name] ?? previous[name] ?? true]));
     const hiddenCanvasLegend = isMap(legend) ? { ...legend, show: false, selected: selectionRef.current } : legend;
-    chart.setOption({ ...option, legend: hiddenCanvasLegend } as EChartsOption, { notMerge: true, lazyUpdate: true });
+    chart.setOption(visualizationWithFloatingTooltip({ ...option, legend: hiddenCanvasLegend } as EChartsOption), { notMerge: true, lazyUpdate: true });
     setSelectionRevision((value) => value + 1);
-  }, [option]);
+  }, [option, seriesVisibility]);
 
   const ratioParts = aspectRatio?.split('/').map((value) => Number(value.trim()));
   const ratio = ratioParts?.length === 2 && ratioParts[0] > 0 && ratioParts[1] > 0 ? ratioParts[0] / ratioParts[1] : undefined;
   const names = legendNames(option);
+  const renderedStyles = Object.fromEntries(names.map((name) => [name, { ...seriesStyle(option, name), ...seriesStyleOverrides?.[name], ...(seriesColorOverrides?.[name] ? { color: seriesColorOverrides[name] } : {}) }]));
   return <>
     {names.length > 0 && <div className="pisa-chart-legend" aria-label="Visible chart series" data-revision={selectionRevision}>{names.map((name) => {
       const visible = selectionRef.current[name] ?? true;
-      return <button key={name} type="button" className={`pisa-chart-legend-item${visible ? '' : ' pisa-chart-legend-item--hidden'}`} aria-pressed={visible} onClick={() => {
+      return <SeriesLegendItem key={name} name={name} label={seriesLabels?.[name]} visible={visible} style={renderedStyles[name]} styleOverride={seriesStyleOverrides?.[name]} otherColors={names.filter((other) => other !== name && (selectionRef.current[other] ?? true)).map((other) => renderedStyles[other].color)} colorEditable={Boolean(onSeriesColorChange)} styleEditable={Boolean(onSeriesStyleChange)} customized={seriesColorOverrides?.[name] !== undefined || seriesStyleOverrides?.[name] !== undefined} onToggle={() => {
         selectionRef.current = { ...selectionRef.current, [name]: !visible };
         instance.current?.setOption({ legend: { selected: selectionRef.current } } as EChartsOption);
+        onSeriesVisibilityChange?.(name, !visible);
         setSelectionRevision((value) => value + 1);
-      }}><span className="pisa-chart-legend-swatch" style={{ background: seriesColor(option, name) }} />{name}</button>;
+      }} onColorChange={(color) => onSeriesColorChange?.(name, color)} onStyleChange={(style) => onSeriesStyleChange?.(name, style)} />;
     })}</div>}
     <div ref={ref} className={`pisa-chart${compact ? ' pisa-chart--compact' : ''}`} style={ratio ? { aspectRatio, height: 'auto', maxWidth: `${Math.round(760 * ratio)}px`, marginInline: 'auto' } : undefined} role="img" aria-label="Interactive data visualization" />
   </>;
@@ -231,6 +309,13 @@ export function VisualizationCard({
   onChartReady,
   animationDurationSeconds,
   animationOptionAtProgress,
+  seriesVisibility,
+  onSeriesVisibilityChange,
+  seriesColorOverrides,
+  onSeriesColorChange,
+  seriesStyleOverrides,
+  onSeriesStyleChange,
+  seriesLabels,
 }: {
   spec: VisualizationSpec;
   datasetId?: string;
@@ -241,6 +326,13 @@ export function VisualizationCard({
   onChartReady?: (chart?: EChartsType) => void;
   animationDurationSeconds?: number;
   animationOptionAtProgress?: (progress: number) => EChartsOption;
+  seriesVisibility?: Record<string, boolean>;
+  onSeriesVisibilityChange?: (name: string, visible: boolean) => void;
+  seriesColorOverrides?: Record<string, string>;
+  onSeriesColorChange?: (name: string, color?: string) => void;
+  seriesStyleOverrides?: Record<string, SeriesStyleOverride>;
+  onSeriesStyleChange?: (name: string, style?: SeriesStyleOverride) => void;
+  seriesLabels?: Record<string, string>;
 }) {
   const chartRef = useRef<EChartsType | undefined>(undefined);
   const activePoll = useRef<AbortController | undefined>(undefined);
@@ -481,7 +573,7 @@ export function VisualizationCard({
         <div className={`pisa-chart${compact ? ' pisa-chart--compact' : ''}`} style={{ display: 'grid', placeItems: 'center', padding: 24 }}>
           <img src={spec.source_url} alt={spec.title} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
         </div>
-      ) : hasChart ? <Chart option={spec.option as EChartsOption} compact={compact} onReady={handleChartReady} onPointClick={onPointClick} aspectRatio={aspectRatio} /> : (
+      ) : hasChart ? <Chart option={spec.option as EChartsOption} compact={compact} onReady={handleChartReady} onPointClick={onPointClick} aspectRatio={aspectRatio} seriesVisibility={seriesVisibility} onSeriesVisibilityChange={onSeriesVisibilityChange} seriesColorOverrides={seriesColorOverrides} onSeriesColorChange={onSeriesColorChange} seriesStyleOverrides={seriesStyleOverrides} onSeriesStyleChange={onSeriesStyleChange} seriesLabels={seriesLabels} /> : (
         <EmptyState title="No values for this view" description={emptyDescription ?? 'Adjust the report filters or choose another experiment.'} />
       )}
       {(requestedFormat || serverError || unsafeArtifactError || localMessage || localError) && (

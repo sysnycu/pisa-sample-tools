@@ -42,6 +42,8 @@ export interface DatasetDescriptor {
   generated_at?: string;
   report_build_version?: number;
   latest_report_build_version?: number;
+  storage_kind?: 'saved' | 'temporary';
+  expires_at?: string;
 }
 
 export interface OutcomeCounts {
@@ -84,6 +86,15 @@ export interface ReportBuildRequest {
   report_mode?: 'interactive' | 'static';
   sensitivity?: boolean;
   engine?: 'auto' | 'normalized' | 'legacy';
+}
+
+export type ReportPreviewBuildRequest = Omit<ReportBuildRequest, 'output_dir' | 'overwrite'> & {
+  report_name: string;
+};
+
+export interface ReportPersistRequest {
+  output_dir: string;
+  overwrite?: boolean;
 }
 
 export interface ExperimentPreview {
@@ -235,8 +246,9 @@ export interface ScatterResult {
   datasets: string[];
   stop_reasons: string[];
   stop_conditions: string[];
-  selection: { x: string; y: string; color: string; dataset?: string | null };
-  points: Array<{ run_id: string; dataset_id: string; scenario_id: string; sample_id?: string | null; parameter_hash?: string | null; ordinal: number; outcome: string; collision: boolean; stop_condition?: string | null; stop_reason?: string | null; x: number; y: number; color?: unknown }>;
+  selection: { x: string; y: string; color: string; filter_field?: string | null; dataset?: string | null };
+  filter?: { field: string; kind: 'continuous' | 'discrete'; minimum?: number | null; maximum?: number | null; step?: number; values?: string[]; present_count: number; missing_count: number } | null;
+  points: Array<{ run_id: string; dataset_id: string; scenario_id: string; sample_id?: string | null; parameter_hash?: string | null; ordinal: number; outcome: string; collision: boolean; stop_condition?: string | null; stop_reason?: string | null; x: number; y: number; color?: unknown; filter?: unknown }>;
   returned: number;
   scanned: number;
   limit?: number | null;
@@ -365,6 +377,246 @@ export interface CrossExperimentComparison {
 export interface ComparisonResult {
   items: ComparisonClass[];
   cross_experiment?: CrossExperimentComparison;
+}
+
+export interface PairedParameterAnalysisRequest {
+  x?: string;
+  y?: string;
+  facet?: string;
+  view?: 'outcome' | 'metric_delta';
+  metric?: string;
+  bin_count?: number;
+  boundaries?: Record<string, number[]>;
+  facet_range?: [number, number];
+  minimum_cell_count?: number;
+  point_limit?: number;
+}
+
+export interface PairedMetricAgreementRequest {
+  metric?: string;
+  x_side?: 'left' | 'right';
+  outcome_scope?: 'all_same' | 'success' | 'fail' | 'invalid' | 'unknown';
+  primary_threshold?: number;
+  secondary_threshold?: number;
+  point_limit?: number;
+}
+
+export interface PairedMetricAgreementSummary {
+  count: number;
+  mean_absolute_difference?: number | null;
+  median_absolute_difference?: number | null;
+  thresholds: Array<{
+    threshold: number;
+    count: number;
+    rate?: number | null;
+    y_greater_count: number;
+    x_greater_count: number;
+  }>;
+}
+
+export interface PairedMetricAgreement {
+  schema_version: number;
+  relation_id: string;
+  left: string;
+  right: string;
+  role: ComparisonClass['role'];
+  pairing_key: string;
+  metrics: Array<{ key: string; label: string; unit?: string | null }>;
+  selection: {
+    metric: string;
+    unit?: string | null;
+    x_side: 'left' | 'right';
+    x_dataset: string;
+    y_dataset: string;
+    outcome_scope: 'all_same' | 'success' | 'fail' | 'invalid' | 'unknown';
+    primary_threshold: number;
+    secondary_threshold: number;
+    difference_definition: 'y minus x';
+  };
+  summary: {
+    paired_count: number;
+    metric_eligible_count: number;
+    metric_missing_count: number;
+    same_outcome_metric_eligible_count: number;
+    outcome_disagreement_metric_eligible_count: number;
+    included: PairedMetricAgreementSummary;
+    categories: Record<string, PairedMetricAgreementSummary>;
+  };
+  points: Array<{
+    parameter_hash: string;
+    left_run_id: string;
+    right_run_id: string;
+    left_outcome: string;
+    right_outcome: string;
+    category: string;
+    left_value: number;
+    right_value: number;
+    x: number;
+    y: number;
+    y_minus_x: number;
+    absolute_difference: number;
+  }>;
+  coverage: { included_count: number; plotted_count: number; point_limit: number; sampled: boolean };
+  disclosure: Record<string, string | boolean>;
+}
+
+export interface PairedParameterCell {
+  total: number;
+  disagreement_count: number;
+  disagreement_rate?: number | null;
+  categories: Record<string, number>;
+  metric_eligible_count: number;
+  metric_missing_count: number;
+  delta_mean?: number | null;
+  delta_median?: number | null;
+  sparse: boolean;
+}
+
+export interface PairedParameterAnalysis {
+  schema_version: number;
+  relation_id: string;
+  left: string;
+  right: string;
+  role: ComparisonClass['role'];
+  pairing_key: string;
+  parameters: string[];
+  metrics: string[];
+  selection: {
+    x: string; y: string; facet?: string | null; view: 'outcome' | 'metric_delta';
+    metric?: string | null; delta_definition: 'right minus left'; bin_count: number;
+    boundaries: Record<string, number[]>; facet_range?: [number, number] | null;
+    minimum_cell_count: number;
+  };
+  overview: {
+    paired_count: number; agreement_count: number; disagreement_count: number;
+    disagreement_rate?: number | null; direct_reversal_count: number;
+    invalid_related_count: number; categories: Record<string, number>;
+    transitions: Record<string, number>; metric?: string | null;
+    metric_eligible_count: number; metric_missing_count: number;
+  };
+  marginals: Array<{ parameter: string; boundaries: number[]; bins: Array<PairedParameterCell & { index: number; lower: number; upper: number; upper_inclusive: boolean }> }>;
+  heatmaps: Array<{
+    x: string; y: string; x_boundaries: number[]; y_boundaries: number[];
+    facet?: string | null; facet_index?: number | null;
+    facet_interval?: { lower: number; upper: number; upper_inclusive: boolean } | null;
+    total: number; cells: Array<PairedParameterCell & { x_index: number; y_index: number }>;
+  }>;
+  observations: Array<{ kind: string; text: string; parameter?: string; numerator?: number; denominator?: number }>;
+  candidates: Array<{
+    kind: string; reason: string; parameter_hash: string; left_run_id: string; right_run_id: string;
+    left_outcome: string; right_outcome: string; delta?: number | null; parameters: Record<string, number | null>;
+  }>;
+  points: Array<{
+    parameter_hash: string; left_run_id: string; right_run_id: string; x: number; y: number;
+    facet?: number | null; left_outcome: string; right_outcome: string; category: string;
+    left_value?: number | null; right_value?: number | null; delta?: number | null;
+  }>;
+  coverage: {
+    paired_count: number; complete_parameter_count: number; included_count: number;
+    excluded_incomplete_parameters: number; excluded_parameter_mismatch: number; excluded_by_boundaries: number;
+    excluded_by_facet: number; plotted_count: number; point_limit: number; sampled: boolean;
+  };
+  disclosure: Record<string, string | boolean>;
+}
+
+export interface ConsistencyDiscreteMetric {
+  key: string;
+  label: string;
+  consistent_count: number;
+  comparable_count: number;
+  agreement_ratio?: number | null;
+  unavailable_sample_count: number;
+}
+
+export interface ConsistencyContinuousMetric {
+  key: string;
+  label: string;
+  unit?: string | null;
+  eligible_sample_count: number;
+  partial_sample_count: number;
+  unavailable_sample_count: number;
+  exact_count: number;
+  exact_ratio?: number | null;
+  variation_min?: number | null;
+  variation_median?: number | null;
+  variation_p95?: number | null;
+  variation_max?: number | null;
+  representatives?: Record<string, { parameter_hash: string; variation: number } | null>;
+}
+
+export interface ConsistencyGroup {
+  id: string;
+  datasets: string[];
+  experiment_count: number;
+  common_sample_count: number;
+  union_sample_count: number;
+  excluded_noncommon_sample_count: number;
+  information_consistent_count: number;
+  information_comparable_count: number;
+  information_agreement_ratio?: number | null;
+  discrete: ConsistencyDiscreteMetric[];
+  continuous: ConsistencyContinuousMetric[];
+  runtime: ConsistencyContinuousMetric[];
+  outcome_patterns: Array<{ pattern: string; count: number; all_replicates_agree: boolean }>;
+  pairwise: Array<{ left: string; right: string; matched_count: number; outcome_agreement_count: number; outcome_agreement_ratio?: number | null }>;
+  hash_quality: Record<string, { run_count: number; unique_hash_count: number; missing_hash_runs: number; ambiguous_hashes: number }>;
+}
+
+export interface ConsistencyQuickSummary {
+  schema_version: number;
+  available: boolean;
+  reason?: string | null;
+  source_fingerprint?: string | null;
+  dataset_count: number;
+  canonical_dataset_count: number;
+  group_count: number;
+  groups: ConsistencyGroup[];
+  excluded_duplicate_aliases: string[];
+  methodology?: Record<string, unknown>;
+}
+
+export interface DeepConsistencyGroup {
+  id: string;
+  datasets: string[];
+  sample_count: number;
+  trajectory_comparable_count: number;
+  outcome_agreement_count: number;
+  strict_exact_count: number;
+  lengths_equal_count: number;
+  position_tolerance_counts: Record<string, number>;
+  max_position_error_m: { median?: number | null; p95?: number | null; p99?: number | null; max?: number | null };
+}
+
+export interface DeepConsistencySummary {
+  generated_at: string;
+  profile: 'trajectory_outlier_controls' | 'full_controls';
+  sample_count: number;
+  position_tolerances_m: number[];
+  groups: DeepConsistencyGroup[];
+  alignment_rule?: string;
+  strict_rule?: string;
+  control_rule?: string;
+}
+
+export interface ConsistencyResult {
+  quick: ConsistencyQuickSummary;
+  deep: {
+    state: 'not_generated' | 'queued' | 'running' | 'ready' | 'stale' | 'failed';
+    cache_key?: string;
+    profile?: 'trajectory_outlier_controls' | 'full_controls';
+    generated_at?: string | null;
+    analyzer_version?: number;
+    summary?: DeepConsistencySummary | null;
+    artifacts?: Array<string | { path: string; download_url?: string }>;
+    job?: Job;
+  };
+}
+
+export interface ConsistencyAnalyzeRequest {
+  profile: 'trajectory_outlier_controls' | 'full_controls';
+  position_tolerances_m?: number[];
+  outlier_limit?: number;
+  force?: boolean;
 }
 
 export interface MediaItem {

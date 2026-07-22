@@ -1,7 +1,7 @@
 import { lazy, Suspense } from 'react';
 import { Button, Card } from '@mantine/core';
 import { IconCompass } from '@tabler/icons-react';
-import { Link, Route, Routes } from 'react-router-dom';
+import { Link, Navigate, Route, Routes } from 'react-router-dom';
 import { AppLayout } from './components/AppLayout';
 import { EmptyState, PageLoading } from './components/Feedback';
 
@@ -19,7 +19,7 @@ export function App() {
           <Route index element={<DashboardPage />} />
           <Route path="experiments" element={<ExperimentsPage />} />
           <Route path="samples" element={<SamplesPage />} />
-          <Route path="reports" element={<ReportWorkspacePage />} />
+          <Route path="reports" element={<Navigate to="/#reports" replace />} />
           <Route path="reports/:datasetId/:section?/:runId?" element={<ReportWorkspacePage />} />
           <Route path="advanced" element={<AdvancedToolsPage />} />
           <Route path="*" element={<Card><EmptyState title="Page not found" description="This workspace route does not exist." icon={<IconCompass size={23} />} action={<Button component={Link} to="/">Return to Dashboard</Button>} /></Card>} />

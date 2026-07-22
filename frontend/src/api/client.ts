@@ -3,6 +3,14 @@ import type {
   CaseDetail,
   ComparisonClass,
   ComparisonResult,
+  PairedMetricAgreement,
+  PairedMetricAgreementRequest,
+  PairedParameterAnalysis,
+  PairedParameterAnalysisRequest,
+  ConsistencyAnalyzeRequest,
+  ConsistencyContinuousMetric,
+  ConsistencyGroup,
+  ConsistencyResult,
   CrossExperimentComparison,
   DataHealthFinding,
   DatasetDescriptor,
@@ -19,6 +27,8 @@ import type {
   RepairPlan,
   RepairScanRequest,
   ReportBuildRequest,
+  ReportPersistRequest,
+  ReportPreviewBuildRequest,
   ReportBrowserResult,
   ReportSourceInspection,
   ReportSummary,
@@ -155,6 +165,8 @@ function normalizeDataset(value: unknown): DatasetDescriptor {
     generated_at: stringValue(raw.generated_at) || undefined,
     report_build_version: numberValue(raw.report_build_version),
     latest_report_build_version: numberValue(raw.latest_report_build_version),
+    storage_kind: stringValue(raw.storage_kind) === 'temporary' ? 'temporary' : 'saved',
+    expires_at: stringValue(raw.expires_at) || undefined,
   };
 }
 
@@ -437,6 +449,74 @@ function normalizeCrossExperiment(value: unknown): CrossExperimentComparison {
   };
 }
 
+function normalizeConsistencyMetric(value: unknown): ConsistencyContinuousMetric {
+  const raw = map(value);
+  return {
+    key: stringValue(raw.key),
+    label: stringValue(raw.label, titleCase(stringValue(raw.key))),
+    unit: stringValue(raw.unit) || null,
+    eligible_sample_count: numberValue(raw.eligible_sample_count) ?? 0,
+    partial_sample_count: numberValue(raw.partial_sample_count) ?? 0,
+    unavailable_sample_count: numberValue(raw.unavailable_sample_count) ?? 0,
+    exact_count: numberValue(raw.exact_count) ?? 0,
+    exact_ratio: numberValue(raw.exact_ratio) ?? null,
+    variation_min: numberValue(raw.variation_min) ?? null,
+    variation_median: numberValue(raw.variation_median) ?? null,
+    variation_p95: numberValue(raw.variation_p95) ?? null,
+    variation_max: numberValue(raw.variation_max) ?? null,
+    representatives: Object.fromEntries(Object.entries(map(raw.representatives)).flatMap(([key, value]) => {
+      const item = map(value), variation = numberValue(item.variation);
+      return variation === undefined ? [] : [[key, { parameter_hash: stringValue(item.parameter_hash), variation }]];
+    })),
+  };
+}
+
+function normalizeConsistencyGroup(value: unknown): ConsistencyGroup {
+  const raw = map(value);
+  return {
+    id: stringValue(raw.id), datasets: list(raw.datasets).map(String),
+    experiment_count: numberValue(raw.experiment_count) ?? 0,
+    common_sample_count: numberValue(raw.common_sample_count) ?? 0,
+    union_sample_count: numberValue(raw.union_sample_count) ?? 0,
+    excluded_noncommon_sample_count: numberValue(raw.excluded_noncommon_sample_count) ?? 0,
+    information_consistent_count: numberValue(raw.information_consistent_count) ?? 0,
+    information_comparable_count: numberValue(raw.information_comparable_count) ?? 0,
+    information_agreement_ratio: numberValue(raw.information_agreement_ratio) ?? null,
+    discrete: list(raw.discrete).map((value) => {
+      const item = map(value);
+      return { key: stringValue(item.key), label: stringValue(item.label), consistent_count: numberValue(item.consistent_count) ?? 0, comparable_count: numberValue(item.comparable_count) ?? 0, agreement_ratio: numberValue(item.agreement_ratio) ?? null, unavailable_sample_count: numberValue(item.unavailable_sample_count) ?? 0 };
+    }),
+    continuous: list(raw.continuous).map(normalizeConsistencyMetric),
+    runtime: list(raw.runtime).map(normalizeConsistencyMetric),
+    outcome_patterns: list(raw.outcome_patterns).map((value) => { const item = map(value); return { pattern: stringValue(item.pattern), count: numberValue(item.count) ?? 0, all_replicates_agree: Boolean(item.all_replicates_agree) }; }),
+    pairwise: list(raw.pairwise).map((value) => { const item = map(value); return { left: stringValue(item.left), right: stringValue(item.right), matched_count: numberValue(item.matched_count) ?? 0, outcome_agreement_count: numberValue(item.outcome_agreement_count) ?? 0, outcome_agreement_ratio: numberValue(item.outcome_agreement_ratio) ?? null }; }),
+    hash_quality: Object.fromEntries(Object.entries(map(raw.hash_quality)).map(([dataset, value]) => { const item = map(value); return [dataset, { run_count: numberValue(item.run_count) ?? 0, unique_hash_count: numberValue(item.unique_hash_count) ?? 0, missing_hash_runs: numberValue(item.missing_hash_runs) ?? 0, ambiguous_hashes: numberValue(item.ambiguous_hashes) ?? 0 }]; })),
+  };
+}
+
+function normalizeConsistency(value: unknown): ConsistencyResult {
+  const raw = map(value), quick = map(raw.quick), deep = map(raw.deep), summary = map(deep.summary);
+  const deepGroups = list(summary.groups).map((value) => {
+    const item = map(value), position = map(item.max_position_error_m);
+    return { id: stringValue(item.id), datasets: list(item.datasets).map(String), sample_count: numberValue(item.sample_count) ?? 0, trajectory_comparable_count: numberValue(item.trajectory_comparable_count) ?? numberValue(item.sample_count) ?? 0, outcome_agreement_count: numberValue(item.outcome_agreement_count) ?? 0, strict_exact_count: numberValue(item.strict_exact_count) ?? 0, lengths_equal_count: numberValue(item.lengths_equal_count) ?? 0, position_tolerance_counts: Object.fromEntries(Object.entries(map(item.position_tolerance_counts)).map(([key, count]) => [key, numberValue(count) ?? 0])), max_position_error_m: { median: numberValue(position.median) ?? null, p95: numberValue(position.p95) ?? null, p99: numberValue(position.p99) ?? null, max: numberValue(position.max) ?? null } };
+  });
+  const stateValue = stringValue(deep.state, 'not_generated');
+  const state = (['not_generated', 'queued', 'running', 'ready', 'stale', 'failed'].includes(stateValue) ? stateValue : 'not_generated') as ConsistencyResult['deep']['state'];
+  const artifacts: NonNullable<ConsistencyResult['deep']['artifacts']> = [];
+  for (const value of list(deep.artifacts)) {
+    if (typeof value === 'string') {
+      artifacts.push(value);
+      continue;
+    }
+    const item = map(value), path = stringValue(item.path), downloadUrl = stringValue(item.download_url);
+    if (path || downloadUrl) artifacts.push({ path, download_url: downloadUrl || undefined });
+  }
+  return {
+    quick: { schema_version: numberValue(quick.schema_version) ?? 1, available: Boolean(quick.available), reason: stringValue(quick.reason) || null, source_fingerprint: stringValue(quick.source_fingerprint) || null, dataset_count: numberValue(quick.dataset_count) ?? 0, canonical_dataset_count: numberValue(quick.canonical_dataset_count) ?? 0, group_count: numberValue(quick.group_count) ?? 0, groups: list(quick.groups).map(normalizeConsistencyGroup), excluded_duplicate_aliases: list(quick.excluded_duplicate_aliases).map(String), methodology: map(quick.methodology) },
+    deep: { state, cache_key: stringValue(deep.cache_key) || undefined, profile: stringValue(deep.profile) as ConsistencyResult['deep']['profile'], generated_at: stringValue(deep.generated_at) || null, analyzer_version: numberValue(deep.analyzer_version), summary: Object.keys(summary).length ? { generated_at: stringValue(summary.generated_at), profile: stringValue(summary.profile) === 'full_controls' ? 'full_controls' : 'trajectory_outlier_controls', sample_count: numberValue(summary.sample_count) ?? 0, position_tolerances_m: list(summary.position_tolerances_m).map((item) => numberValue(item) ?? 0), groups: deepGroups, alignment_rule: stringValue(summary.alignment_rule) || undefined, strict_rule: stringValue(summary.strict_rule) || undefined, control_rule: stringValue(summary.control_rule) || undefined } : null, artifacts, job: isMap(deep.job) ? normalizeJob(deep.job) : undefined },
+  };
+}
+
 function normalizeMedia(value: unknown): MediaItem {
   const raw = map(value);
   const format = stringValue(raw.format).toLowerCase();
@@ -698,6 +778,18 @@ export class ApiClient {
     build: async (body: ReportBuildRequest): Promise<Job> => normalizeJob(
       await this.request('/reports/build', { method: 'POST', body: JSON.stringify(body) }),
     ),
+    previewBuild: async (body: ReportPreviewBuildRequest): Promise<Job> => normalizeJob(
+      await this.request('/reports/previews', { method: 'POST', body: JSON.stringify(body) }),
+    ),
+    persist: async (id: string, body: ReportPersistRequest): Promise<Job> => normalizeJob(
+      await this.request(`/reports/${encodeURIComponent(id)}/persist`, { method: 'POST', body: JSON.stringify(body) }),
+    ),
+    lease: async (id: string): Promise<DatasetDescriptor> => normalizeDataset(
+      await this.request(`/reports/${encodeURIComponent(id)}/lease`, { method: 'POST' }),
+    ),
+    discardPreview: async (id: string): Promise<void> => {
+      await this.request(`/reports/${encodeURIComponent(id)}/preview`, { method: 'DELETE' });
+    },
     rebuild: async (id: string, body: LegacyRebuildRequest): Promise<Job> => normalizeJob(
       await this.request(`/reports/${encodeURIComponent(id)}/rebuild`, { method: 'POST', body: JSON.stringify(body) }),
     ),
@@ -708,7 +800,7 @@ export class ApiClient {
     delete: async (id: string, confirmName: string): Promise<void> => {
       await this.request(`/reports/${encodeURIComponent(id)}`, { method: 'DELETE', body: JSON.stringify({ confirm_name: confirmName }) });
     },
-    scatter: async (id: string, options: { x?: string; y?: string; color?: string; dataset?: string; stop_reason?: string; limit?: number } = {}): Promise<ScatterResult> =>
+    scatter: async (id: string, options: { x?: string; y?: string; color?: string; filter_field?: string; dataset?: string; stop_reason?: string; limit?: number } = {}): Promise<ScatterResult> =>
       this.request(`/reports/${encodeURIComponent(id)}/scatter${queryString(options)}`),
     summary: async (id: string) => normalizeSummary(await this.request(`/reports/${encodeURIComponent(id)}/overview`)),
     runs: async (id: string, options: { cursor?: string; limit?: number; search?: string; outcome?: string; experiment?: string; sort?: string; descending?: boolean } = {}): Promise<Page<RunRecord>> => {
@@ -744,6 +836,19 @@ export class ApiClient {
         cross_experiment: isMap(raw.cross_experiment) ? normalizeCrossExperiment(raw.cross_experiment) : undefined,
       };
     },
+    pairedParameterAnalysis: async (id: string, relationId: string, body: PairedParameterAnalysisRequest = {}): Promise<PairedParameterAnalysis> =>
+      this.request(`/reports/${encodeURIComponent(id)}/comparisons/${encodeURIComponent(relationId)}/parameter-analysis`, { method: 'POST', body: JSON.stringify(body) }),
+    pairedMetricAgreement: async (id: string, relationId: string, body: PairedMetricAgreementRequest = {}): Promise<PairedMetricAgreement> =>
+      this.request(`/reports/${encodeURIComponent(id)}/comparisons/${encodeURIComponent(relationId)}/metric-agreement`, { method: 'POST', body: JSON.stringify(body) }),
+    consistency: async (id: string, options: Omit<ConsistencyAnalyzeRequest, 'force'> = { profile: 'trajectory_outlier_controls', position_tolerances_m: [0.001, 0.01, 0.1], outlier_limit: 25 }): Promise<ConsistencyResult> => {
+      const params = new URLSearchParams({ profile: options.profile });
+      for (const tolerance of options.position_tolerances_m ?? [0.001, 0.01, 0.1]) params.append('position_tolerances_m', String(tolerance));
+      params.set('outlier_limit', String(options.outlier_limit ?? 25));
+      return normalizeConsistency(await this.request(`/reports/${encodeURIComponent(id)}/consistency?${params.toString()}`));
+    },
+    analyzeConsistency: async (id: string, body: ConsistencyAnalyzeRequest): Promise<Job> => normalizeJob(
+      await this.request(`/reports/${encodeURIComponent(id)}/consistency/analyze`, { method: 'POST', body: JSON.stringify(body) }),
+    ),
     media: async (id: string): Promise<Page<MediaItem>> => {
       const rawValue = await this.request(`/reports/${encodeURIComponent(id)}/media`);
       const values = Array.isArray(rawValue) ? rawValue : list(map(rawValue).items);
